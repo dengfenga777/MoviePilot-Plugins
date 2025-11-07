@@ -1,0 +1,24 @@
+{
+  "name": "MoviePilot-Plugins-StrmWebhook",
+  "version": "0.1.0",
+  "description": "StrmWebhook 插件仓库（支持 V2）",
+  "author": "dengfenga777",
+  "license": "GPL-3.0",
+  "plugins": [
+    {
+      "name": "StrmWebhook",
+      "title": "整理入库 Webhook",
+      "desc": "MoviePilot 整理/入库完成后自动调用 Webhook 发送 JSON 通知，可用于远程生成 STRM。",
+      "version": "0.1",
+      "author": "dengfenga777",
+      "icon": "https://movie-pilot.org/favicon.ico",
+      "tags": [
+        "Webhook",
+        "STRM",
+        "Automation"
+      ],
+      "plugin_dir": "strmwebhook",
+      "v2": true
+    }
+  ]
+}
