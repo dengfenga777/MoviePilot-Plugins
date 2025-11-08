@@ -29,14 +29,12 @@ class StrmWebhook(_PluginBase):
     plugin_order = 15
     # 可使用的用户级别
     auth_level = 1 常量定义
-    SUCCESS_CODES = [200, 201, 202, 204]  # 成功状态码
-    RETRY_CODES = [408, 429, 500, 502, 503, 504]  # 可重试状态码
-    MIN_TIMEOUT = 1  # 最小超时时间（秒）
-    MAX_TIMEOUT = 60  # 最大超时时间（秒）
-    MIN_RETRY = 1  # 最小重试次数
-    MAX_RETRY = 10  # 最大重试次数
-
-    # 私有属性
+    SUCCESS_CODES = [200, 201, 202, 204]
+    RETRY_CODES = [408, 429, 500, 502, 503, 504]
+    MIN_TIMEOUT = 1
+    MAX_TIMEOUT = 60
+    MIN_RETRY = 1
+    MAX_RETRY = 10 私有属性
     _enabled = False
     _webhook_url = None
     _webhook_method = "POST"
@@ -54,7 +52,7 @@ class StrmWebhook(_PluginBase):
         if config:
             self._enabled = config.get("enabled", False)
             self._webhook_url = config.get("webhook_url", "").strip()
-            # 验证 URL 格式
+             验证 URL 格式
             if self._enabled and self._webhook_url:
                 if not self._webhook_url.startswith(('http://', 'https://')):
                     logger.error("❌ Webhook URL 格式错误，必须以 http:// 或 https:// 开头")
@@ -98,7 +96,7 @@ class StrmWebhook(_PluginBase):
             try:
                 for line in headers_str.strip().split("\n"):
                     line = line.strip()
-                    if not line or line.startswith("#"):  # 跳过空行和注释
+                    if not line or line.startswith("#"):
                         continue
                     if ":" in line:
                         key, value = line.split(":", 1)
@@ -121,7 +119,7 @@ class StrmWebhook(_PluginBase):
             try:
                 for line in custom_fields_str.strip().split("\n"):
                     line = line.strip()
-                    if not line or line.startswith("#"):  # 跳过空行和注释
+                    if not line or line.startswith("#"):
                         continue
                     if ":" in line:
                         key, value = line.split(":", 1)
@@ -207,6 +205,7 @@ class StrmWebhook(_PluginBase):
                     "message": f"⚠️ 连接失败，状态码: {status_code}",
                     "status_code": status_code,
                     "response": response.text[:500] if response and response.text else "无响应内容"
+                }
                 
         except requests.exceptions.Timeout:
             logger.error(f"⏱️ 测试超时（{self._timeout}秒）")
@@ -218,7 +217,7 @@ class StrmWebhook(_PluginBase):
             logger.error(f"🔌 连接失败: {str(e)}")
             return {
                 "success": False,
-                "message": f"🔌 连接失败: 无法连接到目标服务器"
+                "message": "🔌 连接失败: 无法连接到目标服务器"
             }
         except Exception as e:
             logger.error(f"❌ 测试异常: {str(e)}", exc_info=True)
@@ -323,7 +322,9 @@ class StrmWebhook(_PluginBase):
                                             'label': '请求方法',
                                             'items': [
                                                 {'title': 'POST', 'value': 'POST'},
-                                                {'title': 'PUT', 'value': 'PUT'}        }
+                                                {'title': 'PUT', 'value': 'PUT'}
+                                            ]
+                                        }
                                     }
                                 ]
                             }
@@ -518,34 +519,34 @@ class StrmWebhook(_PluginBase):
             "timestamp": datetime.now().isoformat(),
             "plugin_version": self.plugin_version,
             "data": {
-                "dest_path": event_data.get("dest"),  # 目标路径（入库后的路径）
-                "src_path": event_data.get("src"),  # 源路径
-                "dest_filename": event_data.get("dest_filename"),  # 目标文件名
+                "dest_path": event_data.get("dest"),
+                "src_path": event_data.get("src"),
+                "dest_filename": event_data.get("dest_filename"),
             }
         }
 
         # 如果启用发送媒体详细信息
         if self._send_media_info and mediainfo:
             media_data = {
-                "media_type": mediainfo.get("type"),  # 媒体类型：电影/电视剧
-                "title": mediainfo.get("title"),  # 标题
-                "year": mediainfo.get("year"),  # 年份
-                "tmdb_id": mediainfo.get("tmdb_id"),  # TMDB ID
-                "imdb_id": mediainfo.get("imdb_id"),  # IMDB ID
-                "category": mediainfo.get("category"),  # 分类
-             电视剧特有信息
+                "media_type": mediainfo.get("type"),
+                "title": mediainfo.get("title"),
+                "year": mediainfo.get("year"),
+                "tmdb_id": mediainfo.get("tmdb_id"),
+                "imdb_id": mediainfo.get("imdb_id"),
+                "category": mediainfo.get("category"), 电视剧特有信息
             if mediainfo.get("type") == "tv":
                 media_data.update({
-                    "season": mediainfo.get("season"),  # 季
-                    "episode": mediainfo.get("episode"),  # 集
-                    "tvdb_id": mediainfo.get("tvdb_id"),  # TVDB ID
-                }) 可选信息
-            if mediainfo.get("overview"):
-                media_data["overview"] = mediainfo.get("overview")  # 简介
-            if mediainfo.get("douban_id"):
-                media_data["douban_id"] = mediainfo.get("douban_id")  # 豆瓣 ID
+                    "season": mediainfo.get("season"),
+                    "episode": mediainfo.get("episode"),
+                    "tvdb_id": mediainfo.get("tvdb_id"),
+                })
             
-            payload["data"].update(media_data) 添加自定义字段（添加到根级别）
+            # 可选信息
+            if mediainfo.get("overview"):
+                media_data["overview"] = mediainfo.get("overview")
+            if mediainfo.get("douban_id"):
+                media_data["douban_id"] = mediainfo.get("douban_id")
+            payload["data"].update(media_data) 添加自定义字段
         if self._custom_fields:
             payload.update(self._custom_fields)
 
@@ -590,11 +591,9 @@ class StrmWebhook(_PluginBase):
                         if response.text:
                             logger.debug(f"错误信息: {response.text[:200]}")
                     else:
-                        # 客户端错误（4xx），不重试
                         logger.error(f"❌ 客户端错误 {response.status_code}，停止重试")
                         if response.text:
-                            logger.error(f"错误信息: {response.text[:200]}")
-                        return False
+                            logger.error(f"错误信息: {response.text[:200]}")return False
                 else:
                     logger.warn(f"⚠️ 无响应，将重试")
                         
@@ -607,7 +606,6 @@ class StrmWebhook(_PluginBase):
                 logger.error(f"🌐 请求异常 (尝试 {attempt}/{self._retry_times}): {str(e)}")except Exception as e:
                 logger.error(f"❌ 未知异常 (尝试 {attempt}/{self._retry_times}): {str(e)}", exc_info=True) 如果不是最后一次尝试，等待后重试
             if attempt < self._retry_times:
-                # 递增等待时间：3秒、6秒、9秒...，最多10秒
                 wait_time = min(3 * attempt, 10)
                 logger.info(f"⏳ 等待 {wait_time} 秒后重试...")
                 time.sleep(wait_time)
