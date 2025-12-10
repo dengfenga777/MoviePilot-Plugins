@@ -1,11 +1,9 @@
 {
-  "StrmWebhook": {
-    "name": "远程 STRM Webhook",
-    "description": "整理入库成功后，通过 Webhook 推送媒体信息到远程服务器生成 .strm 文件。",
-    "labels": "webhook,strm,media",
-    "version": "1.0.0",
-    "icon": "strmwebhook.png",
-    "author": "dengfenga777",
-    "level": 2
-  }
+  "id": "strmwebhook",
+  "name": "STRM Webhook 通知",
+  "version": "1.0.0",
+  "author": "misaya + chatgpt",
+  "desc": "入库后将目录结构通知 STRM 服务器，用于秒生成 .strm 文件。",
+  "dependencies": [],
+  "entry": "__init__.py"
 }
