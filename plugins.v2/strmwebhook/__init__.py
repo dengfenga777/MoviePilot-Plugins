@@ -1,186 +1,157 @@
-from datetime import datetime
-from typing import Any, List, Dict, Tuple
+# -*- coding: utf-8 -*-
+"""
+StrmWebhookNotify —— 专用于通知 STRM 服务器生成 .strm
+不会刷新媒体库，只发送 webhook
+"""
 
+import threading
+import time
+import json
+import requests
+from pathlib import Path
+from typing import Any, List, Dict, Tuple, Optional
+
+from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import EventType
 from app.schemas import TransferInfo
-from app.core.context import MediaInfo
-from app.utils.http import RequestUtils
+from app.schemas.types import EventType
 
 
 class StrmWebhookNotify(_PluginBase):
-    """
-    入库完成 → 发送 Webhook 通知，用于 STRM 秒生成
-    """
-
-    # ===== 插件元信息 =====
     plugin_name = "STRM Webhook 通知"
-    plugin_desc = "入库成功后发送 Webhook，供外部服务器生成 STRM 文件"
-    plugin_icon = "webhook.png"
+    plugin_desc = "入库完成后立即将入库目录结构发送到 STRM 服务器实现秒生成 .strm 文件。"
+    plugin_icon = "refresh2.png"
     plugin_version = "1.0.0"
-    plugin_author = "misaya"
-    author_url = "https://github.com"
+    plugin_author = "misaya + chatgpt"
+    author_url = "https://github.com/misaya"
     plugin_config_prefix = "strmwebhook_"
-    plugin_order = 15
+    plugin_order = 5
     auth_level = 1
 
-    # ===== 配置 =====
-    _enabled = False
-    _webhook_url = ""
-    _secret_key = ""
-    _timeout = 10
-    _retry = 3
-    _send_mediainfo = True
+    # ============== 插件内部状态 ==============
+    _enabled: bool = False
+    _webhook_url: str = ""
+    _token: str = ""
+    _timeout: int = 5
 
     def init_plugin(self, config: dict = None):
+        """读取插件配置"""
         if config:
             self._enabled = config.get("enabled", False)
             self._webhook_url = config.get("webhook_url", "")
-            self._secret_key = config.get("secret_key", "")
-            self._timeout = int(config.get("timeout", 10))
-            self._retry = int(config.get("retry", 3))
-            self._send_mediainfo = config.get("send_mediainfo", True)
+            self._token = config.get("token", "")
+            self._timeout = int(config.get("timeout", 5))
 
-        logger.info(
-            f"STRM Webhook 插件初始化完成："
-            f"{'启用' if self._enabled else '禁用'}"
-        )
+        logger.info(f"[STRM] 初始化插件 enabled={self._enabled}, url={self._webhook_url}")
 
-    def get_state(self) -> bool:
-        return self._enabled
-
-    def get_command(self) -> List[Dict[str, Any]]:
-        return []
-
-    def get_api(self) -> List[Dict[str, Any]]:
-        return []
-
+    # ============== 插件配置页面 ==============
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        插件配置 UI
+        返回两个内容：
+        1. 页面结构（前端表单）
+        2. 默认值
         """
         return [
             {
                 "component": "VForm",
                 "content": [
+
+                    # 开关
                     {
                         "component": "VSwitch",
                         "props": {
                             "model": "enabled",
-                            "label": "启用 STRM Webhook 通知"
+                            "label": "启用 STRM Webhook 功能",
                         }
                     },
+
+                    # webhook_url
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "webhook_url",
-                            "label": "Webhook URL",
-                            "placeholder": "http://strm-server:58090/mp_notify"
+                            "label": "Webhook URL（必填）",
+                            "placeholder": "http://127.0.0.1:7001/strm_event"
                         }
                     },
+
+                    # Token
                     {
                         "component": "VTextField",
                         "props": {
-                            "model": "secret_key",
-                            "label": "密钥（可选）"
+                            "model": "token",
+                            "label": "访问 Token（可选）"
                         }
                     },
-                    {
-                        "component": "VSwitch",
-                        "props": {
-                            "model": "send_mediainfo",
-                            "label": "发送媒体详细信息"
-                        }
-                    },
+
+                    # 超时
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "timeout",
-                            "label": "超时时间（秒）",
-                            "type": "number"
+                            "label": "请求超时（秒）",
+                            "placeholder": "默认为 5 秒"
                         }
                     },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "retry",
-                            "label": "失败重试次数",
-                            "type": "number"
-                        }
-                    }
                 ]
             }
         ], {
             "enabled": False,
             "webhook_url": "",
-            "secret_key": "",
-            "timeout": 10,
-            "retry": 3,
-            "send_mediainfo": True
+            "token": "",
+            "timeout": 5
         }
 
-    def get_page(self) -> List[dict]:
+    # ============== 插件无页面展示 ==============
+    def get_page(self):
         return []
 
-    # ===== 核心逻辑：只监听入库完成 =====
-
+    # ============== 监听入库事件 ==============
     @eventmanager.register(EventType.TransferComplete)
-    def notify(self, event: Event):
+    def handle_transfer_complete(self, event: Event):
+        """入库完成发送 webhook"""
+
         if not self._enabled:
             return
-
-        event_data = event.event_data or {}
-        transferinfo: TransferInfo = event_data.get("transferinfo")
-        mediainfo: MediaInfo = event_data.get("mediainfo")
-
-        if not transferinfo or not transferinfo.target_diritem:
-            logger.warning("Webhook：未获取到 target_diritem，跳过")
+        
+        event_data = event.event_data
+        if not event_data:
             return
 
-        dest_path = str(transferinfo.target_diritem.path)
+        transfer: TransferInfo = event_data.get("transferinfo")
+        mediainfo: MediaInfo = event_data.get("mediainfo")
+
+        if not transfer or not mediainfo:
+            return
+        
+        target_path = transfer.target_diritem.path
+        logger.info(f"[STRM] 触发 STRM Webhook，入库路径：{target_path}")
 
         payload = {
-            "event": "transfer_complete",
-            "timestamp": datetime.now().isoformat(),
-            "data": {
-                "dest_path": dest_path
-            }
+            "title": mediainfo.title,
+            "year": mediainfo.year,
+            "type": mediainfo.type,
+            "category": mediainfo.category,
+            "path": str(target_path)
         }
 
-        if self._send_mediainfo and mediainfo:
-            payload["data"].update({
-                "media_type": mediainfo.type,
-                "category": mediainfo.category,
-                "title": mediainfo.title,
-                "year": mediainfo.year,
-                "season": getattr(mediainfo, "season", None),
-                "episode": getattr(mediainfo, "episode", None),
-                "tmdb_id": getattr(mediainfo, "tmdbid", None),
-            })
-
         headers = {"Content-Type": "application/json"}
-        if self._secret_key:
-            headers["X-Secret-Key"] = self._secret_key
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
 
-        logger.info(f"📡 STRM Webhook -> {self._webhook_url}")
-        logger.info(f"📂 入库路径: {dest_path}")
-
-        request = RequestUtils(headers=headers, timeout=self._timeout)
-
-        for i in range(1, self._retry + 1):
-            try:
-                resp = request.post_res(self._webhook_url, json=payload)
-                if resp and resp.status_code in (200, 201, 202):
-                    logger.info("✅ STRM Webhook 发送成功")
-                    return
-                else:
-                    logger.warning(f"Webhook 失败 [{i}/{self._retry}]")
-            except Exception as e:
-                logger.error(f"Webhook 异常 [{i}/{self._retry}]: {e}")
-
-        logger.error("❌ STRM Webhook 发送失败（已达最大重试次数）")
+        try:
+            r = requests.post(
+                self._webhook_url,
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=self._timeout
+            )
+            logger.info(f"[STRM] 通知完成：HTTP {r.status_code}")
+        except Exception as e:
+            logger.error(f"[STRM] Webhook 调用失败：{e}")
 
     def stop_service(self):
-        pass
+        """插件卸载时"""
+        logger.info("[STRM] 插件已停止")
