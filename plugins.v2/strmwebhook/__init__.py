@@ -22,7 +22,7 @@ from app.schemas.types import EventType
 class StrmWebhookNotify(_PluginBase):
     plugin_name = "STRM Webhook 通知"
     plugin_desc = "入库完成后立即将入库目录结构发送到 STRM 服务器实现秒生成 .strm 文件。"
-    plugin_icon = "refresh2.png"
+    plugin_icon = "None"
     plugin_version = "1.0.0"
     plugin_author = "misaya + chatgpt"
     author_url = "https://github.com/misaya"
