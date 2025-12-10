@@ -3,7 +3,7 @@
     "name": "远程 STRM Webhook",
     "description": "整理入库成功后，通过 Webhook 推送媒体信息到远程服务器生成 .strm 文件。",
     "labels": "webhook,strm,media",
-    "version": "1.1.0",
+    "version": "1.0.0",
     "icon": "strmwebhook.png",
     "author": "dengfenga777",
     "level": 2
