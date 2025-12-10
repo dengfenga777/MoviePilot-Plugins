@@ -13,7 +13,7 @@ class Strmwebhook(_PluginBase):
 
     plugin_name = "远程 STRM Webhook"
     plugin_desc = "入库整理完成后，通过 Webhook 通知远端生成 STRM 文件"
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/webhook.png"
+    plugin_icon = "none"
     plugin_version = "1.0.0"
     plugin_author = "misaya"
     author_url = "https://github.com/dengfenga777"
