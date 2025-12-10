@@ -1,614 +1,186 @@
-from typing import Any, List, Dict, Tuple, Optional
 from datetime import datetime
-import time
-import requests
+from typing import Any, List, Dict, Tuple
 
 from app.core.event import eventmanager, Event
+from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
-from app.log import logger
+from app.schemas import TransferInfo
+from app.core.context import MediaInfo
 from app.utils.http import RequestUtils
 
 
-class StrmWebhook(_PluginBase):
-    # 插件名称
-    plugin_name = "STRM Webhook通知"
-    # 插件描述
-    plugin_desc = "入库成功后通过Webhook通知其他服务器生成STRM链接"
-    # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/webhook.png"
-    # 插件版本
-    plugin_version = "1.1.0"
-    # 插件作者
-    plugin_author = "MoviePilot"
-    # 作者主页
+class StrmWebhookNotify(_PluginBase):
+    """
+    入库完成 → 发送 Webhook 通知，用于 STRM 秒生成
+    """
+
+    # ===== 插件元信息 =====
+    plugin_name = "STRM Webhook 通知"
+    plugin_desc = "入库成功后发送 Webhook，供外部服务器生成 STRM 文件"
+    plugin_icon = "webhook.png"
+    plugin_version = "1.0.0"
+    plugin_author = "misaya"
     author_url = "https://github.com"
-    # 插件配置项ID前缀
     plugin_config_prefix = "strmwebhook_"
-    # 加载顺序
     plugin_order = 15
-    # 可使用的用户级别
-    auth_level = 1 常量定义
-    SUCCESS_CODES = [200, 201, 202, 204]
-    RETRY_CODES = [408, 429, 500, 502, 503, 504]
-    MIN_TIMEOUT = 1
-    MAX_TIMEOUT = 60
-    MIN_RETRY = 1
-    MAX_RETRY = 10 私有属性
+    auth_level = 1
+
+    # ===== 配置 =====
     _enabled = False
-    _webhook_url = None
-    _webhook_method = "POST"
-    _webhook_headers = {}
-    _retry_times = 3
-    _timeout = 10
-    _send_media_info = True
-    _custom_fields = {}
+    _webhook_url = ""
     _secret_key = ""
+    _timeout = 10
+    _retry = 3
+    _send_mediainfo = True
 
     def init_plugin(self, config: dict = None):
-        """
-        初始化插件
-        """
         if config:
             self._enabled = config.get("enabled", False)
-            self._webhook_url = config.get("webhook_url", "").strip()
-             验证 URL 格式
-            if self._enabled and self._webhook_url:
-                if not self._webhook_url.startswith(('http://', 'https://')):
-                    logger.error("❌ Webhook URL 格式错误，必须以 http:// 或 https:// 开头")
-                    self._enabled = False
-            
-            self._webhook_method = config.get("webhook_method", "POST")
-            # 限制超时时间范围
-            try:
-                self._timeout = max(self.MIN_TIMEOUT, min(int(config.get("timeout", 10)), self.MAX_TIMEOUT))
-            except (ValueError, TypeError):
-                self._timeout = 10
-                logger.warn("⚠️ 超时时间配置无效，使用默认值: 10秒")
-            
-            # 限制重试次数范围
-            try:
-                self._retry_times = max(self.MIN_RETRY, min(int(config.get("retry_times", 3)), self.MAX_RETRY))
-            except (ValueError, TypeError):
-                self._retry_times = 3
-                logger.warn("⚠️ 重试次数配置无效，使用默认值: 3次")
-            
-            self._send_media_info = config.get("send_media_info", True)
-            self._secret_key = config.get("secret_key", "").strip()
-            
-            # 解析自定义请求头
-            self._webhook_headers = self._parse_headers(config.get("webhook_headers", ""))
-            
-            # 解析自定义字段
-            self._custom_fields = self._parse_custom_fields(config.get("custom_fields", ""))logger.info(f"✅ STRM Webhook插件初始化完成")
-        logger.info(f"   状态: {'启用' if self._enabled else '禁用'}")
-        if self._enabled and self._webhook_url:
-            logger.info(f"   URL: {self._webhook_url}")logger.info(f"   方法: {self._webhook_method}")
-            logger.info(f"   超时: {self._timeout}秒")
-            logger.info(f"   重试: {self._retry_times}次")
+            self._webhook_url = config.get("webhook_url", "")
+            self._secret_key = config.get("secret_key", "")
+            self._timeout = int(config.get("timeout", 10))
+            self._retry = int(config.get("retry", 3))
+            self._send_mediainfo = config.get("send_mediainfo", True)
 
-    def _parse_headers(self, headers_str: str) -> dict:
-        """
-        解析自定义请求头
-        """
-        headers = {}
-        if headers_str:
-            try:
-                for line in headers_str.strip().split("\n"):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        headers[key.strip()] = value.strip()
-            except Exception as e:
-                logger.error(f"❌ 解析请求头失败: {str(e)}")
-                return {}
-         默认添加 Content-Type
-        if "Content-Type" not in headers:
-            headers["Content-Type"] = "application/json"
-        
-        return headers
-
-    def _parse_custom_fields(self, custom_fields_str: str) -> dict:
-        """
-        解析自定义字段
-        """
-        custom_fields = {}
-        if custom_fields_str:
-            try:
-                for line in custom_fields_str.strip().split("\n"):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        custom_fields[key.strip()] = value.strip()
-            except Exception as e:
-                logger.error(f"❌ 解析自定义字段失败: {str(e)}")
-                return {}
-        
-        return custom_fields
+        logger.info(
+            f"STRM Webhook 插件初始化完成："
+            f"{'启用' if self._enabled else '禁用'}"
+        )
 
     def get_state(self) -> bool:
-        """
-        获取插件状态
-        """
         return self._enabled
 
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
-        """
-        定义远程控制命令
-        """
+    def get_command(self) -> List[Dict[str, Any]]:
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """
-        获取插件API
-        """
-        return [{
-            "path": "/test_webhook",
-            "endpoint": self.test_webhook,
-            "methods": ["GET"],
-            "summary": "测试Webhook连接",
-            "description": "发送测试消息到配置的Webhook地址"
-        }]
-
-    def test_webhook(self) -> dict:
-        """
-        测试webhook连接
-        """
-        if not self._webhook_url:
-            return {
-                "success": False,
-                "message": "❌ Webhook URL未配置"
-            }
-        
-        test_payload = {
-            "event": "test",
-            "timestamp": datetime.now().isoformat(),
-            "message": "这是一条来自 STRM Webhook 插件的测试消息",
-            "plugin_version": self.plugin_version
-        }
-        
-        # 添加自定义字段
-        if self._custom_fields:
-            test_payload.update(self._custom_fields)
-        
-        logger.info(f"🧪 开始测试Webhook连接: {self._webhook_url}")
-        try:
-            headers = self._webhook_headers.copy()
-            if self._secret_key:
-                headers["X-Secret-Key"] = self._secret_key
-            
-            request_utils = RequestUtils(headers=headers, timeout=self._timeout)
-            
-            if self._webhook_method == "POST":
-                response = request_utils.post_res(url=self._webhook_url, json=test_payload)
-            else:
-                response = request_utils.put_res(url=self._webhook_url, json=test_payload)
-            
-            if response and response.status_code in self.SUCCESS_CODES:
-                logger.info(f"✅ 测试成功！状态码: {response.status_code}")
-                return {
-                    "success": True,
-                    "message": f"✅ 连接成功！状态码: {response.status_code}",
-                    "status_code": response.status_code,
-                    "response": response.text[:500] if response.text else "无响应内容"
-                }
-            else:
-                status_code = response.status_code if response else "无响应"
-                logger.warn(f"⚠️ 测试失败，状态码: {status_code}")
-                return {
-                    "success": False,
-                    "message": f"⚠️ 连接失败，状态码: {status_code}",
-                    "status_code": status_code,
-                    "response": response.text[:500] if response and response.text else "无响应内容"
-                }
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"⏱️ 测试超时（{self._timeout}秒）")
-            return {
-                "success": False,
-                "message": f"⏱️ 连接超时（{self._timeout}秒）"
-            }
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"🔌 连接失败: {str(e)}")
-            return {
-                "success": False,
-                "message": "🔌 连接失败: 无法连接到目标服务器"
-            }
-        except Exception as e:
-            logger.error(f"❌ 测试异常: {str(e)}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"❌ 测试失败: {str(e)}"
-            }
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
+        插件配置 UI
         """
         return [
             {
-                'component': 'VForm',
-                'content': [
+                "component": "VForm",
+                "content": [
                     {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'enabled',
-                                            'label': '启用插件',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'send_media_info',
-                                            'label': '发送媒体详细信息',
-                                        }]
-                            }
-                        ]
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "enabled",
+                            "label": "启用 STRM Webhook 通知"
+                        }
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'webhook_url',
-                                            'label': 'Webhook URL',
-                                            'placeholder': 'http://your-server.com/api/webhook',
-                                            'hint': '接收通知的服务器地址（必须以 http:// 或 https:// 开头）'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        "component": "VTextField",
+                        "props": {
+                            "model": "webhook_url",
+                            "label": "Webhook URL",
+                            "placeholder": "http://strm-server:58090/mp_notify"
+                        }
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'secret_key',
-                                            'label': '密钥（可选）',
-                                            'placeholder': '用于验证请求的密钥',
-                                            'hint': '如设置，会在请求头中添加 X-Secret-Key'    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'webhook_method',
-                                            'label': '请求方法',
-                                            'items': [
-                                                {'title': 'POST', 'value': 'POST'},
-                                                {'title': 'PUT', 'value': 'PUT'}
-                                            ]
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        "component": "VTextField",
+                        "props": {
+                            "model": "secret_key",
+                            "label": "密钥（可选）"
+                        }
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'timeout',
-                                            'label': '超时时间(秒)',
-                                            'type': 'number',
-                                            'hint': f'范围: {self.MIN_TIMEOUT}-{self.MAX_TIMEOUT}秒'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'retry_times',
-                                            'label': '重试次数',
-                                            'type': 'number',
-                                            'hint': f'范围: {self.MIN_RETRY}-{self.MAX_RETRY}次'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "send_mediainfo",
+                            "label": "发送媒体详细信息"
+                        }
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'webhook_headers',
-                                            'label': '自定义请求头',
-                                            'placeholder': 'Authorization: Bearer your-token\nX-Custom-Header: value\n# 以 # 开头的行为注释',
-                                            'hint': '每行一个，格式：Key: Value（支持 # 注释）',
-                                            'rows': 4
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        "component": "VTextField",
+                        "props": {
+                            "model": "timeout",
+                            "label": "超时时间（秒）",
+                            "type": "number"
+                        }
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'custom_fields',
-                                            'label': '自定义字段',
-                                            'placeholder': 'server_name: MyServer\napi_version: v1\n# 以 # 开头的行为注释',
-                                            'hint': '每行一个，格式：Key: Value，将添加到发送的数据中（支持 # 注释）',
-                                            'rows': 4
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '📢 入库成功后会自动通知配置的Webhook地址，发送文件路径、媒体类型、标题等信息。可通过插件API测试连接：GET /api/v1/plugin/StrmWebhook/test_webhook'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'success',
-                                            'variant': 'tonal',
-                                            'text': '💡 提示：配置完成后建议先使用测试功能验证连接是否正常'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        "component": "VTextField",
+                        "props": {
+                            "model": "retry",
+                            "label": "失败重试次数",
+                            "type": "number"
+                        }
                     }
                 ]
-            }], {
+            }
+        ], {
             "enabled": False,
             "webhook_url": "",
-            "webhook_method": "POST",
+            "secret_key": "",
             "timeout": 10,
-            "retry_times": 3,
-            "send_media_info": True,
-            "webhook_headers": "",
-            "custom_fields": "",
-            "secret_key": ""
+            "retry": 3,
+            "send_mediainfo": True
+        }
 
     def get_page(self) -> List[dict]:
-        """
-        拼装插件详情页面，需要返回页面配置，同时附带数据
-        """
         return []
 
-    def stop_service(self):
-        """
-        退出插件
-        """
-        logger.info("🛑 STRM Webhook插件已停止")eventmanager.register(EventType.TransferComplete)
-    def send_webhook(self, event: Event):
-        """
-        发送webhook通知
-        """
+    # ===== 核心逻辑：只监听入库完成 =====
+
+    @eventmanager.register(EventType.TransferComplete)
+    def notify(self, event: Event):
         if not self._enabled:
             return
-        
-        if not self._webhook_url:
-            logger.warn("❌ Webhook URL未配置，跳过发送")
+
+        event_data = event.event_data or {}
+        transferinfo: TransferInfo = event_data.get("transferinfo")
+        mediainfo: MediaInfo = event_data.get("mediainfo")
+
+        if not transferinfo or not transferinfo.target_diritem:
+            logger.warning("Webhook：未获取到 target_diritem，跳过")
             return
 
-        try:
-            event_data = event.event_data
-            if not event_data:
-                logger.warn("❌ 事件数据为空，跳过发送")
-                return
+        dest_path = str(transferinfo.target_diritem.path)
 
-            # 获取媒体信息
-            mediainfo = event_data.get("mediainfo") or {}
-            
-            # 构建发送数据
-            payload = self._build_payload(event_data, mediainfo)
-            
-            # 发送请求
-            success = self._send_request_with_retry(payload)
-            
-            if success:
-                logger.info("🎉 Webhook通知处理完成")
-            else:
-                logger.error("💥 Webhook通知发送失败")
-            
-        except Exception as e:
-            logger.error(f"❌ Webhook处理异常: {str(e)}", exc_info=True)
-
-    def _build_payload(self, event_data: dict, mediainfo: dict) -> dict:
-        """
-        构建请求负载
-        """
         payload = {
             "event": "transfer_complete",
             "timestamp": datetime.now().isoformat(),
-            "plugin_version": self.plugin_version,
             "data": {
-                "dest_path": event_data.get("dest"),
-                "src_path": event_data.get("src"),
-                "dest_filename": event_data.get("dest_filename"),
+                "dest_path": dest_path
             }
         }
 
-        # 如果启用发送媒体详细信息
-        if self._send_media_info and mediainfo:
-            media_data = {
-                "media_type": mediainfo.get("type"),
-                "title": mediainfo.get("title"),
-                "year": mediainfo.get("year"),
-                "tmdb_id": mediainfo.get("tmdb_id"),
-                "imdb_id": mediainfo.get("imdb_id"),
-                "category": mediainfo.get("category"), 电视剧特有信息
-            if mediainfo.get("type") == "tv":
-                media_data.update({
-                    "season": mediainfo.get("season"),
-                    "episode": mediainfo.get("episode"),
-                    "tvdb_id": mediainfo.get("tvdb_id"),
-                })
-            
-            # 可选信息
-            if mediainfo.get("overview"):
-                media_data["overview"] = mediainfo.get("overview")
-            if mediainfo.get("douban_id"):
-                media_data["douban_id"] = mediainfo.get("douban_id")
-            payload["data"].update(media_data) 添加自定义字段
-        if self._custom_fields:
-            payload.update(self._custom_fields)
+        if self._send_mediainfo and mediainfo:
+            payload["data"].update({
+                "media_type": mediainfo.type,
+                "category": mediainfo.category,
+                "title": mediainfo.title,
+                "year": mediainfo.year,
+                "season": getattr(mediainfo, "season", None),
+                "episode": getattr(mediainfo, "episode", None),
+                "tmdb_id": getattr(mediainfo, "tmdbid", None),
+            })
 
-        return payload
-
-    def _send_request_with_retry(self, payload: dict) -> bool:
-        """
-        发送请求并重试
-        """
-        headers = self._webhook_headers.copy()
-         如果设置了密钥，添加到请求头
+        headers = {"Content-Type": "application/json"}
         if self._secret_key:
             headers["X-Secret-Key"] = self._secret_key
 
-        logger.info(f"🚀 准备发送Webhook通知")
-        logger.info(f"   目标: {self._webhook_url}")
-        logger.info(f"   方法: {self._webhook_method}")
-        logger.debug(f"📦 发送数据: {payload}")
+        logger.info(f"📡 STRM Webhook -> {self._webhook_url}")
+        logger.info(f"📂 入库路径: {dest_path}")
 
-        for attempt in range(1, self._retry_times + 1):
+        request = RequestUtils(headers=headers, timeout=self._timeout)
+
+        for i in range(1, self._retry + 1):
             try:
-                logger.info(f"📤 尝试发送 ({attempt}/{self._retry_times})...")
-                
-                request_utils = RequestUtils(
-                    headers=headers,
-                    timeout=self._timeout
-                )
-                
-                # 发送请求
-                if self._webhook_method == "POST":
-                    response = request_utils.post_res(url=self._webhook_url, json=payload)
+                resp = request.post_res(self._webhook_url, json=payload)
+                if resp and resp.status_code in (200, 201, 202):
+                    logger.info("✅ STRM Webhook 发送成功")
+                    return
                 else:
-                    response = request_utils.put_res(url=self._webhook_url, json=payload) 检查响应
-                if response:
-                    if response.status_code in self.SUCCESS_CODES:
-                        logger.info(f"✅ Webhook通知发送成功！状态码: {response.status_code}")
-                        if response.text:
-                            logger.debug(f"📝 响应内容: {response.text[:200]}")
-                        return True
-                    elif response.status_code in self.RETRY_CODES:
-                        logger.warn(f"⚠️ 服务器临时错误 {response.status_code}，将重试")
-                        if response.text:
-                            logger.debug(f"错误信息: {response.text[:200]}")
-                    else:
-                        logger.error(f"❌ 客户端错误 {response.status_code}，停止重试")
-                        if response.text:
-                            logger.error(f"错误信息: {response.text[:200]}")return False
-                else:
-                    logger.warn(f"⚠️ 无响应，将重试")
-                        
-            except requests.exceptions.Timeout:
-                logger.error(f"⏱️ 请求超时（{self._timeout}秒）(尝试 {attempt}/{self._retry_times})")
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"🔌 连接失败 (尝试 {attempt}/{self._retry_times}): 无法连接到目标服务器")
-                logger.debug(f"详细错误: {str(e)}")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"🌐 请求异常 (尝试 {attempt}/{self._retry_times}): {str(e)}")except Exception as e:
-                logger.error(f"❌ 未知异常 (尝试 {attempt}/{self._retry_times}): {str(e)}", exc_info=True) 如果不是最后一次尝试，等待后重试
-            if attempt < self._retry_times:
-                wait_time = min(3 * attempt, 10)
-                logger.info(f"⏳ 等待 {wait_time} 秒后重试...")
-                time.sleep(wait_time)
+                    logger.warning(f"Webhook 失败 [{i}/{self._retry}]")
+            except Exception as e:
+                logger.error(f"Webhook 异常 [{i}/{self._retry}]: {e}")
 
-        logger.error(f"💥 Webhook通知发送失败，已重试 {self._retry_times} 次")
-        return False
+        logger.error("❌ STRM Webhook 发送失败（已达最大重试次数）")
+
+    def stop_service(self):
+        pass
