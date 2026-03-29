@@ -1,9 +1,14 @@
 {
-  "id": "strmwebhook",
-  "name": "STRM Webhook 通知",
-  "version": "1.0.0",
-  "author": "misaya + chatgpt",
-  "desc": "入库后将目录结构通知 STRM 服务器，用于秒生成 .strm 文件。",
-  "dependencies": [],
-  "entry": "__init__.py"
+  "RssBestVersion": {
+    "name": "RSS优选下载",
+    "description": "RSS 刷新后识别同一剧集的多个版本，只下载优先级最高的资源。",
+    "labels": "RSS,下载,剧集",
+    "version": "1.0",
+    "icon": "rss.png",
+    "author": "Codex",
+    "level": 2,
+    "history": {
+      "v1.0": "首个版本，支持同一剧集 4K 优先于 1080p，且允许更大体积版本再次推送下载。"
+    }
+  }
 }
