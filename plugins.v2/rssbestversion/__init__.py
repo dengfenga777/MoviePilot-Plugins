@@ -23,7 +23,16 @@ from app.schemas.types import SystemConfigKey, MediaType
 
 lock = Lock()
 COMPLETE_HINTS = re.compile(
-    r"(complete|全集|全季|全\d+集|全\d+话|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
+    r"(complete|全集|全季|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
+    re.IGNORECASE,
+)
+MULTI_EPISODE_HINTS = re.compile(
+    r"("
+    r"s\d{1,2}e\d{1,3}\s*[-~]\s*e?\d{1,3}"
+    r"|e\d{1,3}\s*[-~]\s*e?\d{1,3}"
+    r"|第\s*\d+\s*[-~到至]\s*\d+\s*集"
+    r"|\b\d{1,3}\s*[-~]\s*\d{1,3}\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -68,7 +77,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -512,7 +521,7 @@ class RssBestVersion(_PluginBase):
         if self._exclude and re.search(self._exclude, f"{title} {description}", re.IGNORECASE):
             logger.info("%s 命中排除规则", title)
             return None
-        if self._skip_complete and COMPLETE_HINTS.search(f"{title} {description or ''}"):
+        if self._skip_complete and self.__should_skip_complete_pack(title=title, description=description):
             logger.info("%s 命中整季/完结包过滤规则，已跳过", title)
             return None
         if self._size_range and not self.__match_size_range(size):
@@ -753,6 +762,18 @@ class RssBestVersion(_PluginBase):
             if domain:
                 rules[domain] = parsed_score
         return rules
+
+    def __should_skip_complete_pack(self, title: str, description: Optional[str]) -> bool:
+        text = f"{title} {description or ''}"
+        normalized = text.lower()
+        if not COMPLETE_HINTS.search(normalized):
+            return False
+
+        # 两集或多集连发应保留，不应被误判为完结包。
+        if MULTI_EPISODE_HINTS.search(normalized):
+            return False
+
+        return True
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]
