@@ -22,6 +22,10 @@ from app.schemas import ExistMediaInfo
 from app.schemas.types import SystemConfigKey, MediaType
 
 lock = Lock()
+COMPLETE_HINTS = re.compile(
+    r"(complete|全集|全季|全\d+集|全\d+话|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -61,7 +65,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -86,6 +90,7 @@ class RssBestVersion(_PluginBase):
     _size_range: str = ""
     _prefer_hevc: bool = True
     _quality_order: str = "2160p,1080p,720p,other"
+    _skip_complete: bool = True
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -106,6 +111,7 @@ class RssBestVersion(_PluginBase):
             self._size_range = config.get("size_range") or ""
             self._prefer_hevc = bool(config.get("prefer_hevc", True))
             self._quality_order = config.get("quality_order") or "2160p,1080p,720p,other"
+            self._skip_complete = bool(config.get("skip_complete", True))
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -227,7 +233,10 @@ class RssBestVersion(_PluginBase):
                     },
                     {
                         "component": "VRow",
-                        "content": [_col(4, _switch("prefer_hevc", "同分辨率优先 HEVC/H265"))],
+                        "content": [
+                            _col(4, _switch("prefer_hevc", "同分辨率优先 HEVC/H265")),
+                            _col(4, _switch("skip_complete", "过滤整季/完结包")),
+                        ],
                     },
                     {
                         "component": "VRow",
@@ -269,6 +278,7 @@ class RssBestVersion(_PluginBase):
             "size_range": "",
             "prefer_hevc": True,
             "quality_order": "2160p,1080p,720p,other",
+            "skip_complete": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -363,6 +373,7 @@ class RssBestVersion(_PluginBase):
                 "size_range": self._size_range,
                 "prefer_hevc": self._prefer_hevc,
                 "quality_order": self._quality_order,
+                "skip_complete": self._skip_complete,
             }
         )
 
@@ -479,6 +490,9 @@ class RssBestVersion(_PluginBase):
             return None
         if self._exclude and re.search(self._exclude, f"{title} {description}", re.IGNORECASE):
             logger.info("%s 命中排除规则", title)
+            return None
+        if self._skip_complete and COMPLETE_HINTS.search(f"{title} {description or ''}"):
+            logger.info("%s 命中整季/完结包过滤规则，已跳过", title)
             return None
         if self._size_range and not self.__match_size_range(size):
             logger.info("%s - 种子大小不在指定范围", title)
