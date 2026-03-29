@@ -36,9 +36,11 @@ class Candidate:
     meta: MetaInfo
     mediainfo: MediaInfo
     source_url: str
+    site_name: str
     group_keys: List[str]
     quality_label: str
     quality_score: int
+    site_score: int
     codec_score: int
     size_score: int
     pubdate_score: int
@@ -52,9 +54,10 @@ class Candidate:
         return self.raw_title
 
     @property
-    def sort_tuple(self) -> Tuple[int, int, int, int]:
+    def sort_tuple(self) -> Tuple[int, int, int, int, int]:
         return (
             self.quality_score,
+            self.site_score,
             self.codec_score,
             self.size_score,
             self.pubdate_score,
@@ -65,7 +68,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -91,6 +94,7 @@ class RssBestVersion(_PluginBase):
     _prefer_hevc: bool = True
     _quality_order: str = "2160p,1080p,720p,other"
     _skip_complete: bool = True
+    _site_priority: str = ""
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -112,6 +116,7 @@ class RssBestVersion(_PluginBase):
             self._prefer_hevc = bool(config.get("prefer_hevc", True))
             self._quality_order = config.get("quality_order") or "2160p,1080p,720p,other"
             self._skip_complete = bool(config.get("skip_complete", True))
+            self._site_priority = config.get("site_priority") or ""
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -241,6 +246,20 @@ class RssBestVersion(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            _col(
+                                12,
+                                _textarea(
+                                    "site_priority",
+                                    "站点优先级",
+                                    "每行一个：pt1.com=100\\npt2.com=80\\n未配置的站点默认 0",
+                                    rows=4,
+                                ),
+                            )
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12},
@@ -279,6 +298,7 @@ class RssBestVersion(_PluginBase):
             "prefer_hevc": True,
             "quality_order": "2160p,1080p,720p,other",
             "skip_complete": True,
+            "site_priority": "",
         }
 
     def get_page(self) -> List[dict]:
@@ -374,6 +394,7 @@ class RssBestVersion(_PluginBase):
                 "prefer_hevc": self._prefer_hevc,
                 "quality_order": self._quality_order,
                 "skip_complete": self._skip_complete,
+                "site_priority": self._site_priority,
             }
         )
 
@@ -531,6 +552,7 @@ class RssBestVersion(_PluginBase):
         exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
         group_keys = self.__build_group_keys(mediainfo=mediainfo, meta=meta)
         size_score = self.__safe_int(size)
+        site_name = self.__site_name(source_url)
         if not group_keys:
             logger.info("%s 未识别到可比较的剧集键", title)
             return None
@@ -564,6 +586,7 @@ class RssBestVersion(_PluginBase):
             return None
 
         quality_label, quality_score = self.__quality_rank(f"{title} {description or ''}")
+        site_score = self.__site_priority_score(site_name)
         codec_score = self.__codec_rank(f"{title} {description or ''}")
         pubdate_score = int(pubdate.timestamp()) if pubdate else 0
 
@@ -574,9 +597,11 @@ class RssBestVersion(_PluginBase):
             meta=meta,
             mediainfo=mediainfo,
             source_url=source_url,
+            site_name=site_name,
             group_keys=group_keys,
             quality_label=quality_label,
             quality_score=quality_score,
+            site_score=site_score,
             codec_score=codec_score,
             size_score=size_score,
             pubdate_score=pubdate_score,
@@ -592,12 +617,14 @@ class RssBestVersion(_PluginBase):
                     best_for_key[group_key] = candidate
                     if current and current.raw_title != candidate.raw_title:
                         logger.info(
-                            "同一剧集版本替换：%s -> %s | key=%s | %s > %s",
+                            "同一剧集版本替换：%s -> %s | key=%s | 质量=%s>%s | 站点=%s(%s)",
                             current.raw_title,
                             candidate.raw_title,
                             group_key,
                             candidate.quality_label,
                             current.quality_label,
+                            candidate.site_name,
+                            candidate.site_score,
                         )
         return best_for_key
 
@@ -695,6 +722,37 @@ class RssBestVersion(_PluginBase):
             return int(float(value))
         except (TypeError, ValueError):
             return 0
+
+    def __site_priority_score(self, site_name: str) -> int:
+        if not site_name:
+            return 0
+        rules = self.__parse_site_priority()
+        site_name = site_name.lower()
+        exact = rules.get(site_name)
+        if exact is not None:
+            return exact
+        best_match = 0
+        for domain, score in rules.items():
+            if site_name == domain or site_name.endswith(f".{domain}"):
+                best_match = max(best_match, score)
+        return best_match
+
+    def __parse_site_priority(self) -> Dict[str, int]:
+        rules: Dict[str, int] = {}
+        for raw_line in self._site_priority.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            domain, score = line.split("=", 1)
+            domain = domain.strip().lower()
+            if domain.startswith("http://") or domain.startswith("https://"):
+                domain = self.__site_name(domain)
+            parsed_score = self.__safe_int(score.strip())
+            if domain:
+                rules[domain] = parsed_score
+        return rules
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]
