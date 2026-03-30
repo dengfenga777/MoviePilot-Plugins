@@ -23,7 +23,7 @@ from app.schemas.types import SystemConfigKey, MediaType
 
 lock = Lock()
 COMPLETE_HINTS = re.compile(
-    r"(complete|全集|全季|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
+    r"(complete|全集|全季|全\s*\d+\s*[集话]|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
     re.IGNORECASE,
 )
 MULTI_EPISODE_HINTS = re.compile(
@@ -77,7 +77,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -251,7 +251,7 @@ class RssBestVersion(_PluginBase):
                         "component": "VRow",
                         "content": [
                             _col(4, _switch("prefer_hevc", "同分辨率优先 HEVC/H265")),
-                            _col(4, _switch("skip_complete", "过滤整季/完结包")),
+                            _col(4, _switch("skip_complete", "整季/完结包库里有则跳过")),
                             _col(4, _switch("skip_tv_without_episode", "电视剧无集号则跳过")),
                         ],
                     },
@@ -526,13 +526,11 @@ class RssBestVersion(_PluginBase):
         if self._exclude and re.search(self._exclude, f"{title} {description}", re.IGNORECASE):
             logger.info("%s 命中排除规则", title)
             return None
-        if self._skip_complete and self.__should_skip_complete_pack(title=title, description=description):
-            logger.info("%s 命中整季/完结包过滤规则，已跳过", title)
-            return None
         if self._size_range and not self.__match_size_range(size):
             logger.info("%s - 种子大小不在指定范围", title)
             return None
 
+        is_complete_pack = self.__is_complete_pack(title=title, description=description)
         meta_title = self.__build_meta_title(title=title, description=description)
         meta = MetaInfo(title=meta_title, subtitle=description)
         if not meta.name:
@@ -573,10 +571,14 @@ class RssBestVersion(_PluginBase):
             return None
 
         if mediainfo.type == MediaType.TV:
-            if self._skip_tv_without_episode and not (meta.episode_list or []):
+            if is_complete_pack and self._skip_complete:
+                if self.__complete_pack_exists_in_library(meta=meta, exist_info=exist_info):
+                    logger.info("%s %s 命中整季/完结包规则，媒体库已有内容，已跳过", mediainfo.title_year, meta.season or "")
+                    return None
+            elif self._skip_tv_without_episode and not (meta.episode_list or []):
                 logger.info("%s 未识别到集号，按配置跳过该电视剧资源", title)
                 return None
-            if exist_info and self.__all_episodes_exist(meta=meta, exist_info=exist_info):
+            if not is_complete_pack and exist_info and self.__all_episodes_exist(meta=meta, exist_info=exist_info):
                 logger.info("%s %s 已存在", mediainfo.title_year, meta.season_episode)
                 return None
             remaining_keys = []
@@ -590,13 +592,13 @@ class RssBestVersion(_PluginBase):
                     logger.info(
                         "%s %s 检测到更大版本，允许再次推送：%s > %s",
                         mediainfo.title_year,
-                        meta.season_episode,
+                        self.__season_episode_text(meta),
                         size_score,
                         previous_size,
                     )
                     remaining_keys.append(key)
             if not remaining_keys:
-                logger.info("%s %s 已在下载历史中，且未发现更大体积版本", mediainfo.title_year, meta.season_episode)
+                logger.info("%s %s 已在下载历史中，且未发现更大体积版本", mediainfo.title_year, self.__season_episode_text(meta))
                 return None
             group_keys = remaining_keys
         elif exist_info:
@@ -845,7 +847,7 @@ class RssBestVersion(_PluginBase):
                 return f"E{episode:02d}"
         return None
 
-    def __should_skip_complete_pack(self, title: str, description: Optional[str]) -> bool:
+    def __is_complete_pack(self, title: str, description: Optional[str]) -> bool:
         text = f"{title} {description or ''}"
         normalized = text.lower()
         if not COMPLETE_HINTS.search(normalized):
@@ -856,6 +858,21 @@ class RssBestVersion(_PluginBase):
             return False
 
         return True
+
+    @staticmethod
+    def __complete_pack_exists_in_library(meta: MetaInfo, exist_info: Optional[ExistMediaInfo]) -> bool:
+        if not exist_info:
+            return False
+
+        seasons = getattr(exist_info, "seasons", None)
+        season = meta.begin_season or 1
+
+        if not seasons:
+            # 已识别到媒体存在，但拿不到季集细节时保守跳过，避免整季包重复下发。
+            return True
+
+        season_episodes = seasons.get(season)
+        return bool(season_episodes)
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]
