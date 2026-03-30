@@ -77,7 +77,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -533,7 +533,8 @@ class RssBestVersion(_PluginBase):
             logger.info("%s - 种子大小不在指定范围", title)
             return None
 
-        meta = MetaInfo(title=title, subtitle=description)
+        meta_title = self.__build_meta_title(title=title, description=description)
+        meta = MetaInfo(title=meta_title, subtitle=description)
         if not meta.name:
             logger.warning("%s 未识别到有效数据", title)
             return None
@@ -770,6 +771,79 @@ class RssBestVersion(_PluginBase):
             if domain:
                 rules[domain] = parsed_score
         return rules
+
+    def __build_meta_title(self, title: str, description: Optional[str]) -> str:
+        text = f"{title} {description or ''}"
+        meta_title = title
+        normalized = title.lower()
+
+        if not re.search(r"s\d{1,2}", normalized):
+            season = self.__extract_season_number(text)
+            if season:
+                meta_title = f"{meta_title} S{season:02d}"
+
+        if not re.search(r"(s\d{1,2}e\d{1,3}|e\d{1,3})", normalized):
+            episode_hint = self.__extract_episode_hint(text)
+            if episode_hint:
+                meta_title = f"{meta_title} {episode_hint}"
+
+        return meta_title
+
+    @staticmethod
+    def __extract_season_number(text: str) -> Optional[int]:
+        patterns = [
+            r"第\s*([0-9]{1,2})\s*季",
+            r"\[\s*第([一二三四五六七八九十]{1,3})季\s*\]",
+            r"\bseason\s*([0-9]{1,2})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            value = match.group(1)
+            if value.isdigit():
+                return int(value)
+            chinese = {
+                "一": 1,
+                "二": 2,
+                "三": 3,
+                "四": 4,
+                "五": 5,
+                "六": 6,
+                "七": 7,
+                "八": 8,
+                "九": 9,
+                "十": 10,
+            }
+            if value in chinese:
+                return chinese[value]
+        return None
+
+    @staticmethod
+    def __extract_episode_hint(text: str) -> Optional[str]:
+        patterns = [
+            r"第\s*([0-9]{1,3})\s*[-~到至]\s*([0-9]{1,3})\s*集",
+            r"第\s*([0-9]{1,3})\s*集",
+            r"\[\s*第([一二三四五六七八九十]{1,3})季\s*第([0-9]{1,3})集\s*\]",
+            r"第([0-9]{1,3})季第([0-9]{1,3})集",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            groups = match.groups()
+            if len(groups) == 2:
+                if groups[0].isdigit() and groups[1].isdigit():
+                    first = int(groups[0])
+                    second = int(groups[1])
+                    if "季" in match.group(0) and first <= 20 and second <= 999:
+                        return f"S{first:02d}E{second:02d}"
+                    if first <= 999 and second <= 999:
+                        return f"E{first:02d}-E{second:02d}"
+            if len(groups) == 1 and groups[0].isdigit():
+                episode = int(groups[0])
+                return f"E{episode:02d}"
+        return None
 
     def __should_skip_complete_pack(self, title: str, description: Optional[str]) -> bool:
         text = f"{title} {description or ''}"
