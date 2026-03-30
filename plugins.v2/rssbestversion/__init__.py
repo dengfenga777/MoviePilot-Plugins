@@ -77,7 +77,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -104,6 +104,7 @@ class RssBestVersion(_PluginBase):
     _quality_order: str = "2160p,1080p,720p,other"
     _skip_complete: bool = True
     _site_priority: str = ""
+    _skip_tv_without_episode: bool = True
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -126,6 +127,7 @@ class RssBestVersion(_PluginBase):
             self._quality_order = config.get("quality_order") or "2160p,1080p,720p,other"
             self._skip_complete = bool(config.get("skip_complete", True))
             self._site_priority = config.get("site_priority") or ""
+            self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -250,6 +252,7 @@ class RssBestVersion(_PluginBase):
                         "content": [
                             _col(4, _switch("prefer_hevc", "同分辨率优先 HEVC/H265")),
                             _col(4, _switch("skip_complete", "过滤整季/完结包")),
+                            _col(4, _switch("skip_tv_without_episode", "电视剧无集号则跳过")),
                         ],
                     },
                     {
@@ -308,6 +311,7 @@ class RssBestVersion(_PluginBase):
             "quality_order": "2160p,1080p,720p,other",
             "skip_complete": True,
             "site_priority": "",
+            "skip_tv_without_episode": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -404,6 +408,7 @@ class RssBestVersion(_PluginBase):
                 "quality_order": self._quality_order,
                 "skip_complete": self._skip_complete,
                 "site_priority": self._site_priority,
+                "skip_tv_without_episode": self._skip_tv_without_episode,
             }
         )
 
@@ -567,6 +572,9 @@ class RssBestVersion(_PluginBase):
             return None
 
         if mediainfo.type == MediaType.TV:
+            if self._skip_tv_without_episode and not (meta.episode_list or []):
+                logger.info("%s 未识别到集号，按配置跳过该电视剧资源", title)
+                return None
             if exist_info and self.__all_episodes_exist(meta=meta, exist_info=exist_info):
                 logger.info("%s %s 已存在", mediainfo.title_year, meta.season_episode)
                 return None
