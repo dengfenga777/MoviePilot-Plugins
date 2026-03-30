@@ -77,7 +77,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.8"
+    plugin_version = "1.9"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -251,7 +251,7 @@ class RssBestVersion(_PluginBase):
                         "component": "VRow",
                         "content": [
                             _col(4, _switch("prefer_hevc", "同分辨率优先 HEVC/H265")),
-                            _col(4, _switch("skip_complete", "整季/完结包库里有则跳过")),
+                            _col(4, _switch("skip_complete", "整季/完结包直接跳过")),
                             _col(4, _switch("skip_tv_without_episode", "电视剧无集号则跳过")),
                         ],
                     },
@@ -572,13 +572,8 @@ class RssBestVersion(_PluginBase):
 
         if mediainfo.type == MediaType.TV:
             if is_complete_pack and self._skip_complete:
-                if self.__complete_pack_exists_in_library(
-                    meta=meta,
-                    exist_info=exist_info,
-                    mediainfo=mediainfo,
-                ):
-                    logger.info("%s %s 命中整季/完结包规则，该季已完整入库，已跳过", mediainfo.title_year, meta.season or "")
-                    return None
+                logger.info("%s %s 命中整季/完结包规则，已直接跳过", mediainfo.title_year, meta.season or "")
+                return None
             elif self._skip_tv_without_episode and not (meta.episode_list or []):
                 logger.info("%s 未识别到集号，按配置跳过该电视剧资源", title)
                 return None
@@ -862,68 +857,6 @@ class RssBestVersion(_PluginBase):
             return False
 
         return True
-
-    def __complete_pack_exists_in_library(
-        self,
-        meta: MetaInfo,
-        exist_info: Optional[ExistMediaInfo],
-        mediainfo: Optional[MediaInfo] = None,
-    ) -> bool:
-        if not exist_info:
-            return False
-
-        seasons = getattr(exist_info, "seasons", None)
-        season = meta.begin_season or 1
-
-        if not seasons:
-            return False
-
-        season_episodes = seasons.get(season)
-        if not season_episodes:
-            return False
-
-        total_episodes = self.__get_tmdb_season_episode_count(mediainfo=mediainfo, season=season)
-        if not total_episodes:
-            return False
-
-        existing_count = len(set(season_episodes))
-        return existing_count >= total_episodes
-
-    def __get_tmdb_season_episode_count(
-        self,
-        mediainfo: Optional[MediaInfo],
-        season: int,
-    ) -> Optional[int]:
-        if not mediainfo or not mediainfo.tmdb_id:
-            return None
-
-        try:
-            tmdb_info = self.chain.tmdb_info(
-                tmdbid=mediainfo.tmdb_id,
-                mtype=mediainfo.type,
-                season=season,
-            )
-        except Exception as err:
-            logger.warning(
-                "%s 获取 TMDB 季信息失败，season=%s err=%s",
-                getattr(mediainfo, "title_year", mediainfo.tmdb_id),
-                season,
-                err,
-            )
-            return None
-
-        if not tmdb_info or not isinstance(tmdb_info, dict):
-            return None
-
-        episodes = tmdb_info.get("episodes")
-        if isinstance(episodes, list) and episodes:
-            return len(episodes)
-
-        episode_count = tmdb_info.get("episode_count")
-        if isinstance(episode_count, int) and episode_count > 0:
-            return episode_count
-
-        return None
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]

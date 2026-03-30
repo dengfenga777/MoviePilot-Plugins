@@ -1,6 +1,6 @@
+import copy
 import datetime
 import re
-from pathlib import Path
 from threading import Lock
 from typing import Optional, Any, List, Dict, Tuple
 
@@ -28,9 +28,9 @@ SERIES_TYPES = {"series", "show"}
 
 class LibraryGapFill(_PluginBase):
     plugin_name = "媒体库缺集补全"
-    plugin_desc = "扫描实际媒体库中缺失的剧集，直接搜索并推送下载。"
+    plugin_desc = "只补媒体库缺失的单集，并优先选择下载人数高的资源。"
     plugin_icon = "search.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "librarygapfill_"
@@ -224,7 +224,7 @@ class LibraryGapFill(_PluginBase):
                                             "text": (
                                                 "本插件不会看订阅缺失，而是直接扫描媒体库里的电视剧。"
                                                 "它会按 TMDB 判断每一季实际缺了哪些已播出剧集，"
-                                                "然后直接搜索并推送下载。"
+                                                "只按单集逐个搜索，并优先选择下载人数更高的资源。"
                                             ),
                                         },
                                     }
@@ -479,44 +479,16 @@ class LibraryGapFill(_PluginBase):
         missing_text = self.__format_episode_map(missing_map)
         logger.info("%s %s 缺失：%s", server, mediainfo.title_year, missing_text)
 
-        no_exists = self.__build_no_exists(mediainfo=mediainfo, targets=targets)
-        contexts = searchchain.process(
+        downloaded_map, remaining_map, matched_any = self.__download_single_episode_targets(
             mediainfo=mediainfo,
-            no_exists=no_exists,
-            sites=search_sites,
+            missing_map=missing_map,
+            searchchain=searchchain,
+            downloadchain=downloadchain,
             rule_groups=rule_groups,
+            search_sites=search_sites,
+            recent_requests=recent_requests,
         )
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if not contexts:
-            logger.info("%s 未找到可下载资源", mediainfo.title_year)
-            return {
-                "title": mediainfo.title_year,
-                "server": server,
-                "library": library_name,
-                "missing": missing_text,
-                "downloaded": "",
-                "remaining": missing_text,
-                "status": "未找到资源",
-                "time": now,
-                "downloaded_count": 0,
-            }
-
-        downloaded_list, left_no_exists = downloadchain.batch_download(
-            contexts=contexts,
-            no_exists=no_exists,
-            save_path=self._save_path,
-            source="媒体库缺集补全",
-            username="媒体库缺集补全",
-        )
-        remaining_map = self.__remaining_episode_map(
-            mediainfo=mediainfo,
-            left_no_exists=left_no_exists,
-            targets=targets,
-        )
-        downloaded_map = self.__subtract_episode_map(missing_map, remaining_map)
-        if downloaded_map:
-            self.__register_recent_requests(recent_requests, mediainfo, downloaded_map)
-
         downloaded_text = self.__format_episode_map(downloaded_map)
         remaining_text = self.__format_episode_map(remaining_map)
         downloaded_count = sum(len(episodes) for episodes in downloaded_map.values())
@@ -525,10 +497,10 @@ class LibraryGapFill(_PluginBase):
             status = "已推送"
         elif downloaded_map:
             status = "部分推送"
-        elif downloaded_list:
-            status = "已下发待入库"
-        else:
+        elif matched_any:
             status = "匹配到资源但未下载"
+        else:
+            status = "未找到资源"
 
         return {
             "title": mediainfo.title_year,
@@ -541,6 +513,160 @@ class LibraryGapFill(_PluginBase):
             "time": now,
             "downloaded_count": downloaded_count,
         }
+
+    def __download_single_episode_targets(
+        self,
+        mediainfo: MediaInfo,
+        missing_map: Dict[int, List[int]],
+        searchchain: SearchChain,
+        downloadchain: DownloadChain,
+        rule_groups: List[str],
+        search_sites: List[int],
+        recent_requests: Dict[str, dict],
+    ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]], bool]:
+        media_key = mediainfo.tmdb_id or mediainfo.douban_id
+        downloaded_map: Dict[int, List[int]] = {}
+        remaining_map: Dict[int, List[int]] = {
+            season: list(sorted(set(episodes)))
+            for season, episodes in missing_map.items()
+            if episodes
+        }
+        matched_any = False
+
+        if not media_key:
+            return downloaded_map, remaining_map, matched_any
+
+        for season in sorted(missing_map.keys()):
+            for episode in sorted(set(missing_map.get(season) or [])):
+                fresh_mediainfo = self.__fresh_mediainfo(mediainfo=mediainfo, season=season)
+                no_exists = {
+                    media_key: {
+                        season: NotExistMediaInfo(
+                            season=season,
+                            episodes=[episode],
+                            total_episode=1,
+                            start_episode=episode,
+                        )
+                    }
+                }
+                contexts = searchchain.process(
+                    mediainfo=fresh_mediainfo,
+                    no_exists=no_exists,
+                    sites=search_sites,
+                    rule_groups=rule_groups,
+                )
+                contexts = self.__filter_single_episode_contexts(
+                    contexts=contexts,
+                    season=season,
+                    episode=episode,
+                )
+                if not contexts:
+                    continue
+
+                matched_any = True
+                contexts = self.__sort_contexts_by_people(contexts)
+
+                for context in contexts:
+                    torrent = context.torrent_info
+                    logger.info(
+                        "尝试下载单集 %s S%02dE%02d：%s | 下载=%s 做种=%s 完成=%s",
+                        mediainfo.title_year,
+                        season,
+                        episode,
+                        torrent.title,
+                        self.__safe_int(getattr(torrent, "peers", 0)),
+                        self.__safe_int(getattr(torrent, "seeders", 0)),
+                        self.__safe_int(getattr(torrent, "grabs", 0)),
+                    )
+                    download_id = downloadchain.download_single(
+                        context=context,
+                        save_path=self._save_path,
+                        source="媒体库缺集补全",
+                        username="媒体库缺集补全",
+                    )
+                    if not download_id:
+                        continue
+
+                    downloaded_map.setdefault(season, []).append(episode)
+                    if episode in remaining_map.get(season, []):
+                        remaining_map[season].remove(episode)
+                        if not remaining_map[season]:
+                            remaining_map.pop(season, None)
+                    self.__register_recent_requests(
+                        recent_requests=recent_requests,
+                        mediainfo=mediainfo,
+                        downloaded_map={season: [episode]},
+                    )
+                    break
+
+        return downloaded_map, remaining_map, matched_any
+
+    def __fresh_mediainfo(self, mediainfo: MediaInfo, season: int) -> MediaInfo:
+        fresh_mediainfo = None
+        if mediainfo.tmdb_id:
+            fresh_mediainfo = self.chain.recognize_media(
+                mtype=mediainfo.type,
+                tmdbid=mediainfo.tmdb_id,
+                cache=True,
+            )
+        elif mediainfo.douban_id:
+            fresh_mediainfo = self.chain.recognize_media(
+                mtype=mediainfo.type,
+                doubanid=mediainfo.douban_id,
+                cache=True,
+            )
+
+        if not fresh_mediainfo:
+            fresh_mediainfo = copy.deepcopy(mediainfo)
+        fresh_mediainfo.season = season
+        return fresh_mediainfo
+
+    def __filter_single_episode_contexts(
+        self,
+        contexts: List[Any],
+        season: int,
+        episode: int,
+    ) -> List[Any]:
+        results = []
+        for context in contexts or []:
+            meta = context.meta_info
+            if not meta:
+                continue
+
+            seasons = list(meta.season_list or [])
+            if not seasons:
+                seasons = [1]
+            if len(seasons) != 1 or seasons[0] != season:
+                continue
+
+            episodes = sorted(
+                {
+                    self.__safe_int(ep)
+                    for ep in (meta.episode_list or [])
+                    if self.__safe_int(ep) > 0
+                }
+            )
+            if episodes != [episode]:
+                continue
+            results.append(context)
+        return results
+
+    def __sort_contexts_by_people(self, contexts: List[Any]) -> List[Any]:
+        return sorted(
+            contexts,
+            key=self.__context_people_sort_key,
+            reverse=True,
+        )
+
+    def __context_people_sort_key(self, context: Any) -> Tuple[int, int, int, int, int]:
+        torrent = context.torrent_info
+        return (
+            self.__safe_int(getattr(torrent, "peers", 0)),
+            self.__safe_int(getattr(torrent, "seeders", 0)),
+            self.__safe_int(getattr(torrent, "grabs", 0)),
+            self.__safe_int(getattr(torrent, "pri_order", 0)),
+            self.__safe_int(getattr(torrent, "size", 0)),
+        )
 
     def __collect_missing_targets(
         self,
@@ -680,73 +806,6 @@ class LibraryGapFill(_PluginBase):
 
         season_cache[cache_key] = sorted(set(result))
         return season_cache[cache_key]
-
-    def __build_no_exists(
-        self,
-        mediainfo: MediaInfo,
-        targets: Dict[int, dict],
-    ) -> Dict[Any, Dict[int, NotExistMediaInfo]]:
-        media_key = mediainfo.tmdb_id or mediainfo.douban_id
-        no_exists: Dict[Any, Dict[int, NotExistMediaInfo]] = {media_key: {}}
-
-        for season, data in targets.items():
-            expected = sorted(set(data.get("expected") or []))
-            existing = sorted(set(data.get("existing") or []))
-            missing = sorted(set(data.get("missing") or []))
-            if not missing:
-                continue
-
-            whole_season = not existing and set(missing) == set(expected)
-            no_exists[media_key][season] = NotExistMediaInfo(
-                season=season,
-                episodes=[] if whole_season else missing,
-                total_episode=len(expected),
-                start_episode=min(missing),
-            )
-        return no_exists
-
-    def __remaining_episode_map(
-        self,
-        mediainfo: MediaInfo,
-        left_no_exists: Dict[Any, Dict[int, NotExistMediaInfo]],
-        targets: Dict[int, dict],
-    ) -> Dict[int, List[int]]:
-        media_key = mediainfo.tmdb_id or mediainfo.douban_id
-        if not left_no_exists or not left_no_exists.get(media_key):
-            return {}
-
-        remaining = {}
-        for season, info in left_no_exists.get(media_key, {}).items():
-            season_num = self.__safe_int(season)
-            if season_num <= 0:
-                continue
-
-            target = targets.get(season_num) or {}
-            episodes = sorted(
-                {
-                    self.__safe_int(episode)
-                    for episode in (getattr(info, "episodes", None) or [])
-                    if self.__safe_int(episode) > 0
-                }
-            )
-            if episodes:
-                remaining[season_num] = episodes
-            else:
-                remaining[season_num] = sorted(set(target.get("missing") or []))
-        return remaining
-
-    def __subtract_episode_map(
-        self,
-        original: Dict[int, List[int]],
-        current: Dict[int, List[int]],
-    ) -> Dict[int, List[int]]:
-        result = {}
-        for season, episodes in original.items():
-            remain = set(current.get(season) or [])
-            downloaded = [episode for episode in episodes if episode not in remain]
-            if downloaded:
-                result[season] = downloaded
-        return result
 
     def __register_recent_requests(
         self,
