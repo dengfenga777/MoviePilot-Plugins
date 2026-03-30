@@ -1,4 +1,16 @@
 {
+  "LibraryGapFill": {
+    "name": "媒体库缺集补全",
+    "description": "扫描实际媒体库里的电视剧缺失剧集，直接搜索并推送下载。",
+    "labels": "媒体库,剧集,下载,补全",
+    "version": "1.0",
+    "icon": "search.png",
+    "author": "Codex",
+    "level": 2,
+    "history": {
+      "v1.0": "首个版本，按媒体库实际缺集扫描电视剧，直接搜索并下载缺失的已播出剧集，并带有短期去重冷却，避免同一批缺集反复下发。"
+    }
+  },
   "RssBestVersion": {
     "name": "RSS优选下载",
     "description": "RSS 刷新后识别同一剧集的多个版本，只下载优先级最高的资源。",
