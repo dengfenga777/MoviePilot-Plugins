@@ -64,4 +64,4 @@ hdhome.org=60
 ## 当前版本
 
 - `LibraryGapFill` `v1.1`
-- `RssBestVersion` `v1.9`
+- `RssBestVersion` `v1.9.1`
