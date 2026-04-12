@@ -53,6 +53,8 @@ class Candidate:
     codec_score: int
     size_score: int
     pubdate_score: int
+    exist_info: Optional[ExistMediaInfo]
+    is_complete_pack: bool
 
     @property
     def candidate_id(self) -> str:
@@ -73,11 +75,17 @@ class Candidate:
         )
 
 
+@dataclass
+class DownloadPlan:
+    candidate: Candidate
+    group_keys: List[str]
+
+
 class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.9.1"
+    plugin_version = "2.0.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -105,6 +113,7 @@ class RssBestVersion(_PluginBase):
     _skip_complete: bool = True
     _site_priority: str = ""
     _skip_tv_without_episode: bool = True
+    _site_priority_rules: Optional[Dict[str, int]] = None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -128,6 +137,8 @@ class RssBestVersion(_PluginBase):
             self._skip_complete = bool(config.get("skip_complete", True))
             self._site_priority = config.get("site_priority") or ""
             self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
+
+        self._site_priority_rules = self.__parse_site_priority()
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -177,7 +188,7 @@ class RssBestVersion(_PluginBase):
                     "kwargs": {},
                 }
             ]
-        elif self._enabled:
+        if self._enabled:
             return [
                 {
                     "id": "RssBestVersion",
@@ -282,9 +293,9 @@ class RssBestVersion(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "本插件会先用 MoviePilot 识别 RSS 条目的 TMDB、季、集，"
-                                                "再把同一剧集的多个版本放在一起比较，只下载优先级最高的一个。"
-                                                "例如同一集同时出现 4K 和 1080p 时，只会推送 4K。"
+                                                "本插件只做四件事：识别剧集、同集挑最优版本、"
+                                                "整季/完结包过滤、以及更大体积版本的再次推送。"
+                                                "同一集出现 4K 和 1080p 时，只会推送优先级更高的那个。"
                                             ),
                                         },
                                     }
@@ -325,7 +336,7 @@ class RssBestVersion(_PluginBase):
                 }
             ]
 
-        historys = sorted(historys, key=lambda x: x.get("time"), reverse=True)
+        historys = sorted(historys, key=lambda item: item.get("time"), reverse=True)
         rows = []
         for item in historys:
             rows.append(
@@ -385,7 +396,7 @@ class RssBestVersion(_PluginBase):
             self.save_data("history", [])
             return schemas.Response(success=True, message="历史记录已清空")
 
-        historys = [h for h in historys if h.get("group_key") != key]
+        historys = [item for item in historys if item.get("group_key") != key]
         self.save_data("history", historys)
         return schemas.Response(success=True, message="删除成功")
 
@@ -413,103 +424,91 @@ class RssBestVersion(_PluginBase):
         )
 
     def check(self):
-        if not self._address:
+        if not lock.acquire(blocking=False):
+            logger.warning("RSS优选下载任务仍在运行，跳过本次执行")
             return
 
-        if self._clearflag:
-            history = []
-        else:
-            history = self.get_data("history") or []
+        history_lookup: Dict[str, dict] = {}
+        history_changed = False
+        try:
+            history_lookup = self.__load_history_lookup()
+            history_changed = self._clearflag
 
-        history_lookup = {item.get("group_key"): item for item in history if item.get("group_key")}
-        filter_groups = self.systemconfig.get(SystemConfigKey.SubscribeFilterRuleGroups)
+            if not self._address:
+                logger.info("未配置 RSS 地址，跳过本次执行")
+                return
+
+            filter_groups = self.systemconfig.get(SystemConfigKey.SubscribeFilterRuleGroups)
+            candidates = self.__collect_candidates(filter_groups=filter_groups)
+            if not candidates:
+                logger.info("本轮 RSS 未产生可下载候选资源")
+                return
+
+            plans = self.__build_download_plans(candidates=candidates, history_lookup=history_lookup)
+            if not plans:
+                logger.info("本轮 RSS 无需下载的优选资源")
+                return
+
+            history_changed = self.__execute_download_plans(
+                plans=plans,
+                history_lookup=history_lookup,
+            ) or history_changed
+        finally:
+            if history_changed:
+                self.save_data("history", list(history_lookup.values()))
+            self._clearflag = False
+            lock.release()
+
+    def __load_history_lookup(self) -> Dict[str, dict]:
+        if self._clearflag:
+            return {}
+        history = self.get_data("history") or []
+        return {item.get("group_key"): item for item in history if item.get("group_key")}
+
+    def __collect_candidates(self, filter_groups: Any) -> List[Candidate]:
         candidates: List[Candidate] = []
 
-        for url in [line.strip() for line in self._address.splitlines() if line.strip()]:
+        for url in self.__rss_urls():
             logger.info("开始刷新 RSS：%s ...", url)
             results = RssHelper().parse(url, proxy=self._proxy)
             if not results:
                 logger.error("未获取到 RSS 数据：%s", url)
                 continue
 
+            candidate_count_before = len(candidates)
             for result in results:
                 try:
                     candidate = self.__build_candidate(
                         result=result,
                         source_url=url,
                         filter_groups=filter_groups,
-                        history_lookup=history_lookup,
                     )
-                    if candidate:
-                        candidates.append(candidate)
+                    if not candidate:
+                        continue
+
+                    skip_reason = self.__candidate_skip_reason(candidate)
+                    if skip_reason:
+                        logger.info(skip_reason)
+                        continue
+
+                    candidates.append(candidate)
                 except Exception as err:
                     logger.error("解析 RSS 条目出错：%s - %s", str(err), traceback.format_exc())
 
-            logger.info("RSS %s 刷新完成，候选资源累计 %s 条", url, len(candidates))
-
-        if not candidates:
-            logger.info("本轮 RSS 未产生可下载候选资源")
-            self._clearflag = False
-            return
-
-        chosen_map = self.__pick_best_candidates(candidates=candidates)
-        chosen_candidates = self.__dedupe_candidates(chosen_map)
-        if not chosen_candidates:
-            logger.info("本轮 RSS 无需下载的优选资源")
-            self._clearflag = False
-            return
-
-        for candidate in chosen_candidates:
-            downloaded_keys = []
-            for key in candidate.group_keys:
-                previous = history_lookup.get(key)
-                if not previous:
-                    downloaded_keys.append(key)
-                    continue
-                previous_size = self.__safe_int(previous.get("size"))
-                if candidate.size_score > previous_size:
-                    downloaded_keys.append(key)
-            if not downloaded_keys:
-                continue
-
             logger.info(
-                "优选资源：%s | 质量=%s | 组=%s",
-                candidate.raw_title,
-                candidate.quality_label,
-                downloaded_keys,
+                "RSS %s 刷新完成，本次新增候选 %s 条，候选累计 %s 条",
+                url,
+                len(candidates) - candidate_count_before,
+                len(candidates),
             )
-            success = self.__download_candidate(candidate)
-            if not success:
-                logger.error("下载失败：%s", candidate.raw_title)
-                continue
 
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            season_episode = self.__season_episode_text(candidate.meta)
-            site = self.__site_name(candidate.source_url)
-
-            for group_key in downloaded_keys:
-                history_lookup[group_key] = {
-                    "title": candidate.mediainfo.title_year,
-                    "season_episode": season_episode,
-                    "group_key": group_key,
-                    "quality": candidate.quality_label,
-                    "site": site,
-                    "raw_title": candidate.raw_title,
-                    "poster": candidate.mediainfo.get_poster_image(),
-                    "tmdbid": candidate.mediainfo.tmdb_id,
-                    "size": candidate.size_score,
-                    "time": now,
-                }
-
-        self.save_data("history", list(history_lookup.values()))
-        self._clearflag = False
+        return candidates
 
     def __build_candidate(
         self,
         result: dict,
         source_url: str,
         filter_groups: Any,
-        history_lookup: Dict[str, dict],
     ) -> Optional[Candidate]:
         title = result.get("title")
         description = result.get("description")
@@ -520,14 +519,7 @@ class RssBestVersion(_PluginBase):
 
         if not title:
             return None
-        if self._include and not re.search(self._include, f"{title} {description}", re.IGNORECASE):
-            logger.info("%s 不符合包含规则", title)
-            return None
-        if self._exclude and re.search(self._exclude, f"{title} {description}", re.IGNORECASE):
-            logger.info("%s 命中排除规则", title)
-            return None
-        if self._size_range and not self.__match_size_range(size):
-            logger.info("%s - 种子大小不在指定范围", title)
+        if not self.__match_text_filters(title=title, description=description, size=size):
             return None
 
         is_complete_pack = self.__is_complete_pack(title=title, description=description)
@@ -551,63 +543,22 @@ class RssBestVersion(_PluginBase):
             pubdate=pubdate.strftime("%Y-%m-%d %H:%M:%S") if pubdate else None,
             site_proxy=self._proxy,
         )
+        if not self.__match_subscribe_rules(
+            torrent=torrent,
+            mediainfo=mediainfo,
+            filter_groups=filter_groups,
+        ):
+            logger.info("%s 不匹配订阅优先级规则", title)
+            return None
 
-        if self._filter:
-            filtered = self.chain.filter_torrents(
-                rule_groups=filter_groups,
-                torrent_list=[torrent],
-                mediainfo=mediainfo,
-            )
-            if not filtered:
-                logger.info("%s 不匹配订阅优先级规则", title)
-                return None
-
-        exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
         group_keys = self.__build_group_keys(mediainfo=mediainfo, meta=meta)
-        size_score = self.__safe_int(size)
-        site_name = self.__site_name(source_url)
         if not group_keys:
             logger.info("%s 未识别到可比较的剧集键", title)
             return None
 
-        if mediainfo.type == MediaType.TV:
-            if is_complete_pack and self._skip_complete:
-                logger.info("%s %s 命中整季/完结包规则，已直接跳过", mediainfo.title_year, meta.season or "")
-                return None
-            elif self._skip_tv_without_episode and not (meta.episode_list or []):
-                logger.info("%s 未识别到集号，按配置跳过该电视剧资源", title)
-                return None
-            if not is_complete_pack and exist_info and self.__all_episodes_exist(meta=meta, exist_info=exist_info):
-                logger.info("%s %s 已存在", mediainfo.title_year, meta.season_episode)
-                return None
-            remaining_keys = []
-            for key in group_keys:
-                previous = history_lookup.get(key)
-                if not previous:
-                    remaining_keys.append(key)
-                    continue
-                previous_size = self.__safe_int(previous.get("size"))
-                if size_score > previous_size:
-                    logger.info(
-                        "%s %s 检测到更大版本，允许再次推送：%s > %s",
-                        mediainfo.title_year,
-                        self.__season_episode_text(meta),
-                        size_score,
-                        previous_size,
-                    )
-                    remaining_keys.append(key)
-            if not remaining_keys:
-                logger.info("%s %s 已在下载历史中，且未发现更大体积版本", mediainfo.title_year, self.__season_episode_text(meta))
-                return None
-            group_keys = remaining_keys
-        elif exist_info:
-            logger.info("%s 已存在", mediainfo.title_year)
-            return None
-
-        quality_label, quality_score = self.__quality_rank(f"{title} {description or ''}")
-        site_score = self.__site_priority_score(site_name)
-        codec_score = self.__codec_rank(f"{title} {description or ''}")
-        pubdate_score = int(pubdate.timestamp()) if pubdate else 0
+        site_name = self.__site_name(source_url)
+        text = f"{title} {description or ''}"
+        quality_label, quality_score = self.__quality_rank(text)
 
         return Candidate(
             raw_title=title,
@@ -620,39 +571,188 @@ class RssBestVersion(_PluginBase):
             group_keys=group_keys,
             quality_label=quality_label,
             quality_score=quality_score,
-            site_score=site_score,
-            codec_score=codec_score,
-            size_score=size_score,
-            pubdate_score=pubdate_score,
+            site_score=self.__site_priority_score(site_name),
+            codec_score=self.__codec_rank(text),
+            size_score=self.__safe_int(size),
+            pubdate_score=int(pubdate.timestamp()) if pubdate else 0,
+            exist_info=self.chain.media_exists(mediainfo=mediainfo),
+            is_complete_pack=is_complete_pack,
         )
 
-    def __pick_best_candidates(self, candidates: List[Candidate]) -> Dict[str, Candidate]:
-        best_for_key: Dict[str, Candidate] = {}
+    def __match_text_filters(self, title: str, description: Optional[str], size: Any) -> bool:
+        text = f"{title} {description or ''}"
+        if self._include and not re.search(self._include, text, re.IGNORECASE):
+            logger.info("%s 不符合包含规则", title)
+            return False
+        if self._exclude and re.search(self._exclude, text, re.IGNORECASE):
+            logger.info("%s 命中排除规则", title)
+            return False
+        if self._size_range and not self.__match_size_range(size):
+            logger.info("%s - 种子大小不在指定范围", title)
+            return False
+        return True
+
+    def __match_subscribe_rules(
+        self,
+        torrent: TorrentInfo,
+        mediainfo: MediaInfo,
+        filter_groups: Any,
+    ) -> bool:
+        if not self._filter:
+            return True
+        filtered = self.chain.filter_torrents(
+            rule_groups=filter_groups,
+            torrent_list=[torrent],
+            mediainfo=mediainfo,
+        )
+        return bool(filtered)
+
+    def __candidate_skip_reason(self, candidate: Candidate) -> Optional[str]:
+        title_year = candidate.mediainfo.title_year or candidate.raw_title
+        season_episode = self.__season_episode_text(candidate.meta)
+
+        if candidate.mediainfo.type != MediaType.TV:
+            if candidate.exist_info:
+                return f"{title_year} 已存在"
+            return None
+
+        if candidate.is_complete_pack and self._skip_complete:
+            season = candidate.meta.season or ""
+            return f"{title_year} {season} 命中整季/完结包规则，已直接跳过".strip()
+
+        if self._skip_tv_without_episode and not (candidate.meta.episode_list or []):
+            return f"{candidate.raw_title} 未识别到集号，按配置跳过该电视剧资源"
+
+        if (
+            not candidate.is_complete_pack
+            and candidate.exist_info
+            and self.__all_episodes_exist(meta=candidate.meta, exist_info=candidate.exist_info)
+        ):
+            return f"{title_year} {season_episode} 已存在".strip()
+
+        return None
+
+    def __build_download_plans(
+        self,
+        candidates: List[Candidate],
+        history_lookup: Dict[str, dict],
+    ) -> List[DownloadPlan]:
+        chosen_map: Dict[str, Candidate] = {}
 
         for candidate in candidates:
-            for group_key in candidate.group_keys:
-                current = best_for_key.get(group_key)
-                if not current or candidate.sort_tuple > current.sort_tuple:
-                    best_for_key[group_key] = candidate
-                    if current and current.raw_title != candidate.raw_title:
-                        logger.info(
-                            "同一剧集版本替换：%s -> %s | key=%s | 质量=%s>%s | 站点=%s(%s)",
-                            current.raw_title,
-                            candidate.raw_title,
-                            group_key,
-                            candidate.quality_label,
-                            current.quality_label,
-                            candidate.site_name,
-                            candidate.site_score,
-                        )
-        return best_for_key
+            eligible_keys = self.__eligible_group_keys(
+                candidate=candidate,
+                history_lookup=history_lookup,
+            )
+            if not eligible_keys:
+                logger.info("%s 已在下载历史中，且未发现更大体积版本", self.__candidate_label(candidate))
+                continue
+
+            for group_key in eligible_keys:
+                current = chosen_map.get(group_key)
+                if current and candidate.sort_tuple <= current.sort_tuple:
+                    continue
+
+                chosen_map[group_key] = candidate
+                if current and current.raw_title != candidate.raw_title:
+                    logger.info(
+                        "同一剧集版本替换：%s -> %s | key=%s | 分值=%s > %s",
+                        current.raw_title,
+                        candidate.raw_title,
+                        group_key,
+                        candidate.sort_tuple,
+                        current.sort_tuple,
+                    )
+
+        return self.__merge_download_plans(chosen_map)
+
+    def __eligible_group_keys(
+        self,
+        candidate: Candidate,
+        history_lookup: Dict[str, dict],
+    ) -> List[str]:
+        eligible_keys: List[str] = []
+        upgraded_keys: List[str] = []
+
+        for group_key in candidate.group_keys:
+            previous = history_lookup.get(group_key)
+            if not previous:
+                eligible_keys.append(group_key)
+                continue
+
+            previous_size = self.__safe_int(previous.get("size"))
+            if candidate.size_score > previous_size:
+                eligible_keys.append(group_key)
+                upgraded_keys.append(group_key)
+
+        if upgraded_keys:
+            logger.info(
+                "%s 检测到更大版本，允许再次推送：%s | keys=%s",
+                self.__candidate_label(candidate),
+                candidate.size_score,
+                upgraded_keys,
+            )
+
+        return eligible_keys
 
     @staticmethod
-    def __dedupe_candidates(chosen_map: Dict[str, Candidate]) -> List[Candidate]:
-        chosen: Dict[str, Candidate] = {}
-        for candidate in chosen_map.values():
-            chosen[candidate.candidate_id] = candidate
-        return list(chosen.values())
+    def __merge_download_plans(chosen_map: Dict[str, Candidate]) -> List[DownloadPlan]:
+        plan_map: Dict[str, DownloadPlan] = {}
+
+        for group_key, candidate in chosen_map.items():
+            plan = plan_map.get(candidate.candidate_id)
+            if not plan:
+                plan = DownloadPlan(candidate=candidate, group_keys=[])
+                plan_map[candidate.candidate_id] = plan
+            plan.group_keys.append(group_key)
+
+        for plan in plan_map.values():
+            plan.group_keys = sorted(set(plan.group_keys))
+
+        return sorted(
+            plan_map.values(),
+            key=lambda item: item.candidate.sort_tuple,
+            reverse=True,
+        )
+
+    def __execute_download_plans(
+        self,
+        plans: List[DownloadPlan],
+        history_lookup: Dict[str, dict],
+    ) -> bool:
+        changed = False
+
+        for plan in plans:
+            candidate = plan.candidate
+            logger.info(
+                "优选资源：%s | 质量=%s | 站点=%s | 组=%s",
+                candidate.raw_title,
+                candidate.quality_label,
+                candidate.site_name,
+                plan.group_keys,
+            )
+            if not self.__download_candidate(candidate):
+                logger.error("下载失败：%s", candidate.raw_title)
+                continue
+
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            season_episode = self.__season_episode_text(candidate.meta)
+            for group_key in plan.group_keys:
+                history_lookup[group_key] = {
+                    "title": candidate.mediainfo.title_year,
+                    "season_episode": season_episode,
+                    "group_key": group_key,
+                    "quality": candidate.quality_label,
+                    "site": candidate.site_name,
+                    "raw_title": candidate.raw_title,
+                    "poster": candidate.mediainfo.get_poster_image(),
+                    "tmdbid": candidate.mediainfo.tmdb_id,
+                    "size": candidate.size_score,
+                    "time": now,
+                }
+                changed = True
+
+        return changed
 
     def __download_candidate(self, candidate: Candidate) -> bool:
         result = DownloadChain().download_single(
@@ -745,11 +845,13 @@ class RssBestVersion(_PluginBase):
     def __site_priority_score(self, site_name: str) -> int:
         if not site_name:
             return 0
-        rules = self.__parse_site_priority()
+
         site_name = site_name.lower()
+        rules = self._site_priority_rules or {}
         exact = rules.get(site_name)
         if exact is not None:
             return exact
+
         best_match = 0
         for domain, score in rules.items():
             if site_name == domain or site_name.endswith(f".{domain}"):
@@ -760,17 +862,17 @@ class RssBestVersion(_PluginBase):
         rules: Dict[str, int] = {}
         for raw_line in self._site_priority.splitlines():
             line = raw_line.strip()
-            if not line or line.startswith("#"):
+            if not line or line.startswith("#") or "=" not in line:
                 continue
-            if "=" not in line:
-                continue
+
             domain, score = line.split("=", 1)
             domain = domain.strip().lower()
             if domain.startswith("http://") or domain.startswith("https://"):
                 domain = self.__site_name(domain)
-            parsed_score = self.__safe_int(score.strip())
+
             if domain:
-                rules[domain] = parsed_score
+                rules[domain] = self.__safe_int(score.strip())
+
         return rules
 
     def __build_meta_title(self, title: str, description: Optional[str]) -> str:
@@ -801,9 +903,11 @@ class RssBestVersion(_PluginBase):
             match = re.search(pattern, text, re.IGNORECASE)
             if not match:
                 continue
+
             value = match.group(1)
             if value.isdigit():
                 return int(value)
+
             chinese = {
                 "一": 1,
                 "二": 2,
@@ -832,6 +936,7 @@ class RssBestVersion(_PluginBase):
             match = re.search(pattern, text, re.IGNORECASE)
             if not match:
                 continue
+
             groups = match.groups()
             if len(groups) == 2:
                 if groups[0].isdigit() and groups[1].isdigit():
@@ -841,9 +946,11 @@ class RssBestVersion(_PluginBase):
                         return f"S{first:02d}E{second:02d}"
                     if first <= 999 and second <= 999:
                         return f"E{first:02d}-E{second:02d}"
+
             if len(groups) == 1 and groups[0].isdigit():
                 episode = int(groups[0])
                 return f"E{episode:02d}"
+
         return None
 
     def __is_complete_pack(self, title: str, description: Optional[str]) -> bool:
@@ -852,7 +959,6 @@ class RssBestVersion(_PluginBase):
         if not COMPLETE_HINTS.search(normalized):
             return False
 
-        # 两集或多集连发应保留，不应被误判为完结包。
         if MULTI_EPISODE_HINTS.search(normalized):
             return False
 
@@ -866,6 +972,13 @@ class RssBestVersion(_PluginBase):
         if len(sizes) == 1:
             return current >= sizes[0]
         return sizes[0] <= current <= sizes[1]
+
+    def __candidate_label(self, candidate: Candidate) -> str:
+        season_episode = self.__season_episode_text(candidate.meta)
+        title = candidate.mediainfo.title_year or candidate.raw_title
+        if season_episode:
+            return f"{title} {season_episode}"
+        return title
 
     @staticmethod
     def __season_episode_text(meta: MetaInfo) -> str:
@@ -887,6 +1000,9 @@ class RssBestVersion(_PluginBase):
         if match:
             return match.group(1)
         return url
+
+    def __rss_urls(self) -> List[str]:
+        return [line.strip() for line in self._address.splitlines() if line.strip()]
 
     def __log_and_notify_error(self, message: str):
         logger.error(message)
