@@ -1,5 +1,6 @@
 import datetime
 import re
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,7 +86,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -113,7 +114,10 @@ class RssBestVersion(_PluginBase):
     _skip_complete: bool = True
     _site_priority: str = ""
     _skip_tv_without_episode: bool = True
+    _max_downloads_per_run: int = 8
+    _max_run_minutes: int = 20
     _site_priority_rules: Optional[Dict[str, int]] = None
+    _pending_run: bool = False
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -137,6 +141,8 @@ class RssBestVersion(_PluginBase):
             self._skip_complete = bool(config.get("skip_complete", True))
             self._site_priority = config.get("site_priority") or ""
             self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
+            self._max_downloads_per_run = max(0, self.__safe_int(config.get("max_downloads_per_run") or 8))
+            self._max_run_minutes = max(0, self.__safe_int(config.get("max_run_minutes") or 20))
 
         self._site_priority_rules = self.__parse_site_priority()
 
@@ -269,6 +275,13 @@ class RssBestVersion(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            _col(6, _textfield("max_downloads_per_run", "单轮最多推送数", "0 表示不限制，默认 8")),
+                            _col(6, _textfield("max_run_minutes", "单轮最长执行(分钟)", "0 表示不限制，默认 20")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             _col(
                                 12,
                                 _textarea(
@@ -296,6 +309,7 @@ class RssBestVersion(_PluginBase):
                                                 "本插件只做四件事：识别剧集、同集挑最优版本、"
                                                 "整季/完结包过滤、以及更大体积版本的再次推送。"
                                                 "同一集出现 4K 和 1080p 时，只会推送优先级更高的那个。"
+                                                "为避免卡住下一轮调度，可限制单轮推送数量和最长执行时间。"
                                             ),
                                         },
                                     }
@@ -323,6 +337,8 @@ class RssBestVersion(_PluginBase):
             "skip_complete": True,
             "site_priority": "",
             "skip_tv_without_episode": True,
+            "max_downloads_per_run": 8,
+            "max_run_minutes": 20,
         }
 
     def get_page(self) -> List[dict]:
@@ -420,20 +436,33 @@ class RssBestVersion(_PluginBase):
                 "skip_complete": self._skip_complete,
                 "site_priority": self._site_priority,
                 "skip_tv_without_episode": self._skip_tv_without_episode,
+                "max_downloads_per_run": self._max_downloads_per_run,
+                "max_run_minutes": self._max_run_minutes,
             }
         )
 
     def check(self):
         if not lock.acquire(blocking=False):
-            logger.warning("RSS优选下载任务仍在运行，跳过本次执行")
+            self._pending_run = True
+            logger.warning("RSS优选下载任务仍在运行，已登记本轮补跑请求")
             return
 
-        history_lookup: Dict[str, dict] = {}
-        history_changed = False
         try:
-            history_lookup = self.__load_history_lookup()
-            history_changed = self._clearflag
+            while True:
+                self._pending_run = False
+                self.__run_once()
+                if not self._pending_run:
+                    break
+                logger.info("检测到调度期间有新一轮请求，当前执行结束后立即补跑一次")
+        finally:
+            lock.release()
 
+    def __run_once(self):
+        started_at = time.monotonic()
+        history_lookup: Dict[str, dict] = self.__load_history_lookup()
+        history_changed = self._clearflag
+
+        try:
             if not self._address:
                 logger.info("未配置 RSS 地址，跳过本次执行")
                 return
@@ -452,12 +481,14 @@ class RssBestVersion(_PluginBase):
             history_changed = self.__execute_download_plans(
                 plans=plans,
                 history_lookup=history_lookup,
+                started_at=started_at,
             ) or history_changed
         finally:
             if history_changed:
                 self.save_data("history", list(history_lookup.values()))
+            elapsed = time.monotonic() - started_at
+            logger.info("RSS优选下载本轮执行完成，用时 %.1f 秒", elapsed)
             self._clearflag = False
-            lock.release()
 
     def __load_history_lookup(self) -> Dict[str, dict]:
         if self._clearflag:
@@ -719,10 +750,19 @@ class RssBestVersion(_PluginBase):
         self,
         plans: List[DownloadPlan],
         history_lookup: Dict[str, dict],
+        started_at: float,
     ) -> bool:
         changed = False
+        attempted = 0
 
         for plan in plans:
+            if self.__should_stop_current_run(started_at=started_at, attempted=attempted):
+                logger.warning(
+                    "已达到单轮执行保护阈值，剩余 %s 个优选资源留待下个周期继续处理",
+                    len(plans) - attempted,
+                )
+                break
+
             candidate = plan.candidate
             logger.info(
                 "优选资源：%s | 质量=%s | 站点=%s | 组=%s",
@@ -733,6 +773,7 @@ class RssBestVersion(_PluginBase):
             )
             if not self.__download_candidate(candidate):
                 logger.error("下载失败：%s", candidate.raw_title)
+                attempted += 1
                 continue
 
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -752,7 +793,16 @@ class RssBestVersion(_PluginBase):
                 }
                 changed = True
 
+            attempted += 1
+
         return changed
+
+    def __should_stop_current_run(self, started_at: float, attempted: int) -> bool:
+        if self._max_downloads_per_run and attempted >= self._max_downloads_per_run:
+            return True
+        if self._max_run_minutes and (time.monotonic() - started_at) >= self._max_run_minutes * 60:
+            return True
+        return False
 
     def __download_candidate(self, candidate: Candidate) -> bool:
         result = DownloadChain().download_single(
