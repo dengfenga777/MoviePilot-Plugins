@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict, Tuple, Set
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -24,6 +24,8 @@ from app.schemas import ExistMediaInfo
 from app.schemas.types import SystemConfigKey, MediaType
 
 lock = Lock()
+notify_lock = Lock()
+NOTIFY_BACKLOG_LIMIT = 16
 COMPLETE_HINTS = re.compile(
     r"(complete|全集|全季|全\s*\d+\s*[集话]|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
     re.IGNORECASE,
@@ -87,7 +89,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.1"
+    plugin_version = "2.2.2"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -120,6 +122,8 @@ class RssBestVersion(_PluginBase):
     _rss_workers: int = 4
     _site_priority_rules: Optional[Dict[str, int]] = None
     _pending_run: bool = False
+    _notify_executor: Optional[ThreadPoolExecutor] = None
+    _notify_futures: Optional[Set[Any]] = None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -405,6 +409,7 @@ class RssBestVersion(_PluginBase):
                 if self._scheduler.running:
                     self._scheduler.shutdown()
                 self._scheduler = None
+            self.__shutdown_notify_executor()
         except Exception as err:
             logger.error("退出插件失败：%s", str(err))
 
@@ -846,16 +851,30 @@ class RssBestVersion(_PluginBase):
         return False
 
     def __download_candidate(self, candidate: Candidate) -> bool:
-        result = DownloadChain().download_single(
-            context=Context(
-                meta_info=candidate.meta,
-                media_info=candidate.mediainfo,
-                torrent_info=candidate.torrent,
-            ),
-            save_path=self._save_path,
-            username="RSS优选下载",
-        )
-        return bool(result)
+        downloadchain = DownloadChain()
+        original_post_message = downloadchain.post_message
+
+        try:
+            downloadchain.post_message = self.__suppress_post_message
+            result = downloadchain.download_single(
+                context=Context(
+                    meta_info=candidate.meta,
+                    media_info=candidate.mediainfo,
+                    torrent_info=candidate.torrent,
+                ),
+                save_path=self._save_path,
+                username="RSS优选下载",
+            )
+        except Exception:
+            logger.error("推送下载失败：%s - %s", candidate.raw_title, traceback.format_exc())
+            return False
+        finally:
+            downloadchain.post_message = original_post_message
+
+        success = bool(result)
+        if success:
+            self.__notify_download_async(candidate)
+        return success
 
     def __build_group_keys(self, mediainfo: MediaInfo, meta: MetaInfo) -> List[str]:
         tmdbid = mediainfo.tmdb_id or f"{mediainfo.title}_{mediainfo.year}"
@@ -1094,6 +1113,98 @@ class RssBestVersion(_PluginBase):
 
     def __rss_urls(self) -> List[str]:
         return [line.strip() for line in self._address.splitlines() if line.strip()]
+
+    @staticmethod
+    def __suppress_post_message(*args, **kwargs):
+        return None
+
+    def __ensure_notify_executor(self) -> ThreadPoolExecutor:
+        with notify_lock:
+            if not self._notify_executor:
+                self._notify_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="rssbestversion-notify",
+                )
+            if self._notify_futures is None:
+                self._notify_futures = set()
+            return self._notify_executor
+
+    def __shutdown_notify_executor(self):
+        with notify_lock:
+            executor = self._notify_executor
+            self._notify_executor = None
+            self._notify_futures = set()
+
+        if executor:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def __submit_async_notification(self, title: str, text: str):
+        if not self._notify:
+            return
+
+        executor = self.__ensure_notify_executor()
+        with notify_lock:
+            self._notify_futures = {
+                future for future in (self._notify_futures or set()) if not future.done()
+            }
+            if len(self._notify_futures) >= NOTIFY_BACKLOG_LIMIT:
+                logger.warning("RSS优选下载通知积压过多，已跳过本次通知：%s", title)
+                return
+            future = executor.submit(self.__post_notification, title, text)
+            self._notify_futures.add(future)
+
+        future.add_done_callback(self.__handle_notification_future)
+
+    def __handle_notification_future(self, future):
+        with notify_lock:
+            if self._notify_futures is not None:
+                self._notify_futures.discard(future)
+
+        try:
+            future.result()
+        except Exception as err:
+            logger.warning("RSS优选下载异步通知失败：%s", str(err))
+
+    def __post_notification(self, title: str, text: str):
+        self.post_message(
+            mtype=schemas.NotificationType.Manual,
+            title=title,
+            text=text,
+        )
+
+    def __notify_download_async(self, candidate: Candidate):
+        lines = [self.__candidate_label(candidate)]
+
+        if candidate.quality_label:
+            lines.append(f"版本：{candidate.quality_label}")
+        if candidate.site_name:
+            lines.append(f"站点：{candidate.site_name}")
+
+        size_text = self.__format_size(candidate.torrent.size)
+        if size_text:
+            lines.append(f"大小：{size_text}")
+
+        self.__submit_async_notification(
+            title="【RSS优选下载】",
+            text="\n".join(lines),
+        )
+
+    @staticmethod
+    def __format_size(size: Any) -> str:
+        size_value = RssBestVersion.__safe_int(size)
+        if size_value <= 0:
+            return ""
+
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(size_value)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(value)} {unit}"
+                text = f"{value:.2f}".rstrip("0").rstrip(".")
+                return f"{text} {unit}"
+            value /= 1024
+        return ""
 
     def __log_and_notify_error(self, message: str):
         logger.error(message)
