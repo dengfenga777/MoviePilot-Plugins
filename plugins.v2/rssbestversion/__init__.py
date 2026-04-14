@@ -2,6 +2,7 @@ import datetime
 import re
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -86,7 +87,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -116,6 +117,7 @@ class RssBestVersion(_PluginBase):
     _skip_tv_without_episode: bool = True
     _max_downloads_per_run: int = 8
     _max_run_minutes: int = 20
+    _rss_workers: int = 4
     _site_priority_rules: Optional[Dict[str, int]] = None
     _pending_run: bool = False
 
@@ -498,10 +500,14 @@ class RssBestVersion(_PluginBase):
 
     def __collect_candidates(self, filter_groups: Any) -> List[Candidate]:
         candidates: List[Candidate] = []
+        urls = self.__rss_urls()
+        if not urls:
+            return candidates
 
-        for url in self.__rss_urls():
-            logger.info("开始刷新 RSS：%s ...", url)
-            results = RssHelper().parse(url, proxy=self._proxy)
+        fetched_results = self.__fetch_rss_results(urls)
+
+        for url in urls:
+            results = fetched_results.get(url) or []
             if not results:
                 logger.error("未获取到 RSS 数据：%s", url)
                 continue
@@ -534,6 +540,38 @@ class RssBestVersion(_PluginBase):
             )
 
         return candidates
+
+    def __fetch_rss_results(self, urls: List[str]) -> Dict[str, List[dict]]:
+        if len(urls) <= 1:
+            url = urls[0]
+            return {url: self.__fetch_single_rss(url)}
+
+        max_workers = min(len(urls), self._rss_workers)
+        logger.info("开始并发刷新 RSS，共 %s 个源，worker=%s", len(urls), max_workers)
+
+        fetched_results: Dict[str, List[dict]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rssbestversion") as executor:
+            future_to_url = {
+                executor.submit(self.__fetch_single_rss, url): url
+                for url in urls
+            }
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    fetched_results[url] = future.result() or []
+                except Exception as err:
+                    logger.error("刷新 RSS 失败：%s - %s", url, str(err))
+                    fetched_results[url] = []
+
+        return fetched_results
+
+    def __fetch_single_rss(self, url: str) -> List[dict]:
+        logger.info("开始刷新 RSS：%s ...", url)
+        results = RssHelper().parse(url, proxy=self._proxy)
+        if results:
+            logger.info("RSS %s 抓取完成，原始条目 %s 条", url, len(results))
+            return results
+        return []
 
     def __build_candidate(
         self,
