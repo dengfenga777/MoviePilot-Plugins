@@ -92,7 +92,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.4"
+    plugin_version = "2.2.5"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -691,6 +691,8 @@ class RssBestVersion(_PluginBase):
     def __candidate_skip_reason(self, candidate: Candidate) -> Optional[str]:
         title_year = candidate.mediainfo.title_year or candidate.raw_title
         season_episode = self.__season_episode_text(candidate.meta)
+        is_season_pack = self.__is_season_pack(candidate)
+        is_pack_candidate = candidate.is_complete_pack or is_season_pack
 
         if candidate.mediainfo.type != MediaType.TV:
             if candidate.exist_info:
@@ -698,14 +700,20 @@ class RssBestVersion(_PluginBase):
             return None
 
         if candidate.is_complete_pack and self._skip_complete:
+            if self.__library_missing(candidate):
+                logger.info("%s 媒体库不存在，允许下载完结包", title_year)
+                return None
             season = candidate.meta.season or ""
             return f"{title_year} {season} 命中整季/完结包规则，已直接跳过".strip()
 
-        if self._skip_complete and self.__is_season_pack(candidate):
+        if self._skip_complete and is_season_pack:
+            if self.__library_missing(candidate):
+                logger.info("%s 媒体库不存在，允许下载整季包", title_year)
+                return None
             season = candidate.meta.season or ""
             return f"{title_year} {season} 命中整季包规则，已直接跳过".strip()
 
-        if self._skip_tv_without_episode and not (candidate.meta.episode_list or []):
+        if self._skip_tv_without_episode and not (candidate.meta.episode_list or []) and not is_pack_candidate:
             return f"{candidate.raw_title} 未识别到集号，按配置跳过该电视剧资源"
 
         if (
@@ -1252,6 +1260,10 @@ class RssBestVersion(_PluginBase):
             return True
 
         return bool(getattr(candidate.meta, "begin_season", None))
+
+    @staticmethod
+    def __library_missing(candidate: Candidate) -> bool:
+        return not bool(candidate.exist_info)
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]
