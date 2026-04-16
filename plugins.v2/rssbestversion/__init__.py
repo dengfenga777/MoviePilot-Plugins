@@ -26,6 +26,8 @@ from app.schemas.types import SystemConfigKey, MediaType
 lock = Lock()
 notify_lock = Lock()
 NOTIFY_BACKLOG_LIMIT = 16
+CHASE_MAX_VERSIONS = 3
+HISTORY_REF_LIMIT = 12
 COMPLETE_HINTS = re.compile(
     r"(complete|全集|全季|全\s*\d+\s*[集话]|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
     re.IGNORECASE,
@@ -53,6 +55,7 @@ class Candidate:
     group_keys: List[str]
     quality_label: str
     quality_score: int
+    upgrade_score: int
     site_score: int
     codec_score: int
     size_score: int
@@ -89,7 +92,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.2"
+    plugin_version = "2.2.4"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -315,9 +318,9 @@ class RssBestVersion(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "本插件只做四件事：识别剧集、同集挑最优版本、"
-                                                "整季/完结包过滤、以及更大体积版本的再次推送。"
-                                                "同一集出现 4K 和 1080p 时，只会推送优先级更高的那个。"
+                                                "本插件会优先追新：媒体库没有该集时，同一集最多追 3 个不同版本。"
+                                                "如果后续出现更高等级版本，例如 4K HDR 高于已推送的 4K，"
+                                                "即使超过 3 个版本上限也会继续推送。"
                                                 "为避免卡住下一轮调度，可限制单轮推送数量和最长执行时间。"
                                             ),
                                         },
@@ -635,7 +638,7 @@ class RssBestVersion(_PluginBase):
 
         site_name = self.__site_name(source_url)
         text = f"{title} {description or ''}"
-        quality_label, quality_score = self.__quality_rank(text)
+        quality_label, quality_score, upgrade_score = self.__quality_rank(text)
 
         return Candidate(
             raw_title=title,
@@ -648,6 +651,7 @@ class RssBestVersion(_PluginBase):
             group_keys=group_keys,
             quality_label=quality_label,
             quality_score=quality_score,
+            upgrade_score=upgrade_score,
             site_score=self.__site_priority_score(site_name),
             codec_score=self.__codec_rank(text),
             size_score=self.__safe_int(size),
@@ -697,6 +701,10 @@ class RssBestVersion(_PluginBase):
             season = candidate.meta.season or ""
             return f"{title_year} {season} 命中整季/完结包规则，已直接跳过".strip()
 
+        if self._skip_complete and self.__is_season_pack(candidate):
+            season = candidate.meta.season or ""
+            return f"{title_year} {season} 命中整季包规则，已直接跳过".strip()
+
         if self._skip_tv_without_episode and not (candidate.meta.episode_list or []):
             return f"{candidate.raw_title} 未识别到集号，按配置跳过该电视剧资源"
 
@@ -714,63 +722,146 @@ class RssBestVersion(_PluginBase):
         candidates: List[Candidate],
         history_lookup: Dict[str, dict],
     ) -> List[DownloadPlan]:
-        chosen_map: Dict[str, Candidate] = {}
+        grouped_candidates: Dict[str, Dict[str, Candidate]] = {}
+        for candidate in candidates:
+            for group_key in candidate.group_keys:
+                candidate_map = grouped_candidates.setdefault(group_key, {})
+                current = candidate_map.get(candidate.candidate_id)
+                if not current or candidate.sort_tuple > current.sort_tuple:
+                    candidate_map[candidate.candidate_id] = candidate
+
+        selected_plans: Dict[str, DownloadPlan] = {}
+        for group_key, candidate_map in grouped_candidates.items():
+            ordered_candidates = sorted(
+                candidate_map.values(),
+                key=lambda item: item.sort_tuple,
+                reverse=True,
+            )
+            selected_candidates = self.__select_candidates_for_group(
+                group_key=group_key,
+                candidates=ordered_candidates,
+                history_record=history_lookup.get(group_key),
+            )
+            for candidate in selected_candidates:
+                plan = selected_plans.get(candidate.candidate_id)
+                if not plan:
+                    plan = DownloadPlan(candidate=candidate, group_keys=[])
+                    selected_plans[candidate.candidate_id] = plan
+                plan.group_keys.append(group_key)
+
+        for plan in selected_plans.values():
+            plan.group_keys = sorted(set(plan.group_keys))
+
+        return sorted(
+            selected_plans.values(),
+            key=lambda item: item.candidate.sort_tuple,
+            reverse=True,
+        )
+
+    def __select_candidates_for_group(
+        self,
+        group_key: str,
+        candidates: List[Candidate],
+        history_record: Optional[dict],
+    ) -> List[Candidate]:
+        if not candidates:
+            return []
+
+        pushed_ids, pushed_titles = self.__history_pushed_refs(history_record)
+        has_pushed_ids = bool(pushed_ids)
+        version_count = self.__history_version_count(history_record)
+        best_upgrade_score = self.__history_best_upgrade_score(history_record)
+        remaining_slots = max(0, CHASE_MAX_VERSIONS - version_count)
+        selected: List[Candidate] = []
 
         for candidate in candidates:
-            eligible_keys = self.__eligible_group_keys(
-                candidate=candidate,
-                history_lookup=history_lookup,
-            )
-            if not eligible_keys:
-                logger.info("%s 已在下载历史中，且未发现更大体积版本", self.__candidate_label(candidate))
+            if candidate.candidate_id in pushed_ids:
+                continue
+            if not has_pushed_ids and candidate.raw_title in pushed_titles:
                 continue
 
-            for group_key in eligible_keys:
-                current = chosen_map.get(group_key)
-                if current and candidate.sort_tuple <= current.sort_tuple:
-                    continue
-
-                chosen_map[group_key] = candidate
-                if current and current.raw_title != candidate.raw_title:
-                    logger.info(
-                        "同一剧集版本替换：%s -> %s | key=%s | 分值=%s > %s",
-                        current.raw_title,
-                        candidate.raw_title,
-                        group_key,
-                        candidate.sort_tuple,
-                        current.sort_tuple,
-                    )
-
-        return self.__merge_download_plans(chosen_map)
-
-    def __eligible_group_keys(
-        self,
-        candidate: Candidate,
-        history_lookup: Dict[str, dict],
-    ) -> List[str]:
-        eligible_keys: List[str] = []
-        upgraded_keys: List[str] = []
-
-        for group_key in candidate.group_keys:
-            previous = history_lookup.get(group_key)
-            if not previous:
-                eligible_keys.append(group_key)
+            if remaining_slots > 0:
+                selected.append(candidate)
+                remaining_slots -= 1
                 continue
 
-            previous_size = self.__safe_int(previous.get("size"))
-            if candidate.size_score > previous_size:
-                eligible_keys.append(group_key)
-                upgraded_keys.append(group_key)
+            if candidate.upgrade_score > best_upgrade_score:
+                logger.info(
+                    "%s 检测到更高等级版本，超过 %s 个追新版本上限仍继续推送：%s > %s | key=%s",
+                    self.__candidate_label(candidate),
+                    CHASE_MAX_VERSIONS,
+                    candidate.upgrade_score,
+                    best_upgrade_score,
+                    group_key,
+                )
+                selected.append(candidate)
+                best_upgrade_score = candidate.upgrade_score
 
-        if upgraded_keys:
+        if not selected and version_count:
             logger.info(
-                "%s 检测到更大版本，允许再次推送：%s | keys=%s",
-                self.__candidate_label(candidate),
-                candidate.size_score,
-                upgraded_keys,
+                "%s 已追满 %s 个版本，且未出现更高等级新版本",
+                self.__history_label(history_record) or group_key,
+                CHASE_MAX_VERSIONS,
             )
 
-        return eligible_keys
+        return selected
+
+    def __history_pushed_refs(self, history_record: Optional[dict]) -> Tuple[Set[str], Set[str]]:
+        if not history_record:
+            return set(), set()
+
+        pushed_ids = {
+            str(item).strip()
+            for item in history_record.get("pushed_ids") or []
+            if str(item).strip()
+        }
+        pushed_titles = {
+            str(item).strip()
+            for item in history_record.get("pushed_titles") or []
+            if str(item).strip()
+        }
+
+        candidate_id = history_record.get("candidate_id")
+        if candidate_id:
+            pushed_ids.add(str(candidate_id).strip())
+
+        raw_title = history_record.get("raw_title")
+        if raw_title:
+            pushed_titles.add(str(raw_title).strip())
+
+        return pushed_ids, pushed_titles
+
+    def __history_version_count(self, history_record: Optional[dict]) -> int:
+        if not history_record:
+            return 0
+
+        version_count = self.__safe_int(history_record.get("version_count"))
+        if version_count > 0:
+            return version_count
+
+        pushed_ids, pushed_titles = self.__history_pushed_refs(history_record)
+        if pushed_ids or pushed_titles:
+            return max(len(pushed_ids), len(pushed_titles))
+        return 1
+
+    def __history_best_upgrade_score(self, history_record: Optional[dict]) -> int:
+        if not history_record:
+            return 0
+
+        upgrade_score = self.__safe_int(history_record.get("best_upgrade_score"))
+        if upgrade_score > 0:
+            return upgrade_score
+
+        quality_text = history_record.get("best_quality") or history_record.get("quality") or ""
+        return self.__quality_upgrade_score(str(quality_text))
+
+    @staticmethod
+    def __history_label(history_record: Optional[dict]) -> str:
+        if not history_record:
+            return ""
+        title = history_record.get("title") or ""
+        season_episode = history_record.get("season_episode") or ""
+        return f"{title} {season_episode}".strip()
 
     @staticmethod
     def __merge_download_plans(chosen_map: Dict[str, Candidate]) -> List[DownloadPlan]:
@@ -825,13 +916,37 @@ class RssBestVersion(_PluginBase):
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             season_episode = self.__season_episode_text(candidate.meta)
             for group_key in plan.group_keys:
+                previous_record = history_lookup.get(group_key) or {}
+                pushed_ids, pushed_titles = self.__history_pushed_refs(previous_record)
+                pushed_ids_list = list(pushed_ids)
+                pushed_titles_list = list(pushed_titles)
+                if candidate.candidate_id not in pushed_ids_list:
+                    pushed_ids_list.append(candidate.candidate_id)
+                if candidate.raw_title not in pushed_titles_list:
+                    pushed_titles_list.append(candidate.raw_title)
+                pushed_ids_list = pushed_ids_list[-HISTORY_REF_LIMIT:]
+                pushed_titles_list = pushed_titles_list[-HISTORY_REF_LIMIT:]
+
                 history_lookup[group_key] = {
                     "title": candidate.mediainfo.title_year,
                     "season_episode": season_episode,
                     "group_key": group_key,
                     "quality": candidate.quality_label,
+                    "best_quality": candidate.quality_label,
+                    "best_upgrade_score": max(
+                        self.__history_best_upgrade_score(previous_record),
+                        candidate.upgrade_score,
+                    ),
                     "site": candidate.site_name,
                     "raw_title": candidate.raw_title,
+                    "candidate_id": candidate.candidate_id,
+                    "version_count": max(
+                        self.__history_version_count(previous_record),
+                        len(pushed_ids_list),
+                        len(pushed_titles_list),
+                    ),
+                    "pushed_ids": pushed_ids_list,
+                    "pushed_titles": pushed_titles_list,
                     "poster": candidate.mediainfo.get_poster_image(),
                     "tmdbid": candidate.mediainfo.tmdb_id,
                     "size": candidate.size_score,
@@ -898,31 +1013,19 @@ class RssBestVersion(_PluginBase):
             return False
         return set(meta.episode_list).issubset(set(exist_episodes))
 
-    def __quality_rank(self, text: str) -> Tuple[str, int]:
-        normalized = text.lower()
-        detected = "other"
-        if re.search(r"2160p|4k|uhd", normalized):
-            detected = "2160p"
-        elif re.search(r"1080p|1080i", normalized):
-            detected = "1080p"
-        elif re.search(r"720p", normalized):
-            detected = "720p"
-        elif re.search(r"480p|576p", normalized):
-            detected = "sd"
+    def __quality_rank(self, text: str) -> Tuple[str, int, int]:
+        detected = self.__normalize_quality_label(text)
+        upgrade_score = self.__quality_upgrade_score(detected)
 
         order = [item.strip().lower() for item in self._quality_order.split(",") if item.strip()]
-        normalized_order = []
-        for item in order:
-            if item in {"4k", "2160", "2160p", "uhd"}:
-                normalized_order.append("2160p")
-            elif item in {"1080", "1080p", "1080i"}:
-                normalized_order.append("1080p")
-            elif item in {"720", "720p"}:
-                normalized_order.append("720p")
-            elif item in {"480", "480p", "576", "576p", "sd"}:
-                normalized_order.append("sd")
+        normalized_order = [self.__normalize_quality_label(item) for item in order]
+        normalized_order = [item for item in normalized_order if item]
+
+        if "4k_hdr" not in normalized_order:
+            if "2160p" in normalized_order:
+                normalized_order.insert(normalized_order.index("2160p"), "4k_hdr")
             else:
-                normalized_order.append("other")
+                normalized_order.insert(0, "4k_hdr")
 
         if detected not in normalized_order:
             normalized_order.append(detected)
@@ -933,7 +1036,57 @@ class RssBestVersion(_PluginBase):
             label: len(normalized_order) - index
             for index, label in enumerate(normalized_order)
         }
-        return detected, score_map.get(detected, 0)
+        return self.__display_quality_label(detected), score_map.get(detected, 0), upgrade_score
+
+    @staticmethod
+    def __normalize_quality_label(text: str) -> str:
+        normalized = str(text or "").lower()
+        is_2160 = bool(re.search(r"2160p|4k|uhd", normalized))
+        has_hdr = bool(
+            re.search(
+                r"hdr10\+?|(?<![a-z0-9])hdr(?![a-z0-9])|dolby\s*vision|(?<![a-z0-9])dv(?![a-z0-9])",
+                normalized,
+            )
+        )
+        if "4k_hdr" in normalized:
+            return "4k_hdr"
+        if is_2160 and has_hdr:
+            return "4k_hdr"
+        if is_2160:
+            return "2160p"
+        if re.search(r"1080p|1080i", normalized):
+            return "1080p"
+        if re.search(r"720p", normalized):
+            return "720p"
+        if re.search(r"480p|576p|\bsd\b", normalized):
+            return "sd"
+        return "other"
+
+    @staticmethod
+    def __display_quality_label(label: str) -> str:
+        if label == "4k_hdr":
+            return "4K HDR"
+        if label == "2160p":
+            return "4K"
+        if label == "1080p":
+            return "1080p"
+        if label == "720p":
+            return "720p"
+        if label == "sd":
+            return "SD"
+        return "other"
+
+    def __quality_upgrade_score(self, text: str) -> int:
+        label = self.__normalize_quality_label(text)
+        if label == "4k_hdr":
+            return 4
+        if label == "2160p":
+            return 3
+        if label == "1080p":
+            return 2
+        if label == "720p":
+            return 1
+        return 0
 
     def __codec_rank(self, text: str) -> int:
         if not self._prefer_hevc:
@@ -1073,6 +1226,32 @@ class RssBestVersion(_PluginBase):
             return False
 
         return True
+
+    def __is_season_pack(self, candidate: Candidate) -> bool:
+        if candidate.mediainfo.type != MediaType.TV:
+            return False
+        if candidate.meta.episode_list:
+            return False
+
+        text = f"{candidate.raw_title} {candidate.description or ''}"
+        normalized = text.lower()
+        if MULTI_EPISODE_HINTS.search(normalized):
+            return False
+
+        season_markers = [
+            r"\bseason\s*\d{1,2}\b",
+            r"\bs\d{1,2}\b",
+            r"第\s*[0-9一二三四五六七八九十]{1,3}\s*季",
+            r"合集",
+            r"全季",
+            r"全集",
+            r"complete",
+            r"pack",
+        ]
+        if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in season_markers):
+            return True
+
+        return bool(getattr(candidate.meta, "begin_season", None))
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]
