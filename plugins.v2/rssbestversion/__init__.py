@@ -92,7 +92,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.5"
+    plugin_version = "2.2.6"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -1006,7 +1006,9 @@ class RssBestVersion(_PluginBase):
             episodes = meta.episode_list or []
             if episodes:
                 return [f"tv:{tmdbid}:s{season}:e{episode}" for episode in sorted(set(episodes))]
-            return [f"tv:{tmdbid}:s{season}:{meta.season_episode or meta.name}"]
+            if meta.season_episode:
+                return [f"tv:{tmdbid}:s{season}:{meta.season_episode}"]
+            return []
         return [f"movie:{tmdbid}"]
 
     @staticmethod
@@ -1225,14 +1227,11 @@ class RssBestVersion(_PluginBase):
         return None
 
     def __is_complete_pack(self, title: str, description: Optional[str]) -> bool:
-        text = f"{title} {description or ''}"
-        normalized = text.lower()
+        normalized = title.lower()
         if not COMPLETE_HINTS.search(normalized):
             return False
-
         if MULTI_EPISODE_HINTS.search(normalized):
             return False
-
         return True
 
     def __is_season_pack(self, candidate: Candidate) -> bool:
@@ -1241,8 +1240,7 @@ class RssBestVersion(_PluginBase):
         if candidate.meta.episode_list:
             return False
 
-        text = f"{candidate.raw_title} {candidate.description or ''}"
-        normalized = text.lower()
+        normalized = candidate.raw_title.lower()
         if MULTI_EPISODE_HINTS.search(normalized):
             return False
 
