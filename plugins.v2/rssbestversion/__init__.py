@@ -2,7 +2,6 @@ import datetime
 import re
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -24,9 +23,6 @@ from app.schemas import ExistMediaInfo
 from app.schemas.types import SystemConfigKey, MediaType
 
 lock = Lock()
-notify_lock = Lock()
-NOTIFY_BACKLOG_LIMIT = 16
-CHASE_MAX_VERSIONS = 3
 HISTORY_REF_LIMIT = 12
 COMPLETE_HINTS = re.compile(
     r"(complete|全集|全季|全\s*\d+\s*[集话]|season\s*\d+\s*complete|s\d+\s*complete|fin(al|ale)|完结|完結)",
@@ -92,7 +88,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.8"
+    plugin_version = "2.2.9"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -103,7 +99,6 @@ class RssBestVersion(_PluginBase):
     _cache_path: Optional[Path] = None
 
     _enabled: bool = False
-    _notify: bool = True
     _onlyonce: bool = False
     _cron: str = "*/30 * * * *"
     _address: str = ""
@@ -120,13 +115,8 @@ class RssBestVersion(_PluginBase):
     _skip_complete: bool = True
     _site_priority: str = ""
     _skip_tv_without_episode: bool = True
-    _max_downloads_per_run: int = 8
-    _max_run_minutes: int = 20
-    _rss_workers: int = 4
     _site_priority_rules: Optional[Dict[str, int]] = None
     _pending_run: bool = False
-    _notify_executor: Optional[ThreadPoolExecutor] = None
-    _notify_futures: Optional[Set[Any]] = None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -134,7 +124,6 @@ class RssBestVersion(_PluginBase):
         if config:
             self.__validate_and_fix_config(config=config)
             self._enabled = bool(config.get("enabled"))
-            self._notify = bool(config.get("notify", True))
             self._onlyonce = bool(config.get("onlyonce"))
             self._cron = config.get("cron") or "*/30 * * * *"
             self._address = config.get("address") or ""
@@ -150,8 +139,6 @@ class RssBestVersion(_PluginBase):
             self._skip_complete = bool(config.get("skip_complete", True))
             self._site_priority = config.get("site_priority") or ""
             self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
-            self._max_downloads_per_run = max(0, self.__safe_int(config.get("max_downloads_per_run") or 8))
-            self._max_run_minutes = max(0, self.__safe_int(config.get("max_run_minutes") or 20))
 
         self._site_priority_rules = self.__parse_site_priority()
 
@@ -226,10 +213,9 @@ class RssBestVersion(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            _col(3, _switch("enabled", "启用插件")),
-                            _col(3, _switch("notify", "发送通知")),
-                            _col(3, _switch("onlyonce", "立即运行一次")),
-                            _col(3, _switch("clear", "清理历史记录")),
+                            _col(4, _switch("enabled", "启用插件")),
+                            _col(4, _switch("onlyonce", "立即运行一次")),
+                            _col(4, _switch("clear", "清理历史记录")),
                         ],
                     },
                     {
@@ -287,13 +273,6 @@ class RssBestVersion(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            _col(6, _textfield("max_downloads_per_run", "单轮最多推送数", "0 表示不限制，默认 8")),
-                            _col(6, _textfield("max_run_minutes", "单轮最长执行(分钟)", "0 表示不限制，默认 20")),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
                             _col(
                                 12,
                                 _textarea(
@@ -318,10 +297,9 @@ class RssBestVersion(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "本插件会优先追新：媒体库没有该集时，同一集最多追 3 个不同版本。"
-                                                "如果后续出现更高等级版本，例如 4K HDR 高于已推送的 4K，"
-                                                "即使超过 3 个版本上限也会继续推送。"
-                                                "为避免卡住下一轮调度，可限制单轮推送数量和最长执行时间。"
+                                                "本插件会按单条 RSS 单独比较同一集资源，"
+                                                "每轮只推当前 RSS 里最优的一个版本。"
+                                                "后续只有在出现更高等级版本时才会继续推送。"
                                             ),
                                         },
                                     }
@@ -333,7 +311,6 @@ class RssBestVersion(_PluginBase):
             }
         ], {
             "enabled": False,
-            "notify": True,
             "onlyonce": False,
             "clear": False,
             "cron": "*/30 * * * *",
@@ -349,8 +326,6 @@ class RssBestVersion(_PluginBase):
             "skip_complete": True,
             "site_priority": "",
             "skip_tv_without_episode": True,
-            "max_downloads_per_run": 8,
-            "max_run_minutes": 20,
         }
 
     def get_page(self) -> List[dict]:
@@ -412,7 +387,6 @@ class RssBestVersion(_PluginBase):
                 if self._scheduler.running:
                     self._scheduler.shutdown()
                 self._scheduler = None
-            self.__shutdown_notify_executor()
         except Exception as err:
             logger.error("退出插件失败：%s", str(err))
 
@@ -433,7 +407,6 @@ class RssBestVersion(_PluginBase):
         self.update_config(
             {
                 "enabled": self._enabled,
-                "notify": self._notify,
                 "onlyonce": self._onlyonce,
                 "clear": self._clear,
                 "cron": self._cron,
@@ -449,8 +422,6 @@ class RssBestVersion(_PluginBase):
                 "skip_complete": self._skip_complete,
                 "site_priority": self._site_priority,
                 "skip_tv_without_episode": self._skip_tv_without_episode,
-                "max_downloads_per_run": self._max_downloads_per_run,
-                "max_run_minutes": self._max_run_minutes,
             }
         )
 
@@ -474,6 +445,8 @@ class RssBestVersion(_PluginBase):
         started_at = time.monotonic()
         history_lookup: Dict[str, dict] = self.__load_history_lookup()
         history_changed = self._clearflag
+        candidate_total = 0
+        plan_total = 0
 
         try:
             if not self._address:
@@ -481,25 +454,42 @@ class RssBestVersion(_PluginBase):
                 return
 
             filter_groups = self.systemconfig.get(SystemConfigKey.SubscribeFilterRuleGroups)
-            candidates = self.__collect_candidates(filter_groups=filter_groups)
-            if not candidates:
-                logger.info("本轮 RSS 未产生可下载候选资源")
+            urls = self.__rss_urls()
+            if not urls:
+                logger.info("未配置有效 RSS 地址，跳过本次执行")
                 return
 
-            plans = self.__build_download_plans(candidates=candidates, history_lookup=history_lookup)
-            if not plans:
-                logger.info("本轮 RSS 无需下载的优选资源")
-                return
+            for url in urls:
+                candidates = self.__collect_candidates_for_url(
+                    url=url,
+                    filter_groups=filter_groups,
+                )
+                if not candidates:
+                    continue
 
-            history_changed = self.__execute_download_plans(
-                plans=plans,
-                history_lookup=history_lookup,
-                started_at=started_at,
-            ) or history_changed
+                candidate_total += len(candidates)
+                plans = self.__build_download_plans(
+                    candidates=candidates,
+                    history_lookup=history_lookup,
+                )
+                if not plans:
+                    logger.info("RSS %s 无需下载的优选资源", url)
+                    continue
+
+                plan_total += len(plans)
+                changed = self.__execute_download_plans(
+                    plans=plans,
+                    history_lookup=history_lookup,
+                )
+                history_changed = changed or history_changed
         finally:
             if history_changed:
                 self.save_data("history", list(history_lookup.values()))
             elapsed = time.monotonic() - started_at
+            if not candidate_total:
+                logger.info("本轮 RSS 未产生可下载候选资源")
+            elif not plan_total:
+                logger.info("本轮 RSS 无需下载的优选资源")
             logger.info("RSS优选下载本轮执行完成，用时 %.1f 秒", elapsed)
             self._clearflag = False
 
@@ -509,72 +499,39 @@ class RssBestVersion(_PluginBase):
         history = self.get_data("history") or []
         return {item.get("group_key"): item for item in history if item.get("group_key")}
 
-    def __collect_candidates(self, filter_groups: Any) -> List[Candidate]:
+    def __collect_candidates_for_url(self, url: str, filter_groups: Any) -> List[Candidate]:
         candidates: List[Candidate] = []
-        urls = self.__rss_urls()
-        if not urls:
+        results = self.__fetch_single_rss(url)
+        if not results:
+            logger.error("未获取到 RSS 数据：%s", url)
             return candidates
 
-        fetched_results = self.__fetch_rss_results(urls)
+        for result in results:
+            try:
+                candidate = self.__build_candidate(
+                    result=result,
+                    source_url=url,
+                    filter_groups=filter_groups,
+                )
+                if not candidate:
+                    continue
 
-        for url in urls:
-            results = fetched_results.get(url) or []
-            if not results:
-                logger.error("未获取到 RSS 数据：%s", url)
-                continue
+                skip_reason = self.__candidate_skip_reason(candidate)
+                if skip_reason:
+                    logger.info(skip_reason)
+                    continue
 
-            candidate_count_before = len(candidates)
-            for result in results:
-                try:
-                    candidate = self.__build_candidate(
-                        result=result,
-                        source_url=url,
-                        filter_groups=filter_groups,
-                    )
-                    if not candidate:
-                        continue
+                candidates.append(candidate)
+            except Exception as err:
+                logger.error("解析 RSS 条目出错：%s - %s", str(err), traceback.format_exc())
 
-                    skip_reason = self.__candidate_skip_reason(candidate)
-                    if skip_reason:
-                        logger.info(skip_reason)
-                        continue
-
-                    candidates.append(candidate)
-                except Exception as err:
-                    logger.error("解析 RSS 条目出错：%s - %s", str(err), traceback.format_exc())
-
-            logger.info(
-                "RSS %s 刷新完成，本次新增候选 %s 条，候选累计 %s 条",
-                url,
-                len(candidates) - candidate_count_before,
-                len(candidates),
-            )
+        logger.info(
+            "RSS %s 刷新完成，本次新增候选 %s 条",
+            url,
+            len(candidates),
+        )
 
         return candidates
-
-    def __fetch_rss_results(self, urls: List[str]) -> Dict[str, List[dict]]:
-        if len(urls) <= 1:
-            url = urls[0]
-            return {url: self.__fetch_single_rss(url)}
-
-        max_workers = min(len(urls), self._rss_workers)
-        logger.info("开始并发刷新 RSS，共 %s 个源，worker=%s", len(urls), max_workers)
-
-        fetched_results: Dict[str, List[dict]] = {}
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rssbestversion") as executor:
-            future_to_url = {
-                executor.submit(self.__fetch_single_rss, url): url
-                for url in urls
-            }
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    fetched_results[url] = future.result() or []
-                except Exception as err:
-                    logger.error("刷新 RSS 失败：%s - %s", url, str(err))
-                    fetched_results[url] = []
-
-        return fetched_results
 
     def __fetch_single_rss(self, url: str) -> List[dict]:
         logger.info("开始刷新 RSS：%s ...", url)
@@ -776,11 +733,7 @@ class RssBestVersion(_PluginBase):
             return []
 
         pushed_ids, pushed_titles = self.__history_pushed_refs(history_record)
-        has_pushed_ids = bool(pushed_ids)
-        version_count = self.__history_version_count(history_record)
         best_upgrade_score = self.__history_best_upgrade_score(history_record)
-        remaining_slots = max(0, CHASE_MAX_VERSIONS - version_count)
-        selected: List[Candidate] = []
 
         for candidate in candidates:
             if candidate.candidate_id in pushed_ids:
@@ -788,31 +741,23 @@ class RssBestVersion(_PluginBase):
             if candidate.raw_title in pushed_titles:
                 continue
 
-            if remaining_slots > 0:
-                selected.append(candidate)
-                remaining_slots -= 1
-                continue
+            if not history_record:
+                return [candidate]
 
             if candidate.upgrade_score > best_upgrade_score:
                 logger.info(
-                    "%s 检测到更高等级版本，超过 %s 个追新版本上限仍继续推送：%s > %s | key=%s",
+                    "%s 检测到更高等级版本，继续推送：%s > %s | key=%s",
                     self.__candidate_label(candidate),
-                    CHASE_MAX_VERSIONS,
                     candidate.upgrade_score,
                     best_upgrade_score,
                     group_key,
                 )
-                selected.append(candidate)
-                best_upgrade_score = candidate.upgrade_score
+                return [candidate]
 
-        if not selected and version_count:
-            logger.info(
-                "%s 已追满 %s 个版本，且未出现更高等级新版本",
-                self.__history_label(history_record) or group_key,
-                CHASE_MAX_VERSIONS,
-            )
+        if history_record:
+            logger.info("%s 已存在历史记录，当前 RSS 未出现更高等级新版本", self.__history_label(history_record) or group_key)
 
-        return selected
+        return []
 
     def __history_pushed_refs(self, history_record: Optional[dict]) -> Tuple[Set[str], Set[str]]:
         if not history_record:
@@ -838,19 +783,6 @@ class RssBestVersion(_PluginBase):
             pushed_titles.add(str(raw_title).strip())
 
         return pushed_ids, pushed_titles
-
-    def __history_version_count(self, history_record: Optional[dict]) -> int:
-        if not history_record:
-            return 0
-
-        version_count = self.__safe_int(history_record.get("version_count"))
-        if version_count > 0:
-            return version_count
-
-        pushed_ids, pushed_titles = self.__history_pushed_refs(history_record)
-        if pushed_ids or pushed_titles:
-            return max(len(pushed_ids), len(pushed_titles))
-        return 1
 
     def __history_best_upgrade_score(self, history_record: Optional[dict]) -> int:
         if not history_record:
@@ -895,19 +827,10 @@ class RssBestVersion(_PluginBase):
         self,
         plans: List[DownloadPlan],
         history_lookup: Dict[str, dict],
-        started_at: float,
     ) -> bool:
         changed = False
-        attempted = 0
 
         for plan in plans:
-            if self.__should_stop_current_run(started_at=started_at, attempted=attempted):
-                logger.warning(
-                    "已达到单轮执行保护阈值，剩余 %s 个优选资源留待下个周期继续处理",
-                    len(plans) - attempted,
-                )
-                break
-
             candidate = plan.candidate
             logger.info(
                 "优选资源：%s | 质量=%s | 站点=%s | 组=%s",
@@ -918,7 +841,6 @@ class RssBestVersion(_PluginBase):
             )
             if not self.__download_candidate(candidate):
                 logger.error("下载失败：%s", candidate.raw_title)
-                attempted += 1
                 continue
 
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -948,11 +870,6 @@ class RssBestVersion(_PluginBase):
                     "site": candidate.site_name,
                     "raw_title": candidate.raw_title,
                     "candidate_id": candidate.candidate_id,
-                    "version_count": max(
-                        self.__history_version_count(previous_record),
-                        len(pushed_ids_list),
-                        len(pushed_titles_list),
-                    ),
                     "pushed_ids": pushed_ids_list,
                     "pushed_titles": pushed_titles_list,
                     "poster": candidate.mediainfo.get_poster_image(),
@@ -962,16 +879,7 @@ class RssBestVersion(_PluginBase):
                 }
                 changed = True
 
-            attempted += 1
-
         return changed
-
-    def __should_stop_current_run(self, started_at: float, attempted: int) -> bool:
-        if self._max_downloads_per_run and attempted >= self._max_downloads_per_run:
-            return True
-        if self._max_run_minutes and (time.monotonic() - started_at) >= self._max_run_minutes * 60:
-            return True
-        return False
 
     def __download_candidate(self, candidate: Candidate) -> bool:
         downloadchain = DownloadChain()
@@ -994,10 +902,7 @@ class RssBestVersion(_PluginBase):
         finally:
             downloadchain.post_message = original_post_message
 
-        success = bool(result)
-        if success:
-            self.__notify_download_async(candidate)
-        return success
+        return bool(result)
 
     def __build_group_keys(self, mediainfo: MediaInfo, meta: MetaInfo) -> List[str]:
         tmdbid = mediainfo.tmdb_id or f"{mediainfo.title}_{mediainfo.year}"
@@ -1307,103 +1212,13 @@ class RssBestVersion(_PluginBase):
     def __suppress_post_message(*args, **kwargs):
         return None
 
-    def __ensure_notify_executor(self) -> ThreadPoolExecutor:
-        with notify_lock:
-            if not self._notify_executor:
-                self._notify_executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="rssbestversion-notify",
-                )
-            if self._notify_futures is None:
-                self._notify_futures = set()
-            return self._notify_executor
-
-    def __shutdown_notify_executor(self):
-        with notify_lock:
-            executor = self._notify_executor
-            self._notify_executor = None
-            self._notify_futures = set()
-
-        if executor:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    def __submit_async_notification(self, title: str, text: str):
-        if not self._notify:
-            return
-
-        executor = self.__ensure_notify_executor()
-        with notify_lock:
-            self._notify_futures = {
-                future for future in (self._notify_futures or set()) if not future.done()
-            }
-            if len(self._notify_futures) >= NOTIFY_BACKLOG_LIMIT:
-                logger.warning("RSS优选下载通知积压过多，已跳过本次通知：%s", title)
-                return
-            future = executor.submit(self.__post_notification, title, text)
-            self._notify_futures.add(future)
-
-        future.add_done_callback(self.__handle_notification_future)
-
-    def __handle_notification_future(self, future):
-        with notify_lock:
-            if self._notify_futures is not None:
-                self._notify_futures.discard(future)
-
-        try:
-            future.result()
-        except Exception as err:
-            logger.warning("RSS优选下载异步通知失败：%s", str(err))
-
-    def __post_notification(self, title: str, text: str):
-        self.post_message(
-            mtype=schemas.NotificationType.Manual,
-            title=title,
-            text=text,
-        )
-
-    def __notify_download_async(self, candidate: Candidate):
-        lines = [self.__candidate_label(candidate)]
-
-        if candidate.quality_label:
-            lines.append(f"版本：{candidate.quality_label}")
-        if candidate.site_name:
-            lines.append(f"站点：{candidate.site_name}")
-
-        size_text = self.__format_size(candidate.torrent.size)
-        if size_text:
-            lines.append(f"大小：{size_text}")
-
-        self.__submit_async_notification(
-            title="【RSS优选下载】",
-            text="\n".join(lines),
-        )
-
-    @staticmethod
-    def __format_size(size: Any) -> str:
-        size_value = RssBestVersion.__safe_int(size)
-        if size_value <= 0:
-            return ""
-
-        units = ["B", "KB", "MB", "GB", "TB"]
-        value = float(size_value)
-        for unit in units:
-            if value < 1024 or unit == units[-1]:
-                if unit == "B":
-                    return f"{int(value)} {unit}"
-                text = f"{value:.2f}".rstrip("0").rstrip(".")
-                return f"{text} {unit}"
-            value /= 1024
-        return ""
-
-    def __log_and_notify_error(self, message: str):
+    def __log_error(self, message: str):
         logger.error(message)
-        if self._notify:
-            self.systemmessage.put(message, title="RSS优选下载")
 
     def __validate_and_fix_config(self, config: dict = None) -> bool:
         size_range = config.get("size_range")
         if size_range and not self.__is_number_or_range(str(size_range)):
-            self.__log_and_notify_error(f"RSS优选下载出错，种子大小设置错误：{size_range}")
+            self.__log_error(f"RSS优选下载出错，种子大小设置错误：{size_range}")
             config["size_range"] = ""
             return False
         return True
