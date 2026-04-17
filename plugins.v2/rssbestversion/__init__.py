@@ -92,7 +92,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.6"
+    plugin_version = "2.2.7"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -1008,7 +1008,7 @@ class RssBestVersion(_PluginBase):
                 return [f"tv:{tmdbid}:s{season}:e{episode}" for episode in sorted(set(episodes))]
             if meta.season_episode:
                 return [f"tv:{tmdbid}:s{season}:{meta.season_episode}"]
-            return []
+            return [f"tv:{tmdbid}:s{season}:{meta.name}"]
         return [f"movie:{tmdbid}"]
 
     @staticmethod
