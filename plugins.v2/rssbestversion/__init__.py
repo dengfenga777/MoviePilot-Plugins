@@ -92,7 +92,7 @@ class RssBestVersion(_PluginBase):
     plugin_name = "RSS优选下载"
     plugin_desc = "识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "2.2.7"
+    plugin_version = "2.2.8"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssbestversion_"
@@ -785,7 +785,7 @@ class RssBestVersion(_PluginBase):
         for candidate in candidates:
             if candidate.candidate_id in pushed_ids:
                 continue
-            if not has_pushed_ids and candidate.raw_title in pushed_titles:
+            if candidate.raw_title in pushed_titles:
                 continue
 
             if remaining_slots > 0:
