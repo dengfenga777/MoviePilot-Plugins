@@ -26,6 +26,18 @@
       "v1.0.0": "首个版本：支持在一个插件里配置多条 RSS 源，按源独立刷新和容错；使用 MoviePilot 自身识别能力判断媒体库是否已存在；支持整季/完结包过滤、电视剧无集号跳过，以及重复推送冷却，专门用来替代不稳定的 rsssubscribe 分身。"
     }
   },
+  "RssSubscribeNoNotify": {
+    "name": "自定义订阅无通知",
+    "description": "基于官方 rsssubscribe 流程，定时刷新 RSS 识别内容后添加订阅或直接下载，但关闭插件触发的通知链。",
+    "labels": "RSS,订阅,下载,无通知",
+    "version": "1.0.0",
+    "icon": "rss.png",
+    "author": "Codex",
+    "level": 2,
+    "history": {
+      "v1.0.0": "首个版本：按官方 rsssubscribe 的配置和主流程实现，保留多行 RSS、包含/排除、大小限制、代理、订阅优先级规则、订阅/下载动作和历史记录；移除发送通知开关，并静音下载链/订阅链的同步消息发送，避免 Telegram 等通知阻塞 RSS 执行。"
+    }
+  },
   "RssBestVersion": {
     "name": "RSS优选下载",
     "description": "按单条 RSS 单独比较同一剧集资源，只下载当前 RSS 中优先级最高的版本。",

@@ -53,7 +53,7 @@ class MultiRssSubscribe(_PluginBase):
     plugin_name = "多源RSS订阅"
     plugin_desc = "按官方 rsssubscribe 逻辑统一调度多条 RSS 源，并可静音下载通知，降低 TG 通知链卡住任务的概率。"
     plugin_icon = "rss.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "multirsssubscribe_"

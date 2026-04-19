@@ -1,8 +1,9 @@
 # MoviePilot 插件仓库
 
-这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前包含三个插件：
+这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前包含四个插件：
 
 - `多源RSS订阅`
+- `自定义订阅无通知`
 - `RSS优选下载`
 - `媒体库缺集补全`
 
@@ -19,6 +20,14 @@
 - 历史记录按官方方式仅记录已成功处理过的 `RSS 标题`，不再额外做媒体级冷却去重
 - 默认跳过整季/完结包，也可继续跳过“电视剧无集号”的资源
 - 新增“静音下载通知”开关，默认开启，用来尽量减少 Telegram 等通知链阻塞导致的漏跑
+
+### 自定义订阅无通知
+
+- 基本按官方 `rsssubscribe` 插件的配置和主流程实现
+- 支持多行 `RSS` 地址、包含/排除、种子大小限制、保存目录、代理和订阅优先级规则
+- 支持动作选择：`订阅` 或 `下载`，默认动作是 `下载`
+- 不提供“发送通知”开关，插件自身不会调用系统通知
+- 执行下载或添加订阅时会静音 `DownloadChain` / `SubscribeChain` 里的同步消息发送，用来避免 Telegram 等通知链阻塞 RSS 执行
 
 ### 媒体库缺集补全
 
@@ -59,6 +68,8 @@ plugins.v2/
     __init__.py
   multirsssubscribe/
     __init__.py
+  rsssubscribenonotify/
+    __init__.py
   rssbestversion/
     __init__.py
 ```
@@ -84,4 +95,5 @@ hdhome.org=60
 
 - `LibraryGapFill` `v1.1`
 - `MultiRssSubscribe` `v1.1.1`
+- `RssSubscribeNoNotify` `v1.0.0`
 - `RssBestVersion` `v2.2.9`
