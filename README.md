@@ -1,11 +1,24 @@
-# RSS 优选下载插件仓库
+# MoviePilot 插件仓库
 
-这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前包含两个插件：
+这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前包含三个插件：
 
+- `多源RSS订阅`
 - `RSS优选下载`
 - `媒体库缺集补全`
 
 ## 功能
+
+### 多源RSS订阅
+
+- 不再依赖官方 `rsssubscribe` 分身
+- 在一个插件里统一维护多条 `RSS` 源，统一调度，避免容器更新后分身目录丢失
+- 每个源都可以单独配置 `name / rss / include / exclude / save_path / proxy / filter`
+- 每条源单独容错，单个站点报错不会影响其它站点继续跑
+- 直接复用 `MoviePilot` 自身的识别能力，先识别媒体，再判断媒体库是否已存在
+- 默认跳过“电视剧无集号”的资源，也支持跳过整季/完结包
+- 如果整季/完结包对应剧集在媒体库里完全不存在，则允许放行下载
+- 带有“重复推送冷却”机制，默认 `24` 小时内同一媒体不会反复下发下载
+- 下载时静音插件内部同步消息，尽量减少通知链阻塞导致的漏跑
 
 ### 媒体库缺集补全
 
@@ -44,6 +57,8 @@ package.v2.json
 plugins.v2/
   librarygapfill/
     __init__.py
+  multirsssubscribe/
+    __init__.py
   rssbestversion/
     __init__.py
 ```
@@ -68,4 +83,5 @@ hdhome.org=60
 ## 当前版本
 
 - `LibraryGapFill` `v1.1`
-- `RssBestVersion` `v2.2.1`
+- `MultiRssSubscribe` `v1.0.0`
+- `RssBestVersion` `v2.2.9`

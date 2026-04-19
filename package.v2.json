@@ -12,6 +12,18 @@
       "v1.0": "首个版本，按媒体库实际缺集扫描电视剧，直接搜索并下载缺失的已播出剧集，并带有短期去重冷却，避免同一批缺集反复下发。"
     }
   },
+  "MultiRssSubscribe": {
+    "name": "多源RSS订阅",
+    "description": "把多条 RSS 源放进一个插件里统一调度，稳定执行识别、过滤和直接下载，避免官方 rsssubscribe 分身丢失或漏跑。",
+    "labels": "RSS,订阅,下载,多源",
+    "version": "1.0.0",
+    "icon": "rss.png",
+    "author": "Codex",
+    "level": 2,
+    "history": {
+      "v1.0.0": "首个版本：支持在一个插件里配置多条 RSS 源，按源独立刷新和容错；使用 MoviePilot 自身识别能力判断媒体库是否已存在；支持整季/完结包过滤、电视剧无集号跳过，以及重复推送冷却，专门用来替代不稳定的 rsssubscribe 分身。"
+    }
+  },
   "RssBestVersion": {
     "name": "RSS优选下载",
     "description": "按单条 RSS 单独比较同一剧集资源，只下载当前 RSS 中优先级最高的版本。",
