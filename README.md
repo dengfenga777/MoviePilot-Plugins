@@ -15,6 +15,7 @@
 - 每个源都可以单独配置 `name / rss / include / exclude / save_path / proxy / filter`
 - 每条源单独容错，单个站点报错不会影响其它站点继续跑
 - 主流程按官方 `rsssubscribe` 的顺序走：`RSS -> 识别 -> 查库 -> 下载`
+- 可直接应用 `MoviePilot` 自身的订阅优先级规则；支持插件页全局开关，也支持按源 JSON 的 `filter` 单独覆盖
 - 历史记录按官方方式仅记录已成功处理过的 `RSS 标题`，不再额外做媒体级冷却去重
 - 默认跳过整季/完结包，也可继续跳过“电视剧无集号”的资源
 - 新增“静音下载通知”开关，默认开启，用来尽量减少 Telegram 等通知链阻塞导致的漏跑
@@ -82,5 +83,5 @@ hdhome.org=60
 ## 当前版本
 
 - `LibraryGapFill` `v1.1`
-- `MultiRssSubscribe` `v1.1.0`
+- `MultiRssSubscribe` `v1.1.1`
 - `RssBestVersion` `v2.2.9`

@@ -46,7 +46,7 @@ class RssSource:
     exclude: str = ""
     save_path: str = ""
     proxy: bool = False
-    filter: bool = False
+    filter: Optional[bool] = None
 
 
 class MultiRssSubscribe(_PluginBase):
@@ -68,6 +68,7 @@ class MultiRssSubscribe(_PluginBase):
     _clearflag: bool = False
     _cron: str = "*/30 * * * *"
     _mute_notify: bool = True
+    _apply_filter_rules: bool = False
     _skip_complete: bool = True
     _skip_tv_without_episode: bool = True
     _sources_json: str = "[]"
@@ -83,6 +84,7 @@ class MultiRssSubscribe(_PluginBase):
             self._clear = bool(config.get("clear"))
             self._cron = config.get("cron") or "*/30 * * * *"
             self._mute_notify = bool(config.get("mute_notify", True))
+            self._apply_filter_rules = bool(config.get("apply_filter_rules", False))
             self._skip_complete = bool(config.get("skip_complete", True))
             self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
             self._sources_json = config.get("sources_json") or "[]"
@@ -167,7 +169,13 @@ class MultiRssSubscribe(_PluginBase):
                         "component": "VRow",
                         "content": [
                             _col(6, _cronfield("cron", "执行周期", "5位 cron 表达式")),
+                            _col(3, _switch("apply_filter_rules", "应用MoviePilot优先规则")),
                             _col(3, _switch("skip_complete", "整季/完结包直接跳过")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             _col(3, _switch("skip_tv_without_episode", "电视剧无集号则跳过")),
                         ],
                     },
@@ -204,6 +212,7 @@ class MultiRssSubscribe(_PluginBase):
                                                 "这个插件按官方 rsssubscribe 的识别、查库、下载顺序来跑，"
                                                 "但把多个 RSS 源统一放到一个插件里调度。"
                                                 "任意单个 RSS 源报错，只会跳过当前源，不会把其它源一起带停。"
+                                                "如果开启 MoviePilot 优先规则，就会复用系统里的订阅优先级筛选逻辑。"
                                             ),
                                         },
                                     }
@@ -249,7 +258,7 @@ class MultiRssSubscribe(_PluginBase):
                                             "text": (
                                                 "配置示例："
                                                 '[{"name":"观众剧集","enabled":true,"rss":["https://audiences.me/xxx"],'
-                                                '"save_path":"","include":"","exclude":"","proxy":false,"filter":false},'
+                                                '"save_path":"","include":"","exclude":"","proxy":false,"filter":true},'
                                                 '{"name":"馒头剧集","enabled":true,"rss":"https://rss.m-team.cc/xxx"}]'
                                             ),
                                         },
@@ -266,6 +275,7 @@ class MultiRssSubscribe(_PluginBase):
             "clear": False,
             "cron": "*/30 * * * *",
             "mute_notify": True,
+            "apply_filter_rules": False,
             "skip_complete": True,
             "skip_tv_without_episode": True,
             "sources_json": "[]",
@@ -492,7 +502,7 @@ class MultiRssSubscribe(_PluginBase):
             pubdate=self.__pubdate_text(pubdate),
             site_proxy=source.proxy,
         )
-        if source.filter:
+        if self.__use_filter_rules(source):
             filtered = self.chain.filter_torrents(
                 rule_groups=filter_groups,
                 torrent_list=[torrentinfo],
@@ -576,6 +586,11 @@ class MultiRssSubscribe(_PluginBase):
         if source.exclude and re.search(source.exclude, text, re.IGNORECASE):
             return False
         return True
+
+    def __use_filter_rules(self, source: RssSource) -> bool:
+        if source.filter is None:
+            return self._apply_filter_rules
+        return bool(source.filter)
 
     @staticmethod
     def __all_episodes_exist(meta: MetaInfo, exist_info: ExistMediaInfo) -> bool:
@@ -675,7 +690,7 @@ class MultiRssSubscribe(_PluginBase):
                     exclude=str(item.get("exclude") or "").strip(),
                     save_path=str(item.get("save_path") or "").strip(),
                     proxy=bool(item.get("proxy", False)),
-                    filter=bool(item.get("filter", False)),
+                    filter=self.__source_filter_value(item.get("filter")),
                 )
             )
 
@@ -688,6 +703,21 @@ class MultiRssSubscribe(_PluginBase):
         if isinstance(value, str):
             return [line.strip() for line in value.splitlines() if line.strip()]
         return []
+
+    @staticmethod
+    def __source_filter_value(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return None
+        return bool(value)
 
     @staticmethod
     def __pubdate_text(value: Any) -> Optional[str]:
@@ -705,6 +735,7 @@ class MultiRssSubscribe(_PluginBase):
                 "clear": self._clear,
                 "cron": self._cron,
                 "mute_notify": self._mute_notify,
+                "apply_filter_rules": self._apply_filter_rules,
                 "skip_complete": self._skip_complete,
                 "skip_tv_without_episode": self._skip_tv_without_episode,
                 "sources_json": self._sources_json,
