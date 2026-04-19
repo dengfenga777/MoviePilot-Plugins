@@ -4,7 +4,7 @@ import re
 import traceback
 from dataclasses import dataclass
 from threading import Lock
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict, Tuple, Set
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -49,37 +49,11 @@ class RssSource:
     filter: bool = False
 
 
-@dataclass
-class Candidate:
-    source: RssSource
-    source_url: str
-    raw_title: str
-    description: str
-    torrent: TorrentInfo
-    meta: MetaInfo
-    mediainfo: MediaInfo
-    group_keys: List[str]
-    exist_info: Optional[ExistMediaInfo]
-    is_complete_pack: bool
-
-    @property
-    def candidate_id(self) -> str:
-        if self.torrent.enclosure:
-            return self.torrent.enclosure
-        if self.torrent.page_url:
-            return self.torrent.page_url
-        return self.raw_title
-
-    @property
-    def title_label(self) -> str:
-        return self.mediainfo.title_year or self.raw_title
-
-
 class MultiRssSubscribe(_PluginBase):
     plugin_name = "多源RSS订阅"
-    plugin_desc = "在一个插件中维护多条RSS源，稳定执行识别、过滤和直接下载，避免分身插件丢失或漏跑。"
+    plugin_desc = "按官方 rsssubscribe 逻辑统一调度多条 RSS 源，并可静音下载通知，降低 TG 通知链卡住任务的概率。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "multirsssubscribe_"
@@ -93,7 +67,7 @@ class MultiRssSubscribe(_PluginBase):
     _clear: bool = False
     _clearflag: bool = False
     _cron: str = "*/30 * * * *"
-    _cooldown_hours: int = 24
+    _mute_notify: bool = True
     _skip_complete: bool = True
     _skip_tv_without_episode: bool = True
     _sources_json: str = "[]"
@@ -108,7 +82,7 @@ class MultiRssSubscribe(_PluginBase):
             self._onlyonce = bool(config.get("onlyonce"))
             self._clear = bool(config.get("clear"))
             self._cron = config.get("cron") or "*/30 * * * *"
-            self._cooldown_hours = self.__safe_int(config.get("cooldown_hours"), default=24)
+            self._mute_notify = bool(config.get("mute_notify", True))
             self._skip_complete = bool(config.get("skip_complete", True))
             self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
             self._sources_json = config.get("sources_json") or "[]"
@@ -186,7 +160,7 @@ class MultiRssSubscribe(_PluginBase):
                             _col(3, _switch("enabled", "启用插件")),
                             _col(3, _switch("onlyonce", "立即运行一次")),
                             _col(3, _switch("clear", "清理历史记录")),
-                            _col(3, _textfield("cooldown_hours", "重复推送冷却(小时)", "默认 24")),
+                            _col(3, _switch("mute_notify", "静音下载通知")),
                         ],
                     },
                     {
@@ -227,9 +201,32 @@ class MultiRssSubscribe(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "这个插件就是为了解决官方 rsssubscribe 分身不稳定的问题："
-                                                "所有 RSS 源都放在一个插件里统一调度，任何单个源报错都不会影响其它源。"
-                                                "同一媒体在冷却期内不会重复推送，等媒体库补齐后会自动跳过。"
+                                                "这个插件按官方 rsssubscribe 的识别、查库、下载顺序来跑，"
+                                                "但把多个 RSS 源统一放到一个插件里调度。"
+                                                "任意单个 RSS 源报错，只会跳过当前源，不会把其它源一起带停。"
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "warning",
+                                            "variant": "tonal",
+                                            "text": (
+                                                "建议保持“静音下载通知”开启：下载仍会正常推送到下载器，"
+                                                "只是屏蔽 MoviePilot 默认的同步消息发送，"
+                                                "用来降低 Telegram 等通知链阻塞当前 RSS 轮次的概率。"
                                             ),
                                         },
                                     }
@@ -268,7 +265,7 @@ class MultiRssSubscribe(_PluginBase):
             "onlyonce": False,
             "clear": False,
             "cron": "*/30 * * * *",
-            "cooldown_hours": 24,
+            "mute_notify": True,
             "skip_complete": True,
             "skip_tv_without_episode": True,
             "sources_json": "[]",
@@ -345,7 +342,7 @@ class MultiRssSubscribe(_PluginBase):
             self.save_data("history", [])
             return schemas.Response(success=True, message="历史记录已清空")
 
-        historys = [item for item in historys if item.get("group_key") != key]
+        historys = [item for item in historys if item.get("key") != key]
         self.save_data("history", historys)
         return schemas.Response(success=True, message="删除成功")
 
@@ -366,10 +363,10 @@ class MultiRssSubscribe(_PluginBase):
             lock.release()
 
     def __run_once(self):
-        history_lookup = self.__load_history_lookup()
+        history = [] if self._clearflag else list(self.get_data("history") or [])
+        history_keys = self.__history_keys(history)
         history_changed = self._clearflag
         source_count = 0
-        candidate_total = 0
         download_total = 0
 
         try:
@@ -385,95 +382,83 @@ class MultiRssSubscribe(_PluginBase):
                 source_count += 1
                 logger.info("[%s] 开始处理，共 %s 条 RSS 地址", source.name, len(source.urls))
                 try:
-                    source_candidate_total, source_download_total, changed = self.__run_source(
+                    source_download_total, source_changed = self.__run_source(
                         source=source,
                         filter_groups=filter_groups,
-                        history_lookup=history_lookup,
+                        history=history,
+                        history_keys=history_keys,
                     )
-                    candidate_total += source_candidate_total
                     download_total += source_download_total
-                    history_changed = history_changed or changed
+                    history_changed = history_changed or source_changed
                 except Exception:
                     logger.error("[%s] RSS 源处理出错：%s", source.name, traceback.format_exc())
         finally:
             if history_changed:
-                self.save_data("history", list(history_lookup.values()))
+                self.save_data("history", history)
             self._clearflag = False
 
             if not source_count:
                 logger.info("没有启用的 RSS 源，跳过本次执行")
-                return
-
-            if not candidate_total:
-                logger.info("多源RSS订阅本轮未产生可下载候选资源")
+            elif not download_total:
+                logger.info("多源RSS订阅本轮未推送任何新资源")
             else:
-                logger.info("多源RSS订阅本轮完成，候选 %s 条，成功推送 %s 条", candidate_total, download_total)
+                logger.info("多源RSS订阅本轮完成，成功推送 %s 条资源", download_total)
 
     def __run_source(
         self,
         source: RssSource,
         filter_groups: Any,
-        history_lookup: Dict[str, dict],
-    ) -> Tuple[int, int, bool]:
-        candidate_total = 0
+        history: List[dict],
+        history_keys: Set[str],
+    ) -> Tuple[int, bool]:
         download_total = 0
         changed = False
+        downloadchain = DownloadChain()
+        original_post_message = getattr(downloadchain, "post_message", None)
 
-        for url in source.urls:
-            results = self.__fetch_single_rss(source=source, url=url)
-            if not results:
-                continue
+        try:
+            if self._mute_notify and original_post_message:
+                downloadchain.post_message = self.__suppress_post_message
 
-            for result in results:
-                try:
-                    candidate = self.__build_candidate(
-                        source=source,
-                        source_url=url,
-                        result=result,
-                        filter_groups=filter_groups,
-                    )
-                    if not candidate:
-                        continue
+            for url in source.urls:
+                logger.info("[%s] 开始刷新 RSS：%s ...", source.name, url)
+                results = RssHelper().parse(url, proxy=source.proxy)
+                if not results:
+                    logger.error("[%s] 未获取到 RSS 数据：%s", source.name, url)
+                    continue
 
-                    candidate_total += 1
-                    skip_reason = self.__candidate_skip_reason(candidate=candidate, history_lookup=history_lookup)
-                    if skip_reason:
-                        logger.info("[%s] %s", source.name, skip_reason)
-                        continue
+                for result in results:
+                    try:
+                        if self.__process_result(
+                            source=source,
+                            result=result,
+                            filter_groups=filter_groups,
+                            downloadchain=downloadchain,
+                            history=history,
+                            history_keys=history_keys,
+                        ):
+                            download_total += 1
+                            changed = True
+                    except Exception:
+                        logger.error("[%s] 刷新 RSS 条目出错：%s", source.name, traceback.format_exc())
 
-                    if not self.__download_candidate(candidate):
-                        logger.error("[%s] 下载失败：%s", source.name, candidate.raw_title)
-                        continue
+                logger.info("[%s] RSS %s 刷新完成", source.name, url)
+        finally:
+            if original_post_message:
+                downloadchain.post_message = original_post_message
 
-                    download_total += 1
-                    for group_key in candidate.group_keys:
-                        history_lookup[group_key] = self.__build_history_record(
-                            candidate=candidate,
-                            group_key=group_key,
-                        )
-                    changed = True
-                except Exception:
-                    logger.error("[%s] 解析 RSS 条目出错：%s", source.name, traceback.format_exc())
+        logger.info("[%s] 本轮处理完成，成功推送 %s 条", source.name, download_total)
+        return download_total, changed
 
-        logger.info("[%s] 本轮处理完成，候选 %s 条，成功推送 %s 条", source.name, candidate_total, download_total)
-        return candidate_total, download_total, changed
-
-    def __fetch_single_rss(self, source: RssSource, url: str) -> List[dict]:
-        logger.info("[%s] 开始刷新 RSS：%s ...", source.name, url)
-        results = RssHelper().parse(url, proxy=source.proxy)
-        if results:
-            logger.info("[%s] RSS %s 抓取完成，原始条目 %s 条", source.name, url, len(results))
-            return results
-        logger.warning("[%s] 未获取到 RSS 数据：%s", source.name, url)
-        return []
-
-    def __build_candidate(
+    def __process_result(
         self,
         source: RssSource,
-        source_url: str,
         result: dict,
         filter_groups: Any,
-    ) -> Optional[Candidate]:
+        downloadchain: DownloadChain,
+        history: List[dict],
+        history_keys: Set[str],
+    ) -> bool:
         title = result.get("title")
         description = result.get("description")
         enclosure = result.get("enclosure")
@@ -481,24 +466,24 @@ class MultiRssSubscribe(_PluginBase):
         size = result.get("size")
         pubdate = result.get("pubdate")
 
-        if not title:
-            return None
-        if not self.__match_text_filters(source=source, title=title, description=description):
-            return None
+        if not title or title in history_keys:
+            return False
 
-        is_complete_pack = self.__is_complete_pack(title=title)
-        meta_title = self.__build_meta_title(title=title, description=description)
-        meta = MetaInfo(title=meta_title, subtitle=description)
+        if not self.__match_text_filters(source=source, title=title, description=description):
+            logger.info("[%s] %s 不符合包含/排除规则", source.name, title)
+            return False
+
+        meta = MetaInfo(title=title, subtitle=description)
         if not meta.name:
             logger.warning("[%s] %s 未识别到有效数据", source.name, title)
-            return None
+            return False
 
         mediainfo: MediaInfo = self.chain.recognize_media(meta=meta)
         if not mediainfo:
             logger.warning("[%s] 未识别到媒体信息，标题：%s", source.name, title)
-            return None
+            return False
 
-        torrent = TorrentInfo(
+        torrentinfo = TorrentInfo(
             title=title,
             description=description,
             enclosure=enclosure,
@@ -507,132 +492,82 @@ class MultiRssSubscribe(_PluginBase):
             pubdate=self.__pubdate_text(pubdate),
             site_proxy=source.proxy,
         )
-        if not self.__match_subscribe_rules(
-            source=source,
-            torrent=torrent,
-            mediainfo=mediainfo,
-            filter_groups=filter_groups,
-        ):
-            logger.info("[%s] %s 不匹配订阅优先级规则", source.name, title)
-            return None
+        if source.filter:
+            filtered = self.chain.filter_torrents(
+                rule_groups=filter_groups,
+                torrent_list=[torrentinfo],
+                mediainfo=mediainfo,
+            )
+            if not filtered:
+                logger.info("[%s] %s 不匹配订阅优先级规则", source.name, title)
+                return False
 
-        group_keys = self.__build_group_keys(mediainfo=mediainfo, meta=meta)
-        if not group_keys:
-            logger.info("[%s] %s 未识别到可去重的媒体键", source.name, title)
-            return None
-
-        return Candidate(
-            source=source,
-            source_url=source_url,
-            raw_title=title,
-            description=description or "",
-            torrent=torrent,
+        exist_info = self.chain.media_exists(mediainfo=mediainfo)
+        skip_reason = self.__library_skip_reason(
+            title=title,
             meta=meta,
             mediainfo=mediainfo,
-            group_keys=group_keys,
-            exist_info=self.chain.media_exists(mediainfo=mediainfo),
-            is_complete_pack=is_complete_pack,
+            exist_info=exist_info,
         )
+        if skip_reason:
+            logger.info("[%s] %s", source.name, skip_reason)
+            return False
 
-    def __candidate_skip_reason(
+        download_result = downloadchain.download_single(
+            context=Context(
+                meta_info=meta,
+                media_info=mediainfo,
+                torrent_info=torrentinfo,
+            ),
+            save_path=source.save_path,
+            username="多源RSS订阅",
+        )
+        if not download_result:
+            logger.error("[%s] %s 下载失败", source.name, title)
+            return False
+
+        record = {
+            "source": source.name,
+            "title": f"{mediainfo.title} {meta.season}".strip(),
+            "key": title,
+            "type": mediainfo.type.value,
+            "year": mediainfo.year,
+            "poster": mediainfo.get_poster_image(),
+            "overview": mediainfo.overview,
+            "tmdbid": mediainfo.tmdb_id,
+            "season_episode": self.__season_episode_text(meta),
+            "raw_title": title,
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        history.append(record)
+        history_keys.add(title)
+        return True
+
+    def __library_skip_reason(
         self,
-        candidate: Candidate,
-        history_lookup: Dict[str, dict],
+        title: str,
+        meta: MetaInfo,
+        mediainfo: MediaInfo,
+        exist_info: Optional[ExistMediaInfo],
     ) -> Optional[str]:
-        title_year = candidate.title_label
-        season_episode = self.__season_episode_text(candidate.meta)
-        is_season_pack = self.__is_season_pack(candidate)
-        is_pack_candidate = candidate.is_complete_pack or is_season_pack
+        if mediainfo.type == MediaType.TV:
+            if self._skip_complete and self.__is_complete_pack(title):
+                return f"{title} 命中完结包规则，已跳过"
 
-        if candidate.mediainfo.type != MediaType.TV:
-            if candidate.exist_info:
-                return f"{title_year} 已存在"
-            return self.__history_skip_reason(candidate, history_lookup)
+            if self._skip_complete and self.__is_season_pack(title=title, meta=meta):
+                return f"{title} 命中整季包规则，已跳过"
 
-        if candidate.is_complete_pack and self._skip_complete:
-            if self.__library_missing(candidate):
-                return self.__history_skip_reason(candidate, history_lookup)
-            season = candidate.meta.season or ""
-            return f"{title_year} {season} 命中整季/完结包规则，已直接跳过".strip()
+            if self._skip_tv_without_episode and not (meta.episode_list or []):
+                return f"{title} 未识别到集号，按配置跳过"
 
-        if self._skip_complete and is_season_pack:
-            if self.__library_missing(candidate):
-                return self.__history_skip_reason(candidate, history_lookup)
-            season = candidate.meta.season or ""
-            return f"{title_year} {season} 命中整季包规则，已直接跳过".strip()
-
-        if self._skip_tv_without_episode and not (candidate.meta.episode_list or []) and not is_pack_candidate:
-            return f"{candidate.raw_title} 未识别到集号，按配置跳过该电视剧资源"
-
-        if (
-            not candidate.is_complete_pack
-            and candidate.exist_info
-            and self.__all_episodes_exist(meta=candidate.meta, exist_info=candidate.exist_info)
-        ):
-            return f"{title_year} {season_episode} 已存在".strip()
-
-        return self.__history_skip_reason(candidate, history_lookup)
-
-    def __history_skip_reason(
-        self,
-        candidate: Candidate,
-        history_lookup: Dict[str, dict],
-    ) -> Optional[str]:
-        if self._cooldown_hours <= 0:
+            if exist_info and self.__all_episodes_exist(meta=meta, exist_info=exist_info):
+                season_episode = self.__season_episode_text(meta)
+                return f"{mediainfo.title_year} {season_episode} 已存在".strip()
             return None
 
-        for group_key in candidate.group_keys:
-            record = history_lookup.get(group_key)
-            if not record:
-                continue
-            if not self.__history_active(record):
-                continue
-
-            season_episode = record.get("season_episode") or self.__season_episode_text(candidate.meta)
-            return (
-                f"{candidate.title_label} {season_episode} 仍在重复推送冷却期内，"
-                f"已跳过（来源：{record.get('source', '')}）"
-            ).strip()
+        if exist_info:
+            return f"{mediainfo.title_year} 已存在"
         return None
-
-    def __build_history_record(self, candidate: Candidate, group_key: str) -> dict:
-        now = datetime.datetime.now()
-        expire_at = int((now + datetime.timedelta(hours=self._cooldown_hours)).timestamp())
-        return {
-            "group_key": group_key,
-            "source": candidate.source.name,
-            "title": candidate.title_label,
-            "season_episode": self.__season_episode_text(candidate.meta),
-            "raw_title": candidate.raw_title,
-            "candidate_id": candidate.candidate_id,
-            "poster": candidate.mediainfo.get_poster_image(),
-            "tmdbid": candidate.mediainfo.tmdb_id,
-            "time": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "expire_at": expire_at,
-        }
-
-    def __download_candidate(self, candidate: Candidate) -> bool:
-        downloadchain = DownloadChain()
-        original_post_message = downloadchain.post_message
-
-        try:
-            downloadchain.post_message = self.__suppress_post_message
-            result = downloadchain.download_single(
-                context=Context(
-                    meta_info=candidate.meta,
-                    media_info=candidate.mediainfo,
-                    torrent_info=candidate.torrent,
-                ),
-                save_path=candidate.source.save_path,
-                username="多源RSS订阅",
-            )
-        except Exception:
-            logger.error("[%s] 推送下载失败：%s - %s", candidate.source.name, candidate.raw_title, traceback.format_exc())
-            return False
-        finally:
-            downloadchain.post_message = original_post_message
-
-        return bool(result)
 
     def __match_text_filters(self, source: RssSource, title: str, description: Optional[str]) -> bool:
         text = f"{title} {description or ''}"
@@ -641,34 +576,6 @@ class MultiRssSubscribe(_PluginBase):
         if source.exclude and re.search(source.exclude, text, re.IGNORECASE):
             return False
         return True
-
-    def __match_subscribe_rules(
-        self,
-        source: RssSource,
-        torrent: TorrentInfo,
-        mediainfo: MediaInfo,
-        filter_groups: Any,
-    ) -> bool:
-        if not source.filter:
-            return True
-        filtered = self.chain.filter_torrents(
-            rule_groups=filter_groups,
-            torrent_list=[torrent],
-            mediainfo=mediainfo,
-        )
-        return bool(filtered)
-
-    def __build_group_keys(self, mediainfo: MediaInfo, meta: MetaInfo) -> List[str]:
-        tmdbid = mediainfo.tmdb_id or f"{mediainfo.title}_{mediainfo.year}"
-        if mediainfo.type == MediaType.TV:
-            season = meta.begin_season or 1
-            episodes = meta.episode_list or []
-            if episodes:
-                return [f"tv:{tmdbid}:s{season}:e{episode}" for episode in sorted(set(episodes))]
-            if meta.season_episode:
-                return [f"tv:{tmdbid}:s{season}:{meta.season_episode}"]
-            return [f"tv:{tmdbid}:s{season}:{meta.name}"]
-        return [f"movie:{tmdbid}"]
 
     @staticmethod
     def __all_episodes_exist(meta: MetaInfo, exist_info: ExistMediaInfo) -> bool:
@@ -683,102 +590,32 @@ class MultiRssSubscribe(_PluginBase):
         return set(meta.episode_list).issubset(set(exist_episodes))
 
     @staticmethod
-    def __library_missing(candidate: Candidate) -> bool:
-        return not bool(candidate.exist_info)
-
-    def __build_meta_title(self, title: str, description: Optional[str]) -> str:
-        text = f"{title} {description or ''}"
-        meta_title = title
-        normalized = title.lower()
-
-        if not re.search(r"s\d{1,2}", normalized):
-            season = self.__extract_season_number(text)
-            if season:
-                meta_title = f"{meta_title} S{season:02d}"
-
-        if not re.search(r"(s\d{1,2}e\d{1,3}|e\d{1,3})", normalized):
-            episode_hint = self.__extract_episode_hint(text)
-            if episode_hint:
-                meta_title = f"{meta_title} {episode_hint}"
-
-        return meta_title
-
-    @staticmethod
-    def __extract_season_number(text: str) -> Optional[int]:
-        patterns = [
-            r"第\s*([0-9]{1,2})\s*季",
-            r"\[\s*第([一二三四五六七八九十]{1,3})季\s*\]",
-            r"\bseason\s*([0-9]{1,2})\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if not match:
-                continue
-
-            value = match.group(1)
-            if value.isdigit():
-                return int(value)
-
-            chinese = {
-                "一": 1,
-                "二": 2,
-                "三": 3,
-                "四": 4,
-                "五": 5,
-                "六": 6,
-                "七": 7,
-                "八": 8,
-                "九": 9,
-                "十": 10,
-            }
-            if value in chinese:
-                return chinese[value]
-        return None
-
-    @staticmethod
-    def __extract_episode_hint(text: str) -> Optional[str]:
-        patterns = [
-            r"第\s*([0-9]{1,3})\s*[-~到至]\s*([0-9]{1,3})\s*集",
-            r"第\s*([0-9]{1,3})\s*集",
-            r"\[\s*第([一二三四五六七八九十]{1,3})季\s*第([0-9]{1,3})集\s*\]",
-            r"第([0-9]{1,3})季第([0-9]{1,3})集",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if not match:
-                continue
-
-            groups = match.groups()
-            if len(groups) == 2:
-                if groups[0].isdigit() and groups[1].isdigit():
-                    first = int(groups[0])
-                    second = int(groups[1])
-                    if "季" in match.group(0) and first <= 20 and second <= 999:
-                        return f"S{first:02d}E{second:02d}"
-                    if first <= 999 and second <= 999:
-                        return f"E{first:02d}-E{second:02d}"
-
-            if len(groups) == 1 and groups[0].isdigit():
-                episode = int(groups[0])
-                return f"E{episode:02d}"
-
-        return None
+    def __season_episode_text(meta: MetaInfo) -> str:
+        season = getattr(meta, "begin_season", None)
+        episodes = sorted(set(getattr(meta, "episode_list", []) or []))
+        if season and episodes:
+            if len(episodes) == 1:
+                return f"S{int(season):02d}E{int(episodes[0]):02d}"
+            return f"S{int(season):02d}E{int(episodes[0]):02d}-E{int(episodes[-1]):02d}"
+        if meta.season_episode:
+            return meta.season_episode
+        if meta.season:
+            return meta.season
+        return ""
 
     def __is_complete_pack(self, title: str) -> bool:
-        normalized = title.lower()
+        normalized = (title or "").lower()
         if not COMPLETE_HINTS.search(normalized):
             return False
         if MULTI_EPISODE_HINTS.search(normalized):
             return False
         return True
 
-    def __is_season_pack(self, candidate: Candidate) -> bool:
-        if candidate.mediainfo.type != MediaType.TV:
-            return False
-        if candidate.meta.episode_list:
+    def __is_season_pack(self, title: str, meta: MetaInfo) -> bool:
+        if meta.episode_list:
             return False
 
-        normalized = candidate.raw_title.lower()
+        normalized = (title or "").lower()
         if MULTI_EPISODE_HINTS.search(normalized):
             return False
 
@@ -795,49 +632,11 @@ class MultiRssSubscribe(_PluginBase):
         if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in season_markers):
             return True
 
-        return bool(getattr(candidate.meta, "begin_season", None))
+        return bool(getattr(meta, "begin_season", None))
 
     @staticmethod
-    def __season_episode_text(meta: MetaInfo) -> str:
-        season = getattr(meta, "begin_season", None)
-        episodes = sorted(set(getattr(meta, "episode_list", []) or []))
-        if season and episodes:
-            if len(episodes) == 1:
-                return f"S{int(season):02d}E{int(episodes[0]):02d}"
-            return f"S{int(season):02d}E{int(episodes[0]):02d}-E{int(episodes[-1]):02d}"
-        if meta.season_episode:
-            return meta.season_episode
-        if meta.season:
-            return meta.season
-        return ""
-
-    def __history_active(self, record: dict) -> bool:
-        if self._cooldown_hours <= 0:
-            return False
-        expire_at = self.__safe_int(record.get("expire_at"))
-        return expire_at > int(datetime.datetime.now().timestamp())
-
-    def __load_history_lookup(self) -> Dict[str, dict]:
-        if self._clearflag:
-            return {}
-
-        history = self.get_data("history") or []
-        lookup: Dict[str, dict] = {}
-        for item in history:
-            group_key = item.get("group_key")
-            if not group_key:
-                continue
-
-            previous = lookup.get(group_key)
-            if not previous:
-                lookup[group_key] = item
-                continue
-
-            prev_expire = self.__safe_int(previous.get("expire_at"))
-            curr_expire = self.__safe_int(item.get("expire_at"))
-            if curr_expire >= prev_expire:
-                lookup[group_key] = item
-        return lookup
+    def __history_keys(history: List[dict]) -> Set[str]:
+        return {str(item.get("key")).strip() for item in history if str(item.get("key") or "").strip()}
 
     def __parse_sources_json(self, raw_value: str) -> List[RssSource]:
         raw_value = (raw_value or "").strip() or "[]"
@@ -905,19 +704,12 @@ class MultiRssSubscribe(_PluginBase):
                 "onlyonce": self._onlyonce,
                 "clear": self._clear,
                 "cron": self._cron,
-                "cooldown_hours": self._cooldown_hours,
+                "mute_notify": self._mute_notify,
                 "skip_complete": self._skip_complete,
                 "skip_tv_without_episode": self._skip_tv_without_episode,
                 "sources_json": self._sources_json,
             }
         )
-
-    @staticmethod
-    def __safe_int(value: Any, default: int = 0) -> int:
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return default
 
     @staticmethod
     def __suppress_post_message(*args, **kwargs):
@@ -937,13 +729,6 @@ def _switch(model: str, label: str) -> dict:
         "component": "VSwitch",
         "props": {"model": model, "label": label},
     }
-
-
-def _textfield(model: str, label: str, placeholder: str = "") -> dict:
-    props = {"model": model, "label": label}
-    if placeholder:
-        props["placeholder"] = placeholder
-    return {"component": "VTextField", "props": props}
 
 
 def _textarea(model: str, label: str, placeholder: str = "", rows: int = 3) -> dict:

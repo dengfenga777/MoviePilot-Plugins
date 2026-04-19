@@ -14,13 +14,14 @@
   },
   "MultiRssSubscribe": {
     "name": "多源RSS订阅",
-    "description": "把多条 RSS 源放进一个插件里统一调度，稳定执行识别、过滤和直接下载，避免官方 rsssubscribe 分身丢失或漏跑。",
+    "description": "按官方 rsssubscribe 逻辑统一调度多条 RSS 源，并可静音下载通知，降低 TG 通知链卡住任务的概率。",
     "labels": "RSS,订阅,下载,多源",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "rss.png",
     "author": "Codex",
     "level": 2,
     "history": {
+      "v1.1.0": "主流程收敛为官方 rsssubscribe 的多源版：按条目顺序执行识别、查库、下载；移除额外冷却去重；新增默认开启的静音下载通知，降低 Telegram 等通知链阻塞当前 RSS 轮次的概率。",
       "v1.0.0": "首个版本：支持在一个插件里配置多条 RSS 源，按源独立刷新和容错；使用 MoviePilot 自身识别能力判断媒体库是否已存在；支持整季/完结包过滤、电视剧无集号跳过，以及重复推送冷却，专门用来替代不稳定的 rsssubscribe 分身。"
     }
   },
