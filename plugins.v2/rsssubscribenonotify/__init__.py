@@ -2,6 +2,7 @@ import datetime
 import re
 import traceback
 from typing import Optional, Any, List, Dict, Tuple
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,7 +14,9 @@ from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.context import Context, MediaInfo, TorrentInfo
 from app.core.metainfo import MetaInfo
+from app.db.site_oper import SiteOper
 from app.helper.rss import RssHelper
+from app.helper.torrent import TorrentHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import ExistMediaInfo
@@ -392,7 +395,9 @@ class RssSubscribeNoNotify(_PluginBase):
                 logger.error("未获取到RSS数据：%s", url)
                 return
 
+            site_info = self.__get_site_info(url=url)
             filter_groups = self.systemconfig.get(SystemConfigKey.SubscribeFilterRuleGroups)
+            download_contexts: List[Tuple[Context, Dict[str, Any]]] = []
             for result in results:
                 try:
                     title = result.get("title")
@@ -432,13 +437,20 @@ class RssSubscribeNoNotify(_PluginBase):
                         continue
 
                     torrentinfo = TorrentInfo(
+                        site=site_info.get("id"),
+                        site_name=site_info.get("name"),
+                        site_cookie=site_info.get("cookie"),
+                        site_ua=site_info.get("ua") or settings.USER_AGENT,
+                        site_proxy=self._proxy or bool(site_info.get("proxy")),
+                        site_order=site_info.get("pri") or 0,
+                        site_downloader=site_info.get("downloader"),
                         title=title,
                         description=description,
                         enclosure=enclosure,
                         page_url=link,
                         size=size,
+                        seeders=self.__safe_int(result.get("seeders")),
                         pubdate=pubdate.strftime("%Y-%m-%d %H:%M:%S") if pubdate else None,
-                        site_proxy=self._proxy,
                     )
                     if self._filter:
                         filtered = self.chain.filter_torrents(
@@ -449,6 +461,7 @@ class RssSubscribeNoNotify(_PluginBase):
                         if not filtered:
                             logger.info("%s %s 不匹配过滤规则", title, description)
                             continue
+                        torrentinfo = filtered[0]
 
                     exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
                     if mediainfo.type == MediaType.TV:
@@ -464,18 +477,20 @@ class RssSubscribeNoNotify(_PluginBase):
                         continue
 
                     if self._action == "download":
-                        download_result = downloadchain.download_single(
-                            context=Context(
-                                meta_info=meta,
-                                media_info=mediainfo,
-                                torrent_info=torrentinfo,
-                            ),
-                            save_path=self._save_path,
-                            username="RSS订阅无通知",
+                        download_contexts.append(
+                            (
+                                Context(
+                                    meta_info=meta,
+                                    media_info=mediainfo,
+                                    torrent_info=torrentinfo,
+                                ),
+                                self.__build_history_item(
+                                    title=title,
+                                    mediainfo=mediainfo,
+                                    meta=meta,
+                                ),
+                            )
                         )
-                        if not download_result:
-                            logger.error("%s 下载失败", title)
-                            continue
                     else:
                         subflag = subscribechain.exists(mediainfo=mediainfo, meta=meta)
                         if subflag:
@@ -491,24 +506,129 @@ class RssSubscribeNoNotify(_PluginBase):
                             username="RSS订阅无通知",
                         )
 
-                    history.append(
-                        {
-                            "title": f"{mediainfo.title} {meta.season}",
-                            "key": f"{title}",
-                            "type": mediainfo.type.value,
-                            "year": mediainfo.year,
-                            "poster": mediainfo.get_poster_image(),
-                            "overview": mediainfo.overview,
-                            "tmdbid": mediainfo.tmdb_id,
-                            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                    )
+                        history.append(
+                            self.__build_history_item(
+                                title=title,
+                                mediainfo=mediainfo,
+                                meta=meta,
+                            )
+                        )
                 except Exception as err:
                     logger.error("刷新RSS数据出错：%s - %s", str(err), traceback.format_exc())
+
+            if self._action == "download":
+                self.__download_by_priority(
+                    download_contexts=download_contexts,
+                    history=history,
+                    downloadchain=downloadchain,
+                )
             logger.info("RSS %s 刷新完成", url)
 
         self.save_data("history", history)
         self._clearflag = False
+
+    def __download_by_priority(
+        self,
+        download_contexts: List[Tuple[Context, Dict[str, Any]]],
+        history: List[dict],
+        downloadchain: DownloadChain,
+    ):
+        if not download_contexts:
+            return
+
+        contexts = TorrentHelper().sort_torrents(
+            [context for context, _ in download_contexts]
+        )
+        history_by_group: Dict[str, List[dict]] = {}
+        contexts_by_group: Dict[str, List[Context]] = {}
+        for context, history_item in download_contexts:
+            group_key = self.__context_group_key(context)
+            history_by_group.setdefault(group_key, []).append(history_item)
+        for context in contexts:
+            contexts_by_group.setdefault(self.__context_group_key(context), []).append(context)
+
+        logger.info("RSS命中 %s 个候选资源，按MoviePilot优先规则排序后处理 %s 个媒体分组",
+                    len(download_contexts), len(contexts_by_group))
+
+        for group_key, group_contexts in contexts_by_group.items():
+            downloaded = False
+            for context in group_contexts:
+                torrent_title = context.torrent_info.title
+                download_result = downloadchain.download_single(
+                    context=context,
+                    save_path=self._save_path,
+                    username="RSS订阅无通知",
+                )
+                if not download_result:
+                    logger.error("%s 下载失败", torrent_title)
+                    continue
+
+                logger.info("%s 下载成功，同组候选资源将写入历史避免重复下载", torrent_title)
+                downloaded = True
+                break
+
+            if downloaded:
+                history.extend(history_by_group.get(group_key, []))
+
+    @staticmethod
+    def __context_group_key(context: Context) -> str:
+        meta = context.meta_info
+        media = context.media_info
+        if media.type == MediaType.TV:
+            return f"{media.title_year}{meta.season_episode}"
+        return media.title_year
+
+    def __build_history_item(self, title: str, mediainfo: MediaInfo, meta: MetaInfo) -> Dict[str, Any]:
+        return {
+            "title": f"{mediainfo.title} {meta.season}",
+            "key": f"{title}",
+            "type": mediainfo.type.value,
+            "year": mediainfo.year,
+            "poster": mediainfo.get_poster_image(),
+            "overview": mediainfo.overview,
+            "tmdbid": mediainfo.tmdb_id,
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    @staticmethod
+    def __safe_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def __same_host(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        left = left.lower()
+        right = right.lower()
+        return left == right or left.endswith(f".{right}") or right.endswith(f".{left}")
+
+    def __get_site_info(self, url: str) -> Dict[str, Any]:
+        try:
+            rss_host = urlparse(url).netloc.lower()
+            for site in SiteOper().list_active():
+                site_rss_host = urlparse(site.rss or "").netloc.lower()
+                site_url_host = urlparse(site.url or "").netloc.lower()
+                site_domain = (site.domain or "").lower()
+                if (
+                    self.__same_host(rss_host, site_rss_host)
+                    or self.__same_host(rss_host, site_url_host)
+                    or self.__same_host(rss_host, site_domain)
+                ):
+                    return {
+                        "id": site.id,
+                        "name": site.name,
+                        "cookie": site.cookie,
+                        "ua": site.ua,
+                        "proxy": bool(site.proxy),
+                        "pri": site.pri,
+                        "downloader": site.downloader,
+                    }
+        except Exception as err:
+            logger.debug("RSS站点信息匹配失败：%s", str(err))
+        return {}
 
     def __log_and_notify_error(self, message: str):
         logger.error(message)
