@@ -8,6 +8,7 @@
 
 - 面向多 RSS 源场景，先把多条 PT 站 RSS 聚合成统一候选池
 - 聚合层会并发拉取 RSS，按 `guid / enclosure / link / title+size` 去重
+- 默认每轮最多识别 `40` 条新增 RSS item，并跳过已评估过的旧 item，避免整轮反复识别老资源
 - 聚合结果会按发布时间倒序缓存，默认只保留最近 `200` 条
 - 可在聚合层先粗过滤 `CAM / TS / TC / 720p / 合集 / Complete / Pack` 等明显不需要的资源
 - 可通过插件 API `/unified_rss` 输出统一 RSS；配置 `feed_token` 后访问时需要带 `?token=...`
@@ -33,4 +34,4 @@ plugins.v2/
 
 ## 当前版本
 
-- `RssAggregateBestVersion` `v1.0.6`
+- `RssAggregateBestVersion` `v1.1.0`

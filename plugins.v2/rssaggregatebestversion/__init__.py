@@ -30,6 +30,8 @@ from app.schemas.types import SystemConfigKey, MediaType
 lock = Lock()
 HISTORY_REF_LIMIT = 12
 RSS_CACHE_KEY = "unified_rss_cache"
+EVALUATED_CACHE_KEY = "evaluated_rss_items"
+EVALUATED_CACHE_LIMIT = 3000
 DEFAULT_COARSE_EXCLUDE = (
     r"\b(CAM|TS|TC|HDTC|HDCAM|CAMRip|TSRip|Complete|Pack)\b|"
     r"\b720p\b|合集"
@@ -69,6 +71,7 @@ class Candidate:
     pubdate_score: int
     exist_info: Optional[ExistMediaInfo]
     is_complete_pack: bool
+    rss_fingerprint: str = ""
 
     @property
     def candidate_id(self) -> str:
@@ -114,7 +117,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.6"
+    plugin_version = "1.1.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -144,6 +147,8 @@ class RssAggregateBestVersion(_PluginBase):
     _wash_existing_episode: bool = True
     _aggregate_limit: int = 200
     _aggregate_workers: int = 6
+    _process_limit: int = 40
+    _remember_evaluated: bool = True
     _coarse_filter: bool = True
     _coarse_exclude: str = DEFAULT_COARSE_EXCLUDE
     _feed_token: str = ""
@@ -174,6 +179,8 @@ class RssAggregateBestVersion(_PluginBase):
             self._wash_existing_episode = bool(config.get("wash_existing_episode", True))
             self._aggregate_limit = self.__safe_int(config.get("aggregate_limit") or 200) or 200
             self._aggregate_workers = self.__safe_int(config.get("aggregate_workers") or 6) or 6
+            self._process_limit = self.__safe_int(config.get("process_limit") or 40) or 40
+            self._remember_evaluated = bool(config.get("remember_evaluated", True))
             self._coarse_filter = bool(config.get("coarse_filter", True))
             self._coarse_exclude = config.get("coarse_exclude") or DEFAULT_COARSE_EXCLUDE
             self._feed_token = config.get("feed_token") or ""
@@ -320,8 +327,15 @@ class RssAggregateBestVersion(_PluginBase):
                         "content": [
                             _col(3, _textfield("aggregate_limit", "聚合保留条数", "默认 200")),
                             _col(3, _textfield("aggregate_workers", "并发拉取数", "默认 6")),
+                            _col(3, _textfield("process_limit", "单轮识别上限", "默认 40")),
+                            _col(3, _switch("remember_evaluated", "跳过已评估RSS")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             _col(3, _switch("coarse_filter", "启用聚合粗过滤")),
-                            _col(3, _textfield("feed_token", "统一RSS Token", "可留空")),
+                            _col(9, _textfield("feed_token", "统一RSS Token", "可留空")),
                         ],
                     },
                     {
@@ -397,6 +411,8 @@ class RssAggregateBestVersion(_PluginBase):
             "wash_existing_episode": True,
             "aggregate_limit": 200,
             "aggregate_workers": 6,
+            "process_limit": 40,
+            "remember_evaluated": True,
             "coarse_filter": True,
             "coarse_exclude": DEFAULT_COARSE_EXCLUDE,
             "feed_token": "",
@@ -520,6 +536,8 @@ class RssAggregateBestVersion(_PluginBase):
                 "wash_existing_episode": self._wash_existing_episode,
                 "aggregate_limit": self._aggregate_limit,
                 "aggregate_workers": self._aggregate_workers,
+                "process_limit": self._process_limit,
+                "remember_evaluated": self._remember_evaluated,
                 "coarse_filter": self._coarse_filter,
                 "coarse_exclude": self._coarse_exclude,
                 "feed_token": self._feed_token,
@@ -545,7 +563,9 @@ class RssAggregateBestVersion(_PluginBase):
     def __run_once(self):
         started_at = time.monotonic()
         history_lookup: Dict[str, dict] = self.__load_history_lookup()
+        evaluated_lookup: Dict[str, dict] = self.__load_evaluated_lookup()
         history_changed = self._clearflag
+        evaluated_changed = self._clearflag
         candidate_total = 0
         plan_total = 0
 
@@ -563,7 +583,9 @@ class RssAggregateBestVersion(_PluginBase):
             candidates = self.__collect_candidates(
                 urls=urls,
                 filter_groups=filter_groups,
+                evaluated_lookup=evaluated_lookup,
             )
+            evaluated_changed = True
             if not candidates:
                 return
 
@@ -579,11 +601,14 @@ class RssAggregateBestVersion(_PluginBase):
             changed = self.__execute_download_plans(
                 plans=plans,
                 history_lookup=history_lookup,
+                evaluated_lookup=evaluated_lookup,
             )
             history_changed = changed or history_changed
         finally:
             if history_changed:
                 self.save_data("history", list(history_lookup.values()))
+            if evaluated_changed:
+                self.__save_evaluated_lookup(evaluated_lookup)
             elapsed = time.monotonic() - started_at
             if not candidate_total:
                 logger.info("本轮 RSS 未产生可下载候选资源")
@@ -598,13 +623,55 @@ class RssAggregateBestVersion(_PluginBase):
         history = self.get_data("history") or []
         return {item.get("group_key"): item for item in history if item.get("group_key")}
 
-    def __collect_candidates(self, urls: List[str], filter_groups: Any) -> List[Candidate]:
+    def __load_evaluated_lookup(self) -> Dict[str, dict]:
+        if self._clearflag:
+            return {}
+        items = self.get_data(EVALUATED_CACHE_KEY) or []
+        return {item.get("fingerprint"): item for item in items if item.get("fingerprint")}
+
+    def __save_evaluated_lookup(self, evaluated_lookup: Dict[str, dict]):
+        items = sorted(
+            evaluated_lookup.values(),
+            key=lambda item: item.get("time") or "",
+            reverse=True,
+        )[:EVALUATED_CACHE_LIMIT]
+        self.save_data(EVALUATED_CACHE_KEY, items)
+
+    def __mark_evaluated(self, evaluated_lookup: Dict[str, dict], item: AggregatedRssItem, status: str):
+        if not self._remember_evaluated:
+            return
+        evaluated_lookup[item.fingerprint] = {
+            "fingerprint": item.fingerprint,
+            "title": self.__repair_text_encoding(item.result.get("title")),
+            "site": item.site_name,
+            "status": status,
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def __collect_candidates(
+        self,
+        urls: List[str],
+        filter_groups: Any,
+        evaluated_lookup: Dict[str, dict],
+    ) -> List[Candidate]:
         candidates: List[Candidate] = []
         items = self.__aggregate_rss_items(urls=urls)
         if not items:
             return candidates
 
+        processed_total = 0
+        skipped_seen_total = 0
+        process_limit = max(1, self._process_limit or 40)
         for item in items:
+            if self._remember_evaluated and item.fingerprint in evaluated_lookup:
+                skipped_seen_total += 1
+                continue
+
+            if processed_total >= process_limit:
+                logger.info("本轮达到识别上限 %s 条，剩余聚合条目留到后续轮次处理", process_limit)
+                break
+
+            processed_total += 1
             try:
                 candidate = self.__build_candidate(
                     result=item.result,
@@ -612,20 +679,27 @@ class RssAggregateBestVersion(_PluginBase):
                     filter_groups=filter_groups,
                 )
                 if not candidate:
+                    self.__mark_evaluated(evaluated_lookup, item, "ignored")
                     continue
 
+                candidate.rss_fingerprint = item.fingerprint
                 skip_reason = self.__candidate_skip_reason(candidate)
                 if skip_reason:
                     logger.info(skip_reason)
+                    self.__mark_evaluated(evaluated_lookup, item, "skipped")
                     continue
 
+                self.__mark_evaluated(evaluated_lookup, item, "candidate")
                 candidates.append(candidate)
             except Exception as err:
+                self.__mark_evaluated(evaluated_lookup, item, "error")
                 logger.error("解析 RSS 条目出错：%s - %s", str(err), traceback.format_exc())
 
         logger.info(
-            "统一 RSS 聚合处理完成，原始候选 %s 条，识别后候选 %s 条",
+            "统一 RSS 聚合处理完成，原始候选 %s 条，跳过已评估 %s 条，本轮识别 %s 条，识别后候选 %s 条",
             len(items),
+            skipped_seen_total,
+            processed_total,
             len(candidates),
         )
 
@@ -1267,6 +1341,7 @@ class RssAggregateBestVersion(_PluginBase):
         self,
         plans: List[DownloadPlan],
         history_lookup: Dict[str, dict],
+        evaluated_lookup: Dict[str, dict],
     ) -> bool:
         changed = False
 
@@ -1281,6 +1356,8 @@ class RssAggregateBestVersion(_PluginBase):
             )
             if not self.__download_candidate(candidate):
                 logger.error("下载失败：%s", candidate.raw_title)
+                if candidate.rss_fingerprint:
+                    evaluated_lookup.pop(candidate.rss_fingerprint, None)
                 continue
 
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
