@@ -1,10 +1,11 @@
 # MoviePilot 插件仓库
 
-这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前包含四个插件：
+这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前包含五个插件：
 
 - `多源RSS订阅`
 - `自定义订阅无通知`
 - `RSS优选下载`
+- `聚合RSS优选下载`
 - `媒体库缺集补全`
 
 ## 功能
@@ -59,6 +60,17 @@
 - 如果当前轮次真的跨过了下一个调度点，插件会在本轮结束后自动补跑一次，减少漏跑
 - RSS 源改为并发拉取，缩短每一轮的前置等待时间；但最终版本选择、历史判重和推送下载仍保持串行，避免同集重复下发
 
+### 聚合RSS优选下载
+
+- 面向多 RSS 源场景，先把多条 PT 站 RSS 聚合成统一候选池
+- 聚合层会并发拉取 RSS，按 `guid / enclosure / link / title+size` 去重
+- 聚合结果会按发布时间倒序缓存，默认只保留最近 `200` 条
+- 可在聚合层先粗过滤 `CAM / TS / TC / 720p / 合集 / Complete / Pack` 等明显不需要的资源
+- 可通过插件 API `/unified_rss` 输出统一 RSS；配置 `feed_token` 后访问时需要带 `?token=...`
+- 插件主逻辑仍交给 MoviePilot 识别 `TMDB / 季 / 集`
+- 同一集多版本会按质量、站点优先级、编码、体积和发布时间择优
+- 下载下发保持串行，并保留历史判重，避免同集重复下发
+
 ## 仓库结构
 
 ```text
@@ -71,6 +83,8 @@ plugins.v2/
   rsssubscribenonotify/
     __init__.py
   rssbestversion/
+    __init__.py
+  rssaggregatebestversion/
     __init__.py
 ```
 
@@ -97,3 +111,4 @@ hdhome.org=60
 - `MultiRssSubscribe` `v1.1.1`
 - `RssSubscribeNoNotify` `v1.0.0`
 - `RssBestVersion` `v2.2.9`
+- `RssAggregateBestVersion` `v1.0.0`
