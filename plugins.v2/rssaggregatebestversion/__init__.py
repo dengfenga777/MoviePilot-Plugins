@@ -114,7 +114,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -1124,12 +1124,12 @@ class RssAggregateBestVersion(_PluginBase):
                 )
                 return [candidate]
 
-            if candidate.sort_tuple > self.__history_best_sort_tuple(history_record):
+            if self.__candidate_wash_tuple(candidate) > self.__history_best_wash_tuple(history_record):
                 logger.info(
                     "%s 检测到同等级更优版本，继续推送：%s > %s | key=%s",
                     self.__candidate_label(candidate),
-                    candidate.sort_tuple,
-                    self.__history_best_sort_tuple(history_record),
+                    self.__candidate_wash_tuple(candidate),
+                    self.__history_best_wash_tuple(history_record),
                     group_key,
                 )
                 return [candidate]
@@ -1175,25 +1175,34 @@ class RssAggregateBestVersion(_PluginBase):
         quality_text = history_record.get("best_quality") or history_record.get("quality") or ""
         return self.__quality_upgrade_score(str(quality_text))
 
-    def __history_best_sort_tuple(self, history_record: Optional[dict]) -> Tuple[int, int, int, int, int, int]:
+    @staticmethod
+    def __candidate_wash_tuple(candidate: Candidate) -> Tuple[int, int, int, int, int]:
+        return (
+            candidate.quality_score,
+            candidate.site_score,
+            candidate.fps_score,
+            candidate.codec_score,
+            candidate.size_score,
+        )
+
+    def __history_best_wash_tuple(self, history_record: Optional[dict]) -> Tuple[int, int, int, int, int]:
         if not history_record:
-            return (0, 0, 0, 0, 0, 0)
+            return (0, 0, 0, 0, 0)
 
         raw_scores = history_record.get("sort_scores")
         if raw_scores:
             scores = tuple(self.__safe_int(value) for value in raw_scores)
             if len(scores) >= 6:
-                return scores[:6]
+                return scores[:5]
             if len(scores) == 5:
-                return scores[0], scores[1], 0, scores[2], scores[3], scores[4]
+                return scores[0], scores[1], 0, scores[2], scores[3]
 
         quality_score = self.__history_best_upgrade_score(history_record)
         site_score = self.__safe_int(history_record.get("site_score"))
         fps_score = self.__safe_int(history_record.get("fps_score"))
         codec_score = self.__safe_int(history_record.get("codec_score"))
         size_score = self.__safe_int(history_record.get("size"))
-        pubdate_score = self.__safe_int(history_record.get("pubdate_score"))
-        return quality_score, site_score, fps_score, codec_score, size_score, pubdate_score
+        return quality_score, site_score, fps_score, codec_score, size_score
 
     @staticmethod
     def __history_label(history_record: Optional[dict]) -> str:
