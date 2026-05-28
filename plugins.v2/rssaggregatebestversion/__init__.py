@@ -114,7 +114,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -765,10 +765,17 @@ class RssAggregateBestVersion(_PluginBase):
     def __normalize_text(value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
+    @staticmethod
+    def __normalize_torrent_url(value: Any) -> str:
+        url = str(value or "").strip()
+        if re.search(r"https?://rss\.m-team\.(cc|io)/api/rss/dlv2\?", url, re.IGNORECASE):
+            return re.sub(r"/api/rss/dlv2\?", "/api/rss/dl?", url, count=1, flags=re.IGNORECASE)
+        return url
+
     def __rss_cache_record(self, item: AggregatedRssItem) -> dict:
         result = item.result
-        enclosure = str(result.get("enclosure") or "").strip()
-        link = str(result.get("link") or enclosure or item.source_url).strip()
+        enclosure = self.__normalize_torrent_url(result.get("enclosure"))
+        link = self.__normalize_torrent_url(result.get("link") or enclosure or item.source_url)
         return {
             "title": str(result.get("title") or ""),
             "description": str(result.get("description") or ""),
@@ -881,8 +888,8 @@ class RssAggregateBestVersion(_PluginBase):
     ) -> Optional[Candidate]:
         title = result.get("title")
         description = result.get("description")
-        enclosure = result.get("enclosure")
-        link = result.get("link")
+        enclosure = self.__normalize_torrent_url(result.get("enclosure"))
+        link = self.__normalize_torrent_url(result.get("link"))
         size = result.get("size")
         pubdate = result.get("pubdate")
 
