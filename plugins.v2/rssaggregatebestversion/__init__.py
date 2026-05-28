@@ -112,7 +112,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -139,6 +139,7 @@ class RssAggregateBestVersion(_PluginBase):
     _skip_complete: bool = True
     _site_priority: str = ""
     _skip_tv_without_episode: bool = True
+    _wash_existing_episode: bool = True
     _aggregate_limit: int = 200
     _aggregate_workers: int = 6
     _coarse_filter: bool = True
@@ -168,6 +169,7 @@ class RssAggregateBestVersion(_PluginBase):
             self._skip_complete = bool(config.get("skip_complete", True))
             self._site_priority = config.get("site_priority") or ""
             self._skip_tv_without_episode = bool(config.get("skip_tv_without_episode", True))
+            self._wash_existing_episode = bool(config.get("wash_existing_episode", True))
             self._aggregate_limit = self.__safe_int(config.get("aggregate_limit") or 200) or 200
             self._aggregate_workers = self.__safe_int(config.get("aggregate_workers") or 6) or 6
             self._coarse_filter = bool(config.get("coarse_filter", True))
@@ -305,9 +307,10 @@ class RssAggregateBestVersion(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            _col(4, _switch("prefer_hevc", "同分辨率优先 HEVC/H265")),
-                            _col(4, _switch("skip_complete", "整季/完结包直接跳过")),
-                            _col(4, _switch("skip_tv_without_episode", "电视剧无集号则跳过")),
+                            _col(3, _switch("prefer_hevc", "同分辨率优先 HEVC/H265")),
+                            _col(3, _switch("skip_complete", "整季/完结包直接跳过")),
+                            _col(3, _switch("skip_tv_without_episode", "电视剧无集号则跳过")),
+                            _col(3, _switch("wash_existing_episode", "已入库单集允许洗版")),
                         ],
                     },
                     {
@@ -389,6 +392,7 @@ class RssAggregateBestVersion(_PluginBase):
             "skip_complete": True,
             "site_priority": "",
             "skip_tv_without_episode": True,
+            "wash_existing_episode": True,
             "aggregate_limit": 200,
             "aggregate_workers": 6,
             "coarse_filter": True,
@@ -503,6 +507,7 @@ class RssAggregateBestVersion(_PluginBase):
                 "skip_complete": self._skip_complete,
                 "site_priority": self._site_priority,
                 "skip_tv_without_episode": self._skip_tv_without_episode,
+                "wash_existing_episode": self._wash_existing_episode,
                 "aggregate_limit": self._aggregate_limit,
                 "aggregate_workers": self._aggregate_workers,
                 "coarse_filter": self._coarse_filter,
@@ -995,6 +1000,9 @@ class RssAggregateBestVersion(_PluginBase):
             and candidate.exist_info
             and self.__all_episodes_exist(meta=candidate.meta, exist_info=candidate.exist_info)
         ):
+            if self._wash_existing_episode and self.__is_single_episode_candidate(candidate):
+                logger.info("%s %s 已存在，作为单集洗版候选继续优选".strip(), title_year, season_episode)
+                return None
             return f"{title_year} {season_episode} 已存在".strip()
 
         return None
@@ -1484,6 +1492,11 @@ class RssAggregateBestVersion(_PluginBase):
     @staticmethod
     def __library_missing(candidate: Candidate) -> bool:
         return not bool(candidate.exist_info)
+
+    @staticmethod
+    def __is_single_episode_candidate(candidate: Candidate) -> bool:
+        episodes = candidate.meta.episode_list or []
+        return candidate.mediainfo.type == MediaType.TV and len(set(episodes)) == 1
 
     def __match_size_range(self, size: Any) -> bool:
         sizes = [float(item) * 1024 ** 3 for item in self._size_range.split("-")]

@@ -13,6 +13,7 @@
 - 可通过插件 API `/unified_rss` 输出统一 RSS；配置 `feed_token` 后访问时需要带 `?token=...`
 - 插件主逻辑仍交给 MoviePilot 识别 `TMDB / 季 / 集`
 - 同一集多版本会按质量、站点优先级、编码、体积和发布时间择优
+- 默认允许已入库电视剧单集继续进入候选，用于 RSS 单集洗版
 - 下载下发保持串行，并保留历史判重，避免同集重复下发
 - 下载链通知已静音，不会触发 MoviePilot 默认同步通知
 
@@ -27,4 +28,4 @@ plugins.v2/
 
 ## 当前版本
 
-- `RssAggregateBestVersion` `v1.0.0`
+- `RssAggregateBestVersion` `v1.0.1`
