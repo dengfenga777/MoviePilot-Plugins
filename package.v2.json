@@ -1,4 +1,16 @@
 {
+  "SingleEpisodeUpgrade": {
+    "name": "整理记录单集洗版",
+    "description": "读取 MoviePilot 整理记录，按已入库电视剧单集调用 MP 搜索，找到更优版本后下发下载。",
+    "labels": "洗版,电视剧,单集,整理记录",
+    "version": "1.0.0",
+    "icon": "search.png",
+    "author": "Codex",
+    "level": 2,
+    "history": {
+      "v1.0.0": "首个版本：读取最近成功整理记录，按 tmdb_id + SxxExx 去重，只针对电视剧单集调用 MoviePilot 搜索；命中同一季同一集后按 4K HDR/臻彩、分辨率、60fps/高帧率、HEVC、体积等判断是否优于现有版本，符合条件才下发洗版下载。"
+    }
+  },
   "RssAggregateBestVersion": {
     "name": "聚合RSS优选下载",
     "description": "先聚合多条 RSS 为统一候选池，再识别同一剧集资源并只下载优先级最高的版本。",

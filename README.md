@@ -1,8 +1,22 @@
 # MoviePilot 插件仓库
 
-这是一个用于 `MoviePilot V2` 的第三方插件仓库，当前只保留一个插件：
+这是一个用于 `MoviePilot V2` 的第三方插件仓库。
 
+- `整理记录单集洗版`
 - `聚合RSS优选下载`
+
+## 整理记录单集洗版
+
+- 不读取 RSS，不扫描媒体库，只读取 MoviePilot 最近成功的整理记录
+- 只处理电视剧单集，按 `tmdb_id + SxxExx` 去重
+- 每个单集调用 MoviePilot 自带搜索链路，继续使用 MP 的站点搜索、识别和过滤规则
+- 搜索结果必须精确匹配同一季同一集，整季包、多集包不会作为洗版候选
+- 用整理记录里的源路径、目标路径和文件清单判断当前版本质量
+- 支持 `4K HDR / 臻彩 / 真彩 / 高动态 / 2160p / 1080p / 720p` 等质量分级
+- 支持 `60fps / 高帧率 / 100fps / 120fps` 作为同质量优选项
+- 同质量下可继续按 `HEVC/H.265`、体积等维度判断是否更优
+- 每轮最多搜索指定数量的单集，并对已搜索单集设置冷却，避免反复全量搜索
+- 下发下载时静音 MoviePilot 下载链默认通知，只发送插件自己的汇总通知
 
 ## 聚合RSS优选下载
 
@@ -28,10 +42,13 @@
 ```text
 package.v2.json
 plugins.v2/
+  singleepisodeupgrade/
+    __init__.py
   rssaggregatebestversion/
     __init__.py
 ```
 
 ## 当前版本
 
+- `SingleEpisodeUpgrade` `v1.0.0`
 - `RssAggregateBestVersion` `v1.1.0`
