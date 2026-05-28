@@ -114,7 +114,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -423,7 +423,11 @@ class RssAggregateBestVersion(_PluginBase):
                         {"component": "td", "text": item.get("title", "")},
                         {"component": "td", "text": item.get("season_episode", "")},
                         {"component": "td", "text": item.get("quality", "")},
+                        {"component": "td", "text": self.__sort_scores_text(item.get("sort_scores"))},
+                        {"component": "td", "text": self.__format_size(item.get("size"))},
                         {"component": "td", "text": item.get("site", "")},
+                        {"component": "td", "text": str(self.__pushed_count(item))},
+                        {"component": "td", "text": item.get("raw_title", "")},
                         {"component": "td", "text": item.get("time", "")},
                     ],
                 }
@@ -432,7 +436,7 @@ class RssAggregateBestVersion(_PluginBase):
         return [
             {
                 "component": "VTable",
-                "props": {"hover": True},
+                "props": {"hover": True, "density": "compact"},
                 "content": [
                     {
                         "component": "thead",
@@ -443,7 +447,11 @@ class RssAggregateBestVersion(_PluginBase):
                                     {"component": "th", "text": "标题"},
                                     {"component": "th", "text": "季集"},
                                     {"component": "th", "text": "采用版本"},
+                                    {"component": "th", "text": "优选分"},
+                                    {"component": "th", "text": "体积"},
                                     {"component": "th", "text": "来源"},
+                                    {"component": "th", "text": "推送"},
+                                    {"component": "th", "text": "种子标题"},
                                     {"component": "th", "text": "时间"},
                                 ],
                             }
@@ -1161,6 +1169,37 @@ class RssAggregateBestVersion(_PluginBase):
         season_episode = history_record.get("season_episode") or ""
         return f"{title} {season_episode}".strip()
 
+    def __sort_scores_text(self, raw_scores: Any) -> str:
+        if not raw_scores:
+            return ""
+
+        scores = [self.__safe_int(value) for value in raw_scores]
+        while len(scores) < 6:
+            scores.append(0)
+
+        return (
+            f"Q{scores[0]}"
+            f"/站{scores[1]}"
+            f"/帧{scores[2]}"
+            f"/码{scores[3]}"
+        )
+
+    def __format_size(self, value: Any) -> str:
+        size = self.__safe_int(value)
+        if size <= 0:
+            return ""
+        gb = size / 1024 ** 3
+        if gb >= 1:
+            return f"{gb:.2f} GB"
+        mb = size / 1024 ** 2
+        return f"{mb:.1f} MB"
+
+    @staticmethod
+    def __pushed_count(history_record: dict) -> int:
+        pushed_ids = history_record.get("pushed_ids") or []
+        pushed_titles = history_record.get("pushed_titles") or []
+        return max(len(pushed_ids), len(pushed_titles), 1)
+
     @staticmethod
     def __merge_download_plans(chosen_map: Dict[str, Candidate]) -> List[DownloadPlan]:
         plan_map: Dict[str, DownloadPlan] = {}
@@ -1233,6 +1272,11 @@ class RssAggregateBestVersion(_PluginBase):
                     "poster": candidate.mediainfo.get_poster_image(),
                     "tmdbid": candidate.mediainfo.tmdb_id,
                     "size": candidate.size_score,
+                    "site_score": candidate.site_score,
+                    "fps_score": candidate.fps_score,
+                    "codec_score": candidate.codec_score,
+                    "pubdate_score": candidate.pubdate_score,
+                    "source_url": candidate.source_url,
                     "sort_scores": list(candidate.sort_tuple),
                     "time": now,
                 }
