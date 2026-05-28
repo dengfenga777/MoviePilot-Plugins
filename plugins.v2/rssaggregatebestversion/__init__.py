@@ -64,6 +64,7 @@ class Candidate:
     upgrade_score: int
     site_score: int
     codec_score: int
+    fps_score: int
     size_score: int
     pubdate_score: int
     exist_info: Optional[ExistMediaInfo]
@@ -82,6 +83,7 @@ class Candidate:
         return (
             self.quality_score,
             self.site_score,
+            self.fps_score,
             self.codec_score,
             self.size_score,
             self.pubdate_score,
@@ -112,7 +114,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -932,6 +934,7 @@ class RssAggregateBestVersion(_PluginBase):
             quality_score=quality_score,
             upgrade_score=upgrade_score,
             site_score=self.__site_priority_score(site_name),
+            fps_score=self.__fps_rank(text),
             codec_score=self.__codec_rank(text),
             size_score=self.__safe_int(size),
             pubdate_score=self.__pubdate_timestamp(pubdate),
@@ -1079,6 +1082,16 @@ class RssAggregateBestVersion(_PluginBase):
                 )
                 return [candidate]
 
+            if candidate.sort_tuple > self.__history_best_sort_tuple(history_record):
+                logger.info(
+                    "%s 检测到同等级更优版本，继续推送：%s > %s | key=%s",
+                    self.__candidate_label(candidate),
+                    candidate.sort_tuple,
+                    self.__history_best_sort_tuple(history_record),
+                    group_key,
+                )
+                return [candidate]
+
         if history_record:
             logger.info("%s 已存在历史记录，当前 RSS 未出现更高等级新版本", self.__history_label(history_record) or group_key)
 
@@ -1119,6 +1132,26 @@ class RssAggregateBestVersion(_PluginBase):
 
         quality_text = history_record.get("best_quality") or history_record.get("quality") or ""
         return self.__quality_upgrade_score(str(quality_text))
+
+    def __history_best_sort_tuple(self, history_record: Optional[dict]) -> Tuple[int, int, int, int, int, int]:
+        if not history_record:
+            return (0, 0, 0, 0, 0, 0)
+
+        raw_scores = history_record.get("sort_scores")
+        if raw_scores:
+            scores = tuple(self.__safe_int(value) for value in raw_scores)
+            if len(scores) >= 6:
+                return scores[:6]
+            if len(scores) == 5:
+                return scores[0], scores[1], 0, scores[2], scores[3], scores[4]
+
+        quality_score = self.__history_best_upgrade_score(history_record)
+        site_score = self.__safe_int(history_record.get("site_score"))
+        fps_score = self.__safe_int(history_record.get("fps_score"))
+        codec_score = self.__safe_int(history_record.get("codec_score"))
+        size_score = self.__safe_int(history_record.get("size"))
+        pubdate_score = self.__safe_int(history_record.get("pubdate_score"))
+        return quality_score, site_score, fps_score, codec_score, size_score, pubdate_score
 
     @staticmethod
     def __history_label(history_record: Optional[dict]) -> str:
@@ -1200,6 +1233,7 @@ class RssAggregateBestVersion(_PluginBase):
                     "poster": candidate.mediainfo.get_poster_image(),
                     "tmdbid": candidate.mediainfo.tmdb_id,
                     "size": candidate.size_score,
+                    "sort_scores": list(candidate.sort_tuple),
                     "time": now,
                 }
                 changed = True
@@ -1284,7 +1318,7 @@ class RssAggregateBestVersion(_PluginBase):
         is_2160 = bool(re.search(r"2160p|4k|uhd", normalized))
         has_hdr = bool(
             re.search(
-                r"hdr10\+?|(?<![a-z0-9])hdr(?![a-z0-9])|dolby\s*vision|(?<![a-z0-9])dv(?![a-z0-9])",
+                r"hdr10\+?|(?<![a-z0-9])hdr(?![a-z0-9])|dolby\s*vision|(?<![a-z0-9])dv(?![a-z0-9])|臻彩|真彩|高动态",
                 normalized,
             )
         )
@@ -1335,6 +1369,15 @@ class RssAggregateBestVersion(_PluginBase):
         if re.search(r"hevc|h\.?265|x265", normalized):
             return 2
         if re.search(r"h\.?264|x264|avc", normalized):
+            return 1
+        return 0
+
+    @staticmethod
+    def __fps_rank(text: str) -> int:
+        normalized = str(text or "").lower()
+        if re.search(r"(?<!\d)(120|100)\s*(fps|帧)|(?<!\d)(120|100)p(?!\d)|高帧率", normalized):
+            return 2
+        if re.search(r"(?<!\d)60\s*(fps|帧)|(?<!\d)60p(?!\d)", normalized):
             return 1
         return 0
 
