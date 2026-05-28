@@ -114,7 +114,7 @@ class RssAggregateBestVersion(_PluginBase):
     plugin_name = "聚合RSS优选下载"
     plugin_desc = "先聚合多条 RSS，再识别同一剧集的多个版本，只保留优先级最高的资源下发下载。"
     plugin_icon = "rss.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "rssaggregatebestversion_"
@@ -420,14 +420,14 @@ class RssAggregateBestVersion(_PluginBase):
                 {
                     "component": "tr",
                     "content": [
-                        {"component": "td", "text": item.get("title", "")},
+                        {"component": "td", "text": self.__repair_text_encoding(item.get("title"))},
                         {"component": "td", "text": item.get("season_episode", "")},
                         {"component": "td", "text": item.get("quality", "")},
                         {"component": "td", "text": self.__sort_scores_text(item.get("sort_scores"))},
                         {"component": "td", "text": self.__format_size(item.get("size"))},
                         {"component": "td", "text": item.get("site", "")},
                         {"component": "td", "text": str(self.__pushed_count(item))},
-                        {"component": "td", "text": item.get("raw_title", "")},
+                        {"component": "td", "text": self.__repair_text_encoding(item.get("raw_title"))},
                         {"component": "td", "text": item.get("time", "")},
                     ],
                 }
@@ -765,6 +765,33 @@ class RssAggregateBestVersion(_PluginBase):
     def __normalize_text(value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
+    def __repair_text_encoding(self, value: Any) -> str:
+        text = str(value or "")
+        if not text:
+            return ""
+
+        best = text
+        best_score = self.__mojibake_score(text)
+        for encoding in ("cp1252", "latin1"):
+            try:
+                repaired = text.encode(encoding).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+
+            score = self.__mojibake_score(repaired)
+            if score < best_score:
+                best = repaired
+                best_score = score
+
+        return best
+
+    @staticmethod
+    def __mojibake_score(text: str) -> int:
+        suspicious = len(re.findall(r"[äåæçèéêëìíîïðñòóôõöøùúûüýþÿÂÃÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜ]", text))
+        replacement = text.count("�")
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+        return suspicious * 3 + replacement * 6 - cjk * 2
+
     @staticmethod
     def __normalize_torrent_url(value: Any) -> str:
         url = str(value or "").strip()
@@ -777,8 +804,8 @@ class RssAggregateBestVersion(_PluginBase):
         enclosure = self.__normalize_torrent_url(result.get("enclosure"))
         link = self.__normalize_torrent_url(result.get("link") or enclosure or item.source_url)
         return {
-            "title": str(result.get("title") or ""),
-            "description": str(result.get("description") or ""),
+            "title": self.__repair_text_encoding(result.get("title")),
+            "description": self.__repair_text_encoding(result.get("description")),
             "link": link,
             "enclosure": enclosure,
             "size": self.__safe_int(result.get("size")),
@@ -793,11 +820,11 @@ class RssAggregateBestVersion(_PluginBase):
         now = format_datetime(datetime.datetime.now(datetime.timezone.utc), usegmt=True)
         items = []
         for record in records:
-            title = str(record.get("title") or "")
+            title = self.__repair_text_encoding(record.get("title"))
             link = str(record.get("link") or record.get("enclosure") or "")
             enclosure = str(record.get("enclosure") or "")
             size = self.__safe_int(record.get("size"))
-            description = str(record.get("description") or "")
+            description = self.__repair_text_encoding(record.get("description"))
             source = str(record.get("site_name") or record.get("source_url") or "")
             guid = str(record.get("fingerprint") or self.__hash_text(title + link))
             pubdate = str(record.get("pubdate_rfc822") or "")
@@ -886,8 +913,8 @@ class RssAggregateBestVersion(_PluginBase):
         source_url: str,
         filter_groups: Any,
     ) -> Optional[Candidate]:
-        title = result.get("title")
-        description = result.get("description")
+        title = self.__repair_text_encoding(result.get("title"))
+        description = self.__repair_text_encoding(result.get("description"))
         enclosure = self.__normalize_torrent_url(result.get("enclosure"))
         link = self.__normalize_torrent_url(result.get("link"))
         size = result.get("size")
