@@ -10,6 +10,7 @@
 
 - 定时刷新 RSS 报文
 - 默认接入 MoviePilot 订阅优先级规则
+- 记录订阅规则组使用和命中情况
 - 支持包含、排除、代理规则
 - 支持添加订阅或直接下载
 - 支持保存历史记录和清理历史记录
@@ -31,4 +32,4 @@ plugins.v2/
 
 ## 当前版本
 
-- `RssSubscribeNoNotify` `v2.1.3`
+- `RssSubscribeNoNotify` `v2.1.4`

@@ -11,6 +11,7 @@ This plugin is based on MoviePilot's built-in `RssSubscribe` plugin for the curr
 - Config prefix: `rsssubscribenonotify_`
 - Default `notify` value: `false`
 - MoviePilot subscription priority rules are enabled by default.
+- Rule group usage and match results are logged for each RSS candidate.
 - The visible notification switch is removed from the config form.
 - Validation errors are logged only and are not sent through `systemmessage`.
 - Subscription creation passes `message=False`.

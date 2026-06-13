@@ -15,6 +15,7 @@ from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.context import MediaInfo, TorrentInfo, Context
 from app.core.metainfo import MetaInfo
+from app.helper.rule import RuleHelper
 from app.helper.rss import RssHelper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -84,7 +85,7 @@ class RssSubscribeNoNotify(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "2.1.3"
+    plugin_version = "2.1.4"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -647,6 +648,7 @@ class RssSubscribeNoNotify(_PluginBase):
             history: List[dict] = self.get_data('history') or []
         downloadchain = SilentDownloadChain()
         subscribechain = SilentSubscribeChain()
+        rulehelper = RuleHelper()
         for url in self._address.split("\n"):
             # 处理每一个RSS链接
             if not url:
@@ -708,14 +710,35 @@ class RssSubscribeNoNotify(_PluginBase):
                     )
                     # 过滤种子
                     if self._filter:
-                        result = self.chain.filter_torrents(
+                        active_groups = rulehelper.get_rule_group_by_media(
+                            media=mediainfo,
+                            group_names=filter_groups
+                        )
+                        active_group_names = [group.name for group in active_groups]
+                        media_category = mediainfo.category or "未分类"
+                        if not active_group_names:
+                            logger.info(
+                                f"{title} - 未匹配到适用订阅规则组，"
+                                f"类型：{mediainfo.type.value}，分类：{media_category}"
+                            )
+                            continue
+                        logger.info(
+                            f"{title} - 使用订阅规则组：{', '.join(active_group_names)}，"
+                            f"类型：{mediainfo.type.value}，分类：{media_category}"
+                        )
+                        matched_torrents = self.chain.filter_torrents(
                             rule_groups=filter_groups,
                             torrent_list=[torrentinfo],
                             mediainfo=mediainfo
                         )
-                        if not result:
-                            logger.info(f"{title} {description} 不匹配过滤规则")
+                        if not matched_torrents:
+                            logger.info(f"{title} - 不匹配订阅规则组：{', '.join(active_group_names)}")
                             continue
+                        torrentinfo = matched_torrents[0]
+                        logger.info(
+                            f"{title} - 已命中订阅规则组：{', '.join(active_group_names)}，"
+                            f"优先级：{getattr(torrentinfo, 'pri_order', '-')}"
+                        )
                     # 媒体库已存在的剧集
                     exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
                     if mediainfo.type == MediaType.TV:
