@@ -15,6 +15,8 @@
 - 默认不发送通知
 - 配置页不显示“发送通知”开关
 - 错误只写日志，不发送系统消息
+- 订阅添加时传入 `message=False`
+- 下载链使用静音子类，屏蔽 MoviePilot 默认下载成功/失败通知
 
 ## 仓库结构
 
@@ -28,4 +30,4 @@ plugins.v2/
 
 ## 当前版本
 
-- `RssSubscribeNoNotify` `v2.1.1`
+- `RssSubscribeNoNotify` `v2.1.2`

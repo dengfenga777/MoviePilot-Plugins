@@ -12,6 +12,8 @@ This plugin is based on MoviePilot's built-in `RssSubscribe` plugin for the curr
 - Default `notify` value: `false`
 - The visible notification switch is removed from the config form.
 - Validation errors are logged only and are not sent through `systemmessage`.
+- Subscription creation passes `message=False`.
+- Download actions use a silent `DownloadChain` subclass to suppress MoviePilot's default download notifications.
 
 ## Install
 

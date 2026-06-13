@@ -24,6 +24,58 @@ from app.schemas.types import SystemConfigKey, MediaType
 lock = Lock()
 
 
+class _SilentMessageHelper:
+    """
+    Drop system messages emitted by the underlying MoviePilot chains.
+    """
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def put(self, *args, **kwargs):
+        logger.info("自定义订阅无通知：已屏蔽系统通知")
+        return None
+
+    def __getattr__(self, item):
+        return getattr(self._wrapped, item)
+
+
+class SilentDownloadChain(DownloadChain):
+    """
+    DownloadChain variant that keeps download behavior but suppresses notifications.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.messagehelper = _SilentMessageHelper(self.messagehelper)
+
+    def post_message(self, *args, **kwargs):
+        logger.info("自定义订阅无通知：已屏蔽下载链通知")
+        return None
+
+    async def async_post_message(self, *args, **kwargs):
+        logger.info("自定义订阅无通知：已屏蔽下载链异步通知")
+        return None
+
+
+class SilentSubscribeChain(SubscribeChain):
+    """
+    SubscribeChain variant that keeps subscription behavior but suppresses notifications.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.messagehelper = _SilentMessageHelper(self.messagehelper)
+
+    def post_message(self, *args, **kwargs):
+        logger.info("自定义订阅无通知：已屏蔽订阅链通知")
+        return None
+
+    async def async_post_message(self, *args, **kwargs):
+        logger.info("自定义订阅无通知：已屏蔽订阅链异步通知")
+        return None
+
+
 class RssSubscribeNoNotify(_PluginBase):
     # 插件名称
     plugin_name = "自定义订阅无通知"
@@ -32,7 +84,7 @@ class RssSubscribeNoNotify(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.1.2"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -593,8 +645,8 @@ class RssSubscribeNoNotify(_PluginBase):
             history = []
         else:
             history: List[dict] = self.get_data('history') or []
-        downloadchain = DownloadChain()
-        subscribechain = SubscribeChain()
+        downloadchain = SilentDownloadChain()
+        subscribechain = SilentSubscribeChain()
         for url in self._address.split("\n"):
             # 处理每一个RSS链接
             if not url:
@@ -706,6 +758,7 @@ class RssSubscribeNoNotify(_PluginBase):
                                            tmdbid=mediainfo.tmdb_id,
                                            season=meta.begin_season,
                                            exist_ok=True,
+                                           message=False,
                                            username="RSS订阅无通知")
                     # 存储历史记录
                     history.append({
