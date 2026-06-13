@@ -84,7 +84,7 @@ class RssSubscribeNoNotify(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "2.1.2"
+    plugin_version = "2.1.3"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -109,7 +109,7 @@ class RssSubscribeNoNotify(_PluginBase):
     _include: str = ""
     _exclude: str = ""
     _proxy: bool = False
-    _filter: bool = False
+    _filter: bool = True
     _clear: bool = False
     _clearflag: bool = False
     _action: str = "subscribe"
@@ -132,7 +132,7 @@ class RssSubscribeNoNotify(_PluginBase):
             self._include = config.get("include")
             self._exclude = config.get("exclude")
             self._proxy = config.get("proxy")
-            self._filter = config.get("filter")
+            self._filter = config.get("filter", True)
             self._clear = config.get("clear")
             self._action = config.get("action")
             self._save_path = config.get("save_path")
@@ -436,7 +436,7 @@ class RssSubscribeNoNotify(_PluginBase):
                                         'component': 'VSwitch',
                                         'props': {
                                             'model': 'filter',
-                                            'label': '使用订阅优先级规则',
+                                            'label': '使用MP订阅优先级规则',
                                         }
                                     }
                                 ]
@@ -471,7 +471,7 @@ class RssSubscribeNoNotify(_PluginBase):
             "exclude": "",
             "proxy": False,
             "clear": False,
-            "filter": False,
+            "filter": True,
             "action": "subscribe",
             "save_path": "",
             "size_range": ""
