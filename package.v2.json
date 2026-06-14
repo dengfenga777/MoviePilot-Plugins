@@ -13,5 +13,17 @@
       "v2.1.2": "真正静音订阅和下载链路：订阅添加传入 message=false，下载链使用静音子类屏蔽 post_message 和 systemmessage。",
       "v2.1.1": "基于 MoviePilot 内置自定义订阅 v2.1 重建，保留 RSS 匹配、订阅、下载、历史记录和调度能力，移除通知开关并强制不发送系统通知。"
     }
+  },
+  "QbFinishedCleanup": {
+    "name": "qB已整理自动清理",
+    "description": "磁盘剩余空间低于阈值时，删除 qB 指定标签的已完成任务和本地文件。",
+    "labels": "qBittorrent,清理,删种,磁盘空间",
+    "version": "1.0.0",
+    "icon": "delete.jpg",
+    "author": "misaya",
+    "level": 2,
+    "history": {
+      "v1.0.0": "按磁盘剩余空间阈值清理 qB 中指定标签的已完成任务，并删除本地文件。"
+    }
   }
 }

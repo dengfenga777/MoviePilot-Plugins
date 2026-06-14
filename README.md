@@ -1,8 +1,9 @@
 # MoviePilot 插件仓库
 
-这里只保留一个 `MoviePilot V2` 第三方插件：
+这里维护 `MoviePilot V2` 第三方插件：
 
 - `自定义订阅无通知`
+- `qB已整理自动清理`
 
 ## 自定义订阅无通知
 
@@ -25,11 +26,26 @@
 ```text
 package.v2.json
 plugins.v2/
+  qbfinishedcleanup/
+    __init__.py
+    README.md
   rsssubscribenonotify/
     __init__.py
     README.md
 ```
 
+## qB已整理自动清理
+
+磁盘剩余空间低于阈值时，清理 qB 中指定标签的已完成任务。
+
+- 默认阈值 500GB
+- 默认标签 `已整理`
+- 删除 qB 任务和本地文件
+- 默认只处理已完成任务
+- 支持单次删除数量限制
+- 插件默认关闭
+
 ## 当前版本
 
 - `RssSubscribeNoNotify` `v2.1.4`
+- `QbFinishedCleanup` `v1.0.0`
