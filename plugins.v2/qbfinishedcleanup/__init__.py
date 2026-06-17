@@ -22,11 +22,11 @@ class QbFinishedCleanup(_PluginBase):
     # 插件名称
     plugin_name = "qB已整理自动清理"
     # 插件描述
-    plugin_desc = "磁盘剩余空间低于阈值时，删除 qB 指定标签的已完成任务和本地文件。"
+    plugin_desc = "磁盘剩余空间低于阈值时，删除 qB 指定标签中保种超过指定天数的任务和本地文件。"
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -50,6 +50,7 @@ class QbFinishedCleanup(_PluginBase):
     _threshold_gb: str = "500"
     _check_path: str = ""
     _max_delete: str = "10"
+    _min_seed_days: str = "3"
     _completed_only: bool = True
     _dry_run: bool = False
 
@@ -66,6 +67,7 @@ class QbFinishedCleanup(_PluginBase):
             self._threshold_gb = str(config.get("threshold_gb") or "500")
             self._check_path = config.get("check_path") or ""
             self._max_delete = str(config.get("max_delete") or "10")
+            self._min_seed_days = str(config.get("min_seed_days") or "3")
             self._completed_only = config.get("completed_only", True)
             self._dry_run = config.get("dry_run", False)
 
@@ -183,7 +185,7 @@ class QbFinishedCleanup(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
@@ -195,7 +197,7 @@ class QbFinishedCleanup(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
@@ -207,13 +209,25 @@ class QbFinishedCleanup(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
                                         "model": "max_delete",
                                         "label": "单次最多删除",
                                         "placeholder": "10，0表示不限"
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "min_seed_days",
+                                        "label": "最少保种天数",
+                                        "placeholder": "3"
                                     }
                                 }]
                             }
@@ -262,7 +276,7 @@ class QbFinishedCleanup(_PluginBase):
                                 "props": {
                                     "type": "warning",
                                     "variant": "tonal",
-                                    "text": "会删除 qB 任务和本地文件，只处理所选 qB 中带指定标签的任务。"
+                                    "text": "会删除 qB 任务和本地文件，只处理所选 qB 中带指定标签且保种超过指定天数的任务。"
                                 }
                             }]
                         }]
@@ -279,6 +293,7 @@ class QbFinishedCleanup(_PluginBase):
             "threshold_gb": "500",
             "check_path": "",
             "max_delete": "10",
+            "min_seed_days": "3",
             "completed_only": True,
             "dry_run": False
         }
@@ -359,8 +374,12 @@ class QbFinishedCleanup(_PluginBase):
 
         threshold_bytes = int(self.__to_float(self._threshold_gb, 500) * 1024 ** 3)
         max_delete = self.__to_int(self._max_delete, 10)
+        min_seed_seconds = int(self.__to_float(self._min_seed_days, 3) * 86400)
         if threshold_bytes <= 0:
             logger.warning("qB已整理自动清理：剩余空间阈值无效，跳过")
+            return
+        if min_seed_seconds < 0:
+            logger.warning("qB已整理自动清理：最少保种天数无效，跳过")
             return
 
         services = self.service_infos
@@ -377,12 +396,13 @@ class QbFinishedCleanup(_PluginBase):
                     downloader=service_info.instance,
                     tags=tags,
                     threshold_bytes=threshold_bytes,
+                    min_seed_seconds=min_seed_seconds,
                     max_delete=max_delete
                 )
 
     def __cleanup_downloader(self, downloader_name: str, downloader: Any,
                              tags: List[str], threshold_bytes: int,
-                             max_delete: int):
+                             min_seed_seconds: int, max_delete: int):
         torrents, error = downloader.get_torrents(tags=tags)
         if error:
             logger.error(f"qB已整理自动清理：获取 {downloader_name} 种子失败")
@@ -393,11 +413,14 @@ class QbFinishedCleanup(_PluginBase):
             if self._completed_only and not self.__is_completed(torrent):
                 continue
             item = self.__build_item(torrent)
-            if item:
+            if item and item.get("seed_seconds", 0) > min_seed_seconds:
                 candidates.append(item)
 
         if not candidates:
-            logger.info(f"qB已整理自动清理：{downloader_name} 没有符合标签 {','.join(tags)} 的已完成任务")
+            logger.info(
+                f"qB已整理自动清理：{downloader_name} 没有符合标签 {','.join(tags)} "
+                f"且保种超过 {self.__format_duration(min_seed_seconds)} 的已完成任务"
+            )
             return
 
         check_path = self.__resolve_check_path(candidates)
@@ -431,6 +454,7 @@ class QbFinishedCleanup(_PluginBase):
             text_item = (
                 f"{item.get('name')} "
                 f"大小：{StringUtils.str_filesize(item.get('size') or 0)} "
+                f"保种：{self.__format_duration(item.get('seed_seconds') or 0)} "
                 f"路径：{item.get('save_path') or '-'}"
             )
             if self._dry_run:
@@ -493,6 +517,7 @@ class QbFinishedCleanup(_PluginBase):
             "save_path": self.__torrent_attr(torrent, "save_path", ""),
             "done_time": self.__to_int(self.__torrent_attr(torrent, "completion_on", 0), 0),
             "added_time": self.__to_int(self.__torrent_attr(torrent, "added_on", 0), 0),
+            "seed_seconds": self.__seed_seconds(torrent),
             "state": self.__torrent_attr(torrent, "state", "")
         }
 
@@ -518,6 +543,7 @@ class QbFinishedCleanup(_PluginBase):
             "threshold_gb": self._threshold_gb,
             "check_path": self._check_path,
             "max_delete": self._max_delete,
+            "min_seed_days": self._min_seed_days,
             "completed_only": self._completed_only,
             "dry_run": self._dry_run
         })
@@ -532,6 +558,24 @@ class QbFinishedCleanup(_PluginBase):
         if isinstance(torrent, dict):
             return torrent.get(name, default)
         return getattr(torrent, name, default)
+
+    def __seed_seconds(self, torrent: Any) -> int:
+        seeding_time = self.__to_int(self.__torrent_attr(torrent, "seeding_time", 0), 0)
+        if seeding_time > 0:
+            return seeding_time
+
+        completion_on = self.__to_int(self.__torrent_attr(torrent, "completion_on", 0), 0)
+        if completion_on <= 0:
+            return 0
+        return max(0, int(datetime.datetime.now().timestamp()) - completion_on)
+
+    @staticmethod
+    def __format_duration(seconds: int) -> str:
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        if days:
+            return f"{days}天{hours}小时"
+        return f"{hours}小时"
 
     @staticmethod
     def __to_int(value: Any, default: int = 0) -> int:

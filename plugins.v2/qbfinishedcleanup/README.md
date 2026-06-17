@@ -2,15 +2,16 @@
 
 MoviePilot plugin: qB已整理自动清理。
 
-When disk free space drops below the configured threshold, this plugin deletes completed qBittorrent tasks with a specific tag and removes their local files.
+When disk free space drops below the configured threshold, this plugin deletes qBittorrent tasks with a specific tag that have been seeding longer than the configured number of days, and removes their local files.
 
 ## Behavior
 
 - qBittorrent only.
 - Default tag: `已整理`.
 - Default threshold: `500` GB free space.
+- Default minimum seeding time: `3` days.
 - Deletes torrent tasks with `delete_file=True`.
-- Only completed tasks are deleted by default.
+- Only completed tasks that have seeded longer than the configured days are deleted by default.
 - A per-run delete limit is available to avoid deleting too much at once.
 - The plugin is disabled by default.
 

@@ -16,13 +16,14 @@
   },
   "QbFinishedCleanup": {
     "name": "qB已整理自动清理",
-    "description": "磁盘剩余空间低于阈值时，删除 qB 指定标签的已完成任务和本地文件。",
+    "description": "磁盘剩余空间低于阈值时，删除 qB 指定标签中保种超过指定天数的任务和本地文件。",
     "labels": "qBittorrent,清理,删种,磁盘空间",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "delete.jpg",
     "author": "misaya",
     "level": 2,
     "history": {
+      "v1.0.1": "新增最少保种天数条件，默认只清理已整理标签中保种超过 3 天的任务。",
       "v1.0.0": "按磁盘剩余空间阈值清理 qB 中指定标签的已完成任务，并删除本地文件。"
     }
   }
