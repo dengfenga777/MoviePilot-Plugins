@@ -1,7 +1,5 @@
 import datetime
-import shutil
 import threading
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -22,11 +20,11 @@ class QbFinishedCleanup(_PluginBase):
     # 插件名称
     plugin_name = "qB已整理自动清理"
     # 插件描述
-    plugin_desc = "磁盘剩余空间低于阈值时，删除 qB 指定标签中保种超过指定天数的任务和本地文件。"
+    plugin_desc = "删除 qB 指定标签中保种达到指定天数的任务和本地文件。"
     # 插件图标
     plugin_icon = "delete.jpg"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -47,9 +45,6 @@ class QbFinishedCleanup(_PluginBase):
     _downloaders: List[str] = []
     _cron: str = ""
     _tag: str = "已整理"
-    _threshold_gb: str = "500"
-    _check_path: str = ""
-    _max_delete: str = "10"
     _min_seed_days: str = "3"
     _completed_only: bool = True
     _dry_run: bool = False
@@ -64,9 +59,6 @@ class QbFinishedCleanup(_PluginBase):
             self._downloaders = config.get("downloaders") or []
             self._cron = config.get("cron")
             self._tag = config.get("tag") or "已整理"
-            self._threshold_gb = str(config.get("threshold_gb") or "500")
-            self._check_path = config.get("check_path") or ""
-            self._max_delete = str(config.get("max_delete") or "10")
             self._min_seed_days = str(config.get("min_seed_days") or "3")
             self._completed_only = config.get("completed_only", True)
             self._dry_run = config.get("dry_run", False)
@@ -185,19 +177,7 @@ class QbFinishedCleanup(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "threshold_gb",
-                                        "label": "剩余空间阈值GB",
-                                        "placeholder": "500"
-                                    }
-                                }]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
@@ -209,19 +189,7 @@ class QbFinishedCleanup(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "max_delete",
-                                        "label": "单次最多删除",
-                                        "placeholder": "10，0表示不限"
-                                    }
-                                }]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
@@ -236,18 +204,6 @@ class QbFinishedCleanup(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [{
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "check_path",
-                                        "label": "检测目录",
-                                        "placeholder": "留空使用任务保存目录"
-                                    }
-                                }]
-                            },
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 3},
@@ -276,7 +232,7 @@ class QbFinishedCleanup(_PluginBase):
                                 "props": {
                                     "type": "warning",
                                     "variant": "tonal",
-                                    "text": "会删除 qB 任务和本地文件，只处理所选 qB 中带指定标签且保种超过指定天数的任务。"
+                                    "text": "会删除 qB 任务和本地文件，只处理所选 qB 中带指定标签且保种达到指定天数的任务。"
                                 }
                             }]
                         }]
@@ -290,9 +246,6 @@ class QbFinishedCleanup(_PluginBase):
             "downloaders": [],
             "cron": "*/15 * * * *",
             "tag": "已整理",
-            "threshold_gb": "500",
-            "check_path": "",
-            "max_delete": "10",
             "min_seed_days": "3",
             "completed_only": True,
             "dry_run": False
@@ -372,12 +325,7 @@ class QbFinishedCleanup(_PluginBase):
             logger.warning("qB已整理自动清理：清理标签为空，跳过")
             return
 
-        threshold_bytes = int(self.__to_float(self._threshold_gb, 500) * 1024 ** 3)
-        max_delete = self.__to_int(self._max_delete, 10)
         min_seed_seconds = int(self.__to_float(self._min_seed_days, 3) * 86400)
-        if threshold_bytes <= 0:
-            logger.warning("qB已整理自动清理：剩余空间阈值无效，跳过")
-            return
         if min_seed_seconds < 0:
             logger.warning("qB已整理自动清理：最少保种天数无效，跳过")
             return
@@ -395,14 +343,11 @@ class QbFinishedCleanup(_PluginBase):
                     downloader_name=downloader_name,
                     downloader=service_info.instance,
                     tags=tags,
-                    threshold_bytes=threshold_bytes,
-                    min_seed_seconds=min_seed_seconds,
-                    max_delete=max_delete
+                    min_seed_seconds=min_seed_seconds
                 )
 
     def __cleanup_downloader(self, downloader_name: str, downloader: Any,
-                             tags: List[str], threshold_bytes: int,
-                             min_seed_seconds: int, max_delete: int):
+                             tags: List[str], min_seed_seconds: int):
         torrents, error = downloader.get_torrents(tags=tags)
         if error:
             logger.error(f"qB已整理自动清理：获取 {downloader_name} 种子失败")
@@ -413,43 +358,24 @@ class QbFinishedCleanup(_PluginBase):
             if self._completed_only and not self.__is_completed(torrent):
                 continue
             item = self.__build_item(torrent)
-            if item and item.get("seed_seconds", 0) > min_seed_seconds:
+            if item and item.get("seed_seconds", 0) >= min_seed_seconds:
                 candidates.append(item)
 
         if not candidates:
             logger.info(
                 f"qB已整理自动清理：{downloader_name} 没有符合标签 {','.join(tags)} "
-                f"且保种超过 {self.__format_duration(min_seed_seconds)} 的已完成任务"
+                f"且保种达到 {self.__format_duration(min_seed_seconds)} 的已完成任务"
             )
-            return
-
-        check_path = self.__resolve_check_path(candidates)
-        if not check_path:
-            logger.error("qB已整理自动清理：未找到可用检测目录，跳过")
-            return
-
-        usage = shutil.disk_usage(check_path)
-        free_bytes = usage.free
-        logger.info(
-            f"qB已整理自动清理：{downloader_name} 检测目录 {check_path} "
-            f"剩余 {StringUtils.str_filesize(free_bytes)}，"
-            f"阈值 {StringUtils.str_filesize(threshold_bytes)}"
-        )
-        if free_bytes > threshold_bytes:
-            logger.info(f"qB已整理自动清理：{downloader_name} 剩余空间充足，跳过")
             return
 
         candidates.sort(key=lambda item: (item.get("done_time") or 0, item.get("added_time") or 0))
         deleted_count = 0
         deleted_bytes = 0
-        projected_free = free_bytes
 
         for item in candidates:
             if self._event.is_set():
                 logger.info("qB已整理自动清理服务停止")
                 return
-            if max_delete > 0 and deleted_count >= max_delete:
-                break
 
             text_item = (
                 f"{item.get('name')} "
@@ -470,9 +396,6 @@ class QbFinishedCleanup(_PluginBase):
 
             deleted_count += 1
             deleted_bytes += item.get("size") or 0
-            projected_free += item.get("size") or 0
-            if projected_free > threshold_bytes:
-                break
 
         if deleted_count:
             self.__save_history({
@@ -493,18 +416,6 @@ class QbFinishedCleanup(_PluginBase):
                 )
         else:
             logger.info(f"qB已整理自动清理：{downloader_name} 没有执行删除")
-
-    def __resolve_check_path(self, candidates: List[dict]) -> Optional[str]:
-        paths = [self._check_path] if self._check_path else []
-        if not paths:
-            paths = [item.get("save_path") for item in candidates if item.get("save_path")]
-        for path in paths:
-            if not path:
-                continue
-            check_path = Path(path)
-            if check_path.exists():
-                return str(check_path)
-        return None
 
     def __build_item(self, torrent: Any) -> Optional[dict]:
         torrent_id = self.__torrent_attr(torrent, "hash")
@@ -540,9 +451,6 @@ class QbFinishedCleanup(_PluginBase):
             "downloaders": self._downloaders,
             "cron": self._cron,
             "tag": self._tag,
-            "threshold_gb": self._threshold_gb,
-            "check_path": self._check_path,
-            "max_delete": self._max_delete,
             "min_seed_days": self._min_seed_days,
             "completed_only": self._completed_only,
             "dry_run": self._dry_run
