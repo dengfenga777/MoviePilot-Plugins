@@ -22,7 +22,7 @@ Copy this directory to MoviePilot's plugin path:
 /app/app/plugins/qbfinishedcleanup
 ```
 
-For the current Docker setup on ovh, the host mount target is:
+For the current Docker setup, mount the host plugin directory to:
 
 ```bash
 /opt/moviepilot/custom_plugins/qbfinishedcleanup

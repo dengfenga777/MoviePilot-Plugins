@@ -85,7 +85,7 @@ class RssSubscribeNoNotify(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "2.1.4"
+    plugin_version = "2.1.5"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -136,7 +136,7 @@ class RssSubscribeNoNotify(_PluginBase):
             self._filter = config.get("filter", True)
             self._clear = config.get("clear")
             self._action = config.get("action")
-            self._save_path = config.get("save_path")
+            self._save_path = str(config.get("save_path") or "").strip()
             self._size_range = config.get("size_range")
 
         if self._onlyonce:
@@ -171,7 +171,7 @@ class RssSubscribeNoNotify(_PluginBase):
         定义远程控制命令
         :return: 命令关键字、事件、描述、附带数据
         """
-        pass
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
         """
@@ -649,15 +649,16 @@ class RssSubscribeNoNotify(_PluginBase):
         downloadchain = SilentDownloadChain()
         subscribechain = SilentSubscribeChain()
         rulehelper = RuleHelper()
-        for url in self._address.split("\n"):
+        for url in self._address.splitlines():
             # 处理每一个RSS链接
+            url = url.strip()
             if not url:
                 continue
             logger.info(f"开始刷新RSS：{url} ...")
             results = RssHelper().parse(url, proxy=self._proxy)
             if not results:
                 logger.error(f"未获取到RSS数据：{url}")
-                return
+                continue
             # 过滤规则
             filter_groups = self.systemconfig.get(SystemConfigKey.SubscribeFilterRuleGroups)
             # 解析数据
@@ -762,7 +763,7 @@ class RssSubscribeNoNotify(_PluginBase):
                                 media_info=mediainfo,
                                 torrent_info=torrentinfo,
                             ),
-                            save_path=self._save_path,
+                            save_path=self._save_path or None,
                             username="RSS订阅无通知"
                         )
                         if not result:

@@ -16,6 +16,8 @@ This plugin is based on MoviePilot's built-in `RssSubscribe` plugin for the curr
 - Validation errors are logged only and are not sent through `systemmessage`.
 - Subscription creation passes `message=False`.
 - Download actions use a silent `DownloadChain` subclass to suppress MoviePilot's default download notifications.
+- Empty save paths are passed as automatic download paths, matching MoviePilot's built-in behavior.
+- One failed RSS feed does not stop later feeds from being processed.
 
 ## Install
 
@@ -25,7 +27,7 @@ Copy this directory to MoviePilot's plugin path:
 /app/app/plugins/rsssubscribenonotify
 ```
 
-For the current Docker setup on ovh, the host mount target is:
+For the current Docker setup, mount the host plugin directory to:
 
 ```bash
 /opt/moviepilot/custom_plugins/rsssubscribenonotify
