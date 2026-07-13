@@ -3,6 +3,7 @@
 这里维护 `MoviePilot V2` 第三方插件：
 
 - `自定义订阅无通知`
+- `电影订阅无通知`
 - `qB已整理自动清理`
 
 ## 自定义订阅无通知
@@ -32,7 +33,21 @@ plugins.v2/
   rsssubscribenonotify/
     __init__.py
     README.md
+  rsssubscribemovienonotify/
+    __init__.py
+    README.md
 ```
+
+## 电影订阅无通知
+
+基于通用无通知 RSS 插件拆出的电影专用版本。
+
+- 只处理识别为电影的 RSS 项
+- 非电影内容会记录日志并跳过
+- 默认动作是直接下载
+- 仍可在配置页改成添加订阅
+- 不发送系统通知
+- 保存目录留空时走 MoviePilot 自动目录
 
 ## qB已整理自动清理
 
@@ -49,4 +64,5 @@ plugins.v2/
 ## 当前版本
 
 - `RssSubscribeNoNotify` `v2.1.5`
+- `RssSubscribeMovieNoNotify` `v1.0.0`
 - `QbFinishedCleanup` `v1.0.3`
