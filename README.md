@@ -1,6 +1,6 @@
 # MoviePilot 插件仓库
 
-这里维护 `MoviePilot V2` 第三方插件：
+这里维护 `MoviePilot V2 / V3` 第三方插件：
 
 - `自定义订阅无通知`
 - `电影订阅无通知`
@@ -26,6 +26,7 @@
 
 ```text
 package.v2.json
+package.v3.json
 plugins.v2/
   qbfinishedcleanup/
     __init__.py
@@ -36,6 +37,10 @@ plugins.v2/
   rsssubscribemovienonotify/
     __init__.py
     README.md
+plugins.v3/
+  qbfinishedcleanup/
+  rsssubscribenonotify/
+  rsssubscribemovienonotify/
 ```
 
 ## 电影订阅无通知
@@ -61,8 +66,18 @@ plugins.v2/
 - 达到条件的任务会在一次运行中全部删除
 - 插件默认关闭
 
+## MoviePilot V3 适配
+
+- V2 实现保持在 `plugins.v2/`，不影响旧版用户。
+- V3 实现位于 `plugins.v3/`，并使用 `package.v3.json` 独立发布。
+- V3 代码已迁移到稳定 `app.sdk` 导入。
+- 两个 RSS 插件已改用 `media_source + media_id` 统一媒体身份，并会幂等迁移旧历史中的 `tmdbid`。
+- RSS 检查具备执行锁、单源异常隔离、订阅结果校验、稳定指纹去重和有界历史。
+- V3 历史删除接口使用 Bearer 鉴权，不再在页面参数中携带 API Token。
+- V3 插件最低要求 `MoviePilot >= 3.0.0`。
+
 ## 当前版本
 
-- `RssSubscribeNoNotify` `v2.1.5`
-- `RssSubscribeMovieNoNotify` `v1.0.0`
-- `QbFinishedCleanup` `v1.0.3`
+- `RssSubscribeNoNotify`：V3 `v3.1.0` / V2 `v2.1.5`
+- `RssSubscribeMovieNoNotify`：V3 `v2.1.0` / V2 `v1.0.0`
+- `QbFinishedCleanup`：V3 `v2.0.0` / V2 `v1.0.3`

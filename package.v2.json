@@ -1,5 +1,6 @@
 {
   "RssSubscribeNoNotify": {
+    "v3": false,
     "name": "自定义订阅无通知",
     "description": "定时刷新 RSS 报文，识别内容后添加订阅或直接下载，不发送系统通知。",
     "labels": "RSS,订阅,下载,无通知",
@@ -16,6 +17,7 @@
     }
   },
   "RssSubscribeMovieNoNotify": {
+    "v3": false,
     "name": "电影订阅无通知",
     "description": "定时刷新电影 RSS 报文，仅处理电影，添加订阅或直接下载且不发送系统通知。",
     "labels": "RSS,电影,订阅,下载,无通知",
@@ -28,6 +30,7 @@
     }
   },
   "QbFinishedCleanup": {
+    "v3": false,
     "name": "qB已整理自动清理",
     "description": "删除 qB 指定标签中保种达到指定天数的任务和本地文件。",
     "labels": "qBittorrent,清理,删种,保种",
