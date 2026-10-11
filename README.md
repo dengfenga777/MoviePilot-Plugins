@@ -5,6 +5,7 @@
 - `自定义订阅无通知`
 - `电影订阅无通知`
 - `qB已整理自动清理`
+- `RSS剧集优选`（V3）
 
 ## 自定义订阅无通知
 
@@ -41,6 +42,7 @@ plugins.v3/
   qbfinishedcleanup/
   rsssubscribenonotify/
   rsssubscribemovienonotify/
+  rssepisodequality/
 ```
 
 ## 电影订阅无通知
@@ -81,3 +83,13 @@ plugins.v3/
 - `RssSubscribeNoNotify`：V3 `v3.1.0` / V2 `v2.1.5`
 - `RssSubscribeMovieNoNotify`：V3 `v2.1.0` / V2 `v1.0.0`
 - `QbFinishedCleanup`：V3 `v2.0.0` / V2 `v1.0.3`
+
+## RSS剧集优选（V3）
+
+独立插件 `RssEpisodeQuality`，当前版本 `v1.0.0`，要求 MoviePilot `>= 3.0.0`。
+
+汇总多个 RSS 源后按现有订阅优先级规则优选剧集，逐集记录成功加入下载队列的质量，拦截同档重复和降级，允许后续质量升级。文件大小只用于同档候选选择。默认仅处理明确集数的电视剧，不发送通知。
+
+启用本插件前，请停用负责同一批剧集的旧 RSS 下载任务，再将 RSS 地址复制到本插件；独立插件之间不共享下载质量记录。插件默认关闭，不会自动修改其他插件。
+
+详细配置与处理边界见 [插件说明](plugins.v3/rssepisodequality/README.md)。离线测试：`python3 -m unittest discover -s tests -v`。
