@@ -92,7 +92,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -814,6 +814,32 @@ class RssEpisodeQuality(_PluginBase):
         hevc = int(bool(re.search(r"(?i)(?:[hx][ ._-]?265|hevc)", name)))
         return (int(priority or 0), resolution, source, hdr, fps, hevc)
 
+    def __repair_episode_quality(self, ledger: dict) -> dict:
+        """Once-only repair: retain only coverage explicitly supported by each record's title."""
+        if self.get_data("episode_quality_scope_version") == 2:
+            return ledger
+        repaired = {}
+        for key, record in ledger.items():
+            try:
+                meta = MetaInfo(title=record.get("title") or "")
+                seasons = list(getattr(meta, "season_list", None) or [])
+                episodes = set(getattr(meta, "episode_list", None) or [])
+                scope = re.search(r":S(\d+):E(\d+)$", key)
+                if (scope and len(seasons) <= 1 and episodes
+                        and int(scope.group(1)) == meta.begin_season
+                        and int(scope.group(2)) in episodes):
+                    repaired[key] = record
+            except Exception as err:
+                # Preserve the complete pre-repair data for recovery; never guess episode coverage.
+                logger.warning(f"质量记录无法确认标题集数，移除去重标记：{key}，{err}")
+        if self.get_data("episode_quality_before_title_scope_v2") is None:
+            self.save_data("episode_quality_before_title_scope_v2", ledger)
+        # Mark completion only after the repaired data has been saved successfully.
+        self.save_data("episode_quality_v1", repaired)
+        self.save_data("episode_quality_scope_version", 2)
+        logger.info(f"标题集数修复完成：保留 {len(repaired)} 条，移除 {len(ledger)-len(repaired)} 条错误或无法确认的质量标记；原记录已备份")
+        return repaired
+
     def __seed_quality(self, history, mediainfo, filter_groups, ledger) -> None:
         """Migrate retained successful downloads without fetching RSS or downloading again."""
         for item in history:
@@ -826,7 +852,7 @@ class RssEpisodeQuality(_PluginBase):
             if not title:
                 continue
             try:
-                old_meta = MetaInfo(title=title, subtitle=item.get("rss_description") or "")
+                old_meta = MetaInfo(title=title)
                 keys = self.__episode_keys(old_meta, mediainfo)
                 if not keys:
                     continue
@@ -912,7 +938,9 @@ class RssEpisodeQuality(_PluginBase):
                         logger.info(f"{title} - 种子大小不在指定范围")
                         continue
                 # 识别媒体信息
-                meta = MetaInfo(title=title, subtitle=description)
+                # RSS 简介可能包含播出总集数、整季范围等，不能用于下载覆盖范围。
+                # 标题没有明确集数时保持未知，由 skip_unknown_episodes 决定是否跳过。
+                meta = MetaInfo(title=title)
                 if not meta.name:
                     logger.warning(f"{title} 未识别到有效数据")
                     continue
@@ -984,6 +1012,8 @@ class RssEpisodeQuality(_PluginBase):
         ledger = (self.get_data("episode_quality_v1") or {}) if self._smart_quality and self._action == "download" and not self._clearflag else {}
         if not isinstance(ledger, dict):
             raise ValueError("剧集质量记录格式异常；停止本轮，避免重复下载")
+        if self._smart_quality and self._action == "download" and not self._clearflag:
+            ledger = self.__repair_episode_quality(ledger)
         if self._clearflag and self._smart_quality and self._action == "download":
             self.save_data("episode_quality_v1", {})
         seeded_media = set()

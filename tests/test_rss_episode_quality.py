@@ -20,6 +20,9 @@ class MetaInfo:
         self.begin_season=self.season_list[0]
         match=re.search(r'E(\d+)(?:-(?:S\d+)?E(\d+))?',text)
         self.episode_list=list(range(int(match[1]),int(match[2] or match[1])+1)) if match else []
+        # Simulate the observed SDK issue: a synopsis can expand a single episode's range.
+        if '总集数211' in (subtitle or ''):
+            self.episode_list=list(range(18,229))
         self.season=f'S{self.begin_season:02d}'; self.season_episode=self.season+str(self.episode_list)
 class TorrentInfo(NS):
     def __init__(self,**kw):
@@ -118,10 +121,10 @@ class Tests(unittest.TestCase):
         data={'history':[dict(type='电视剧',rss_title=old,media_id='Show',media_source='themoviedb',key='old',time='2026-10-01')]}
         p=plugin({'feed':[entry('Show S01E01 1080p WEB-DL')]},data)
         self.assertEqual(self.run_plugin(p),[]);self.assertTrue(p.data['episode_quality_v1'])
-    def test_subtitle_episode_coverage(self):
+    def test_subtitle_cannot_supply_missing_episode_coverage(self):
         e=entry('Show S01 2160p WEB-DL');e['description']='S01E03-E04'
-        p=plugin({'feed':[e]});self.assertEqual(self.run_plugin(p),[e['title']])
-        self.assertEqual(len(p.data['episode_quality_v1']),2)
+        p=plugin({'feed':[e]});self.assertEqual(self.run_plugin(p),[])
+        self.assertEqual(len(p.data['episode_quality_v1']),0)
     def test_feature_off_preserves_multiple_downloads(self):
         titles=['Show S01E01 1080p WEB-DL','Show S01E01 2160p WEB-DL']
         self.assertEqual(self.run_plugin(plugin({'feed':list(map(entry,titles))},_smart_quality=False)),titles)
@@ -146,4 +149,46 @@ class Tests(unittest.TestCase):
     def test_size_limit_preserved(self):
         p=plugin({'feed':[entry('Show S01E01 2160p WEB-DL',3*1024**3),entry('Show S01E01 1080p WEB-DL',1024**3)]},_size_range='0-2')
         self.assertEqual(self.run_plugin(p),['Show S01E01 1080p WEB-DL'])
+    def test_explicit_title_beats_polluted_description(self):
+        e=entry('Show S10E18 2160p WEB-DL');e['description']='总集数211'
+        p=plugin({'feed':[e]});self.assertEqual(self.run_plugin(p),[e['title']])
+        self.assertEqual(set(p.data['episode_quality_v1']),{'themoviedb:Show:S10:E18'})
+    def test_repair_expanded_range_and_preserve_backup(self):
+        title='Show S10E18 2160p WEB-DL'
+        original={f'themoviedb:Show:S10:E{ep}':{'title':title,'rank':[100,2160,2,0,0,0]} for ep in range(18,229)}
+        p=plugin({'feed':[]},{'episode_quality_v1':original})
+        self.run_plugin(p)
+        self.assertEqual(set(p.data['episode_quality_v1']),{'themoviedb:Show:S10:E18'})
+        self.assertEqual(p.data['episode_quality_before_title_scope_v2'],original)
+        self.assertEqual(p.data['episode_quality_scope_version'],2)
+        backup=copy.deepcopy(p.data['episode_quality_before_title_scope_v2'])
+        self.run_plugin(p);self.assertEqual(p.data['episode_quality_before_title_scope_v2'],backup)
+    def test_repair_keeps_valid_pack_removes_unknown_and_wrong_season(self):
+        rec=lambda title:dict(title=title,rank=[100,2160,2,0,0,0])
+        data={'episode_quality_v1':{
+            'themoviedb:Show:S1:E1':rec('Show S01E01-E02 2160p WEB-DL'),
+            'themoviedb:Show:S1:E2':rec('Show S01E01-E02 2160p WEB-DL'),
+            'themoviedb:Show:S1:E3':rec('Show S01 2160p WEB-DL'),
+            'themoviedb:Show:S2:E1':rec('Show S01E01 2160p WEB-DL')}}
+        p=plugin({'feed':[]},data);self.run_plugin(p)
+        self.assertEqual(set(p.data['episode_quality_v1']),{'themoviedb:Show:S1:E1','themoviedb:Show:S1:E2'})
+    def test_history_reseeding_does_not_restore_polluted_range(self):
+        title='Show S10E18 2160p WEB-DL'
+        old=dict(type='电视剧',rss_title=title,rss_description='总集数211',media_id='Show',media_source='themoviedb',key='old',time='2026-10-11')
+        next_episode=entry('Show S10E19 2160p WEB-DL')
+        p=plugin({'feed':[next_episode]},{'history':[old]})
+        self.assertEqual(self.run_plugin(p),[next_episode['title']])
+        self.assertEqual(set(p.data['episode_quality_v1']),{'themoviedb:Show:S10:E18','themoviedb:Show:S10:E19'})
+    def test_repair_failure_does_not_mark_completed_or_submit_download(self):
+        title='Show S10E18 2160p WEB-DL'
+        p=plugin({'feed':[entry(title)]},{'episode_quality_v1':{'themoviedb:Show:S10:E19':{'title':title,'rank':[100]}}})
+        original=p.save_data
+        def fail(key,value):
+            if key=='episode_quality_v1':raise RuntimeError('database unavailable')
+            original(key,value)
+        p.save_data=fail
+        with self.assertRaises(RuntimeError):self.run_plugin(p)
+        self.assertNotIn('episode_quality_scope_version',p.data)
+        self.assertEqual(Downloader.calls,[])
+
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -81,12 +81,12 @@ plugins.v3/
 ## 当前版本
 
 - `RssSubscribeNoNotify`：V3 `v3.1.0` / V2 `v2.1.5`
-- `RssSubscribeMovieNoNotify`：V3 `v2.1.0` / V2 `v1.0.0`
+- `RssSubscribeMovieNoNotify`：V3 `v2.1.0` / V2 `v1.0.1`
 - `QbFinishedCleanup`：V3 `v2.0.0` / V2 `v1.0.3`
 
 ## RSS剧集优选（V3）
 
-独立插件 `RssEpisodeQuality`，当前版本 `v1.0.0`，要求 MoviePilot `>= 3.0.0`。
+独立插件 `RssEpisodeQuality`，当前版本 `v1.0.1`，要求 MoviePilot `>= 3.0.0`。
 
 汇总多个 RSS 源后按现有订阅优先级规则优选剧集，逐集记录成功加入下载队列的质量，拦截同档重复和降级，允许后续质量升级。文件大小只用于同档候选选择。默认仅处理明确集数的电视剧，不发送通知。
 
