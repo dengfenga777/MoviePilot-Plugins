@@ -22,13 +22,32 @@ from app.sdk.media import Context, MediaInfo, MetaInfo, TorrentInfo, resolve_med
 from app.sdk.network import RssHelper
 from app.sdk.services import RuleHelper, MediaServerHelper, DownloaderHelper
 from app.plugins import _PluginBase
-from app.schemas.types import MediaSource, SystemConfigKey, MediaType
+from app.schemas.types import MediaSource, SystemConfigKey, MediaType, MessageType
 
 from .engine import (Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO,
                      TARGETS, meets_target, site_score)
 from .adapters import query_library, submit_selected
 
 lock = Lock()
+
+# 连续多少部剧的媒体库查询（重试用尽后）失败，就判定媒体库整体不可用并停止本轮查重
+LIBRARY_BREAKER_THRESHOLD = 3
+# “已确认无需下载”的 RSS 条目缓存时长（小时）；期间删集需等缓存过期才会补回
+SETTLED_SKIP_HOURS = 6
+# 这些理由只取决于媒体库已有版本与候选标题，不会因等待而改变
+SETTLED_REASONS = ("已达到目标画质", "媒体库已有", "同档或降级，保留已有版本", "已有版本画质未知，保留已有版本",
+                   "实际画质未知，保留已有版本", "候选未达到目标画质，等待更高画质", "已达每集最多下载次数",
+                   "疑似标题虚标")
+_SECRET_PARAM = re.compile(r"((?:passkey|apikey|api_key|token|authkey|rsskey|sign|uid|key)=)[^&\s]+", re.IGNORECASE)
+
+
+def mask_url(url) -> str:
+    """日志里隐藏 RSS 链接中的 passkey 等凭据。"""
+    return _SECRET_PARAM.sub(r"\1***", str(url or ""))
+
+
+class LibraryUnavailable(UncertainLibrary):
+    """媒体库查询重试用尽仍失败（区别于“集数减少待复核”这类单剧状态）。"""
 
 
 class DeleteHistoryRequest(BaseModel):
@@ -132,7 +151,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -974,7 +993,9 @@ class RssEpisodeQuality(_PluginBase):
         """Cached negative results are only valid for the settings that produced them."""
         return self.__digest(json.dumps([self._include, self._exclude, self._filter, filter_groups,
                                          self._size_range, self._skip_unknown_episodes,
-                                         self._smart_quality, self._action], default=str))
+                                         self._smart_quality, self._action, self._mode,
+                                         self._target_quality, self._upgrade_policy, self._max_downloads,
+                                         self._library_servers], default=str))
 
     def __load_skip_cache(self, fingerprint) -> dict:
         cache = self.get_data("rss_skip_cache_v1")
@@ -1057,7 +1078,7 @@ class RssEpisodeQuality(_PluginBase):
             except UncertainLibrary as err:
                 logger.warning(f"{media.title_year} 媒体库查询 {attempt+1}/{self._query_retries}：{err}")
                 if attempt + 1 == self._query_retries:
-                    raise
+                    raise LibraryUnavailable(str(err)) from err
                 time.sleep(1)
         coverage = library.coverage()
         if previous and any(not set(episodes).issubset(set(coverage.get(season, [])))
@@ -1081,22 +1102,22 @@ class RssEpisodeQuality(_PluginBase):
             results = RssHelper().parse(url, proxy=self._proxy, timeout=20)
         except Exception as err:
             logger.error(
-                f"刷新 RSS 源发生未预期异常，已跳过：{url}，"
-                f"错误：{str(err)} - {traceback.format_exc()}"
+                f"刷新 RSS 源发生未预期异常，已跳过：{mask_url(url)}，"
+                f"错误：{mask_url(err)} - {mask_url(traceback.format_exc())}"
             )
             return []
 
         if results is None:
-            logger.warning(f"RSS 链接可能已经过期：{url}")
+            logger.warning(f"RSS 链接可能已经过期：{mask_url(url)}")
             return []
         if results is False:
-            logger.error(f"RSS 请求或解析失败：{url}")
+            logger.error(f"RSS 请求或解析失败：{mask_url(url)}")
             return []
         if not isinstance(results, list):
-            logger.error(f"RSS 返回了不支持的数据类型：{url}，类型：{type(results).__name__}")
+            logger.error(f"RSS 返回了不支持的数据类型：{mask_url(url)}，类型：{type(results).__name__}")
             return []
         if not results:
-            logger.info(f"RSS 没有可处理的数据：{url}")
+            logger.info(f"RSS 没有可处理的数据：{mask_url(url)}")
         return results
 
     def __persist_history(self, history: List[dict]) -> None:
@@ -1342,7 +1363,7 @@ class RssEpisodeQuality(_PluginBase):
                         )
                         self.__remember_skip(skip_cache, rss_key, "未匹配到适用订阅规则组", 6)
                         continue
-                    logger.info(
+                    logger.debug(
                         f"{title} - 使用订阅规则组：{', '.join(active_group_names)}，"
                         f"类型：{mediainfo.type.value}，分类：{media_category}"
                     )
@@ -1377,7 +1398,7 @@ class RssEpisodeQuality(_PluginBase):
                 logger.error(f'解析RSS候选出错：{err} - {traceback.format_exc()}')
         self.save_data("rss_skip_cache_v1", skip_cache)
         if cache_hits:
-            logger.info(f"剧集优选：{cache_hits} 条 RSS 近期已确认不适用，本轮未重复识别")
+            logger.info(f"剧集优选：{cache_hits} 条 RSS 近期已确认不适用或无需下载，本轮未重复识别")
         # Higher MP rule scores first. Equal-grade variants are ordered by size only as a tie-breaker.
         # Size cannot itself cause an upgrade or a second download.
         if self._smart_quality and self._action == "download":
@@ -1408,6 +1429,10 @@ class RssEpisodeQuality(_PluginBase):
         if not self._library_servers and set(services) != enabled_names:
             raise ValueError("部分已启用媒体服务器没有运行实例，本轮停止")
         libraries = {}
+        # 熔断：连续多部剧查询失败说明媒体库整体不可用，剩余候选直接暂缓，不再逐部重试
+        library_failures = 0
+        library_down = None
+        library_ok = False
         for context, rss_key, episode_keys, _order, smart in candidates:
             meta, mediainfo, torrentinfo = context.meta_info, context.media_info, context.torrent_info
             title = torrentinfo.title
@@ -1416,8 +1441,20 @@ class RssEpisodeQuality(_PluginBase):
                 try:
                     identity = (mediainfo.media_source.value, str(mediainfo.media_id))
                     if identity not in libraries:
+                        if library_down:
+                            raise UncertainLibrary(f"媒体库连续查询失败，本轮暂停查重：{library_down}")
                         libraries[identity] = self.__library(mediainfo, services)
+                        library_failures = 0
+                        library_ok = True
                     library = libraries[identity]
+                except LibraryUnavailable as err:
+                    libraries[identity] = None
+                    library_failures += 1
+                    if library_failures >= LIBRARY_BREAKER_THRESHOLD and not library_down:
+                        library_down = str(err)
+                        logger.error(f"剧集优选：连续 {library_failures} 部剧媒体库查询失败，本轮剩余候选全部暂缓：{err}")
+                    self.__audit(mediainfo, title, "deferred", key=rss_key, reason=str(err))
+                    continue
                 except UncertainLibrary as err:
                     libraries[identity] = None
                     self.__audit(mediainfo, title, "deferred", key=rss_key, reason=str(err))
@@ -1499,6 +1536,11 @@ class RssEpisodeQuality(_PluginBase):
                 details = plan_details()
                 self.__audit(mediainfo, title, "planned" if selected else "skipped", key=rss_key, **details)
                 if not selected:
+                    # 结论只取决于库内版本与候选标题时，缓存一段时间，免得每轮重复识别和查库
+                    if not blocked and plan.reasons and all(
+                            any(reason in str(text) for reason in SETTLED_REASONS)
+                            for text in plan.reasons.values()):
+                        self.__remember_skip(skip_cache, rss_key, "无需下载", SETTLED_SKIP_HOURS)
                     continue
                 # 下载或订阅
                 if self._action == "download":
@@ -1635,6 +1677,8 @@ class RssEpisodeQuality(_PluginBase):
                 self.__audit(mediainfo, title, "deferred", key=rss_key, reason=str(err))
             except Exception as err:
                 logger.error(f'处理RSS候选出错：{err} - {traceback.format_exc()}')
+        self.save_data("rss_skip_cache_v1", skip_cache)
+        self.__report_library_health(library_down, library_ok)
         # 清理长期不再出现的待完成记录
         self.__prune_ledger(ledger, download_services, pending_cache)
         # Persist pending removals as well as successful additions.
@@ -1643,6 +1687,22 @@ class RssEpisodeQuality(_PluginBase):
         self.__persist_history(history)
         # 缓存只清理一次
         self._clearflag = False
+
+    def __report_library_health(self, library_down, library_ok):
+        """媒体库不可用/恢复时各发一条通知；持续故障不重复提醒。
+
+        插件平时不发系统通知，这是唯一例外：查重失败意味着所有下载都会停下。
+        """
+        state = self.get_data("library_health_v1")
+        was_down = isinstance(state, dict) and bool(state.get("down"))
+        if library_down and not was_down:
+            self.save_data("library_health_v1", {"down": True, "since": time.time(), "error": library_down})
+            self.post_message(mtype=MessageType.Plugin, title="【RSS剧集优选】媒体库查询失败",
+                              text=f"连续多部剧查询媒体库失败，查重已暂停，所有下载暂缓。\n错误：{library_down}")
+        elif was_down and not library_down and library_ok:
+            self.save_data("library_health_v1", {"down": False, "since": time.time()})
+            self.post_message(mtype=MessageType.Plugin, title="【RSS剧集优选】媒体库查询已恢复",
+                              text="媒体库查询恢复正常，剧集优选已继续工作。")
 
     def __log_and_notify_error(self, message):
         """

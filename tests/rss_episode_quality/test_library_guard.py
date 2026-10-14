@@ -25,6 +25,7 @@ class Base:
     def get_data(self,key):return copy.deepcopy(self.data.get(key))
     def save_data(self,key,value):self.data[key]=copy.deepcopy(value)
     def update_config(self,value):self.saved_config=value
+    def post_message(self,**kw):self.data.setdefault('_messages',[]).append(kw)
 class Meta:
     def __init__(self,title=None,**kw):
         self.name=title; self.begin_season=1; self.end_season=None
@@ -57,7 +58,10 @@ class DownloadHelper:
 source=Path(__file__).resolve().parents[2]/'plugins.v3'/'rssepisodequality'/'__init__.py'
 tree=ast.parse(source.read_text())
 cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='RssEpisodeQuality')
-module=ast.fix_missing_locations(ast.Module(body=[cls],type_ignores=[]))
+# 模块级常量、mask_url 与 LibraryUnavailable 也是插件行为的一部分
+helpers=[n for n in tree.body if isinstance(n,ast.Assign) and not any(getattr(t,'id','')=='lock' for t in n.targets)
+         or isinstance(n,ast.FunctionDef) or isinstance(n,ast.ClassDef) and n.name=='LibraryUnavailable']
+module=ast.fix_missing_locations(ast.Module(body=helpers+[cls],type_ignores=[]))
 ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tuple':Tuple,
     'BackgroundScheduler':object,'Path':Path,'DeleteHistoryRequest':object,
     'schemas':SimpleNamespace(Response=List),'datetime':datetime,'hashlib':hashlib,
@@ -70,6 +74,7 @@ ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tu
     'Context':SimpleNamespace,'TorrentInfo':TorrentInfo,'MediaInfo':SimpleNamespace,
     'SystemConfigKey':SimpleNamespace(SubscribeFilterRuleGroups='rules'),
     'RuleHelper':object,'SilentDownloadChain':Download,'SilentSubscribeChain':Subscribe,
+    'MessageType':SimpleNamespace(Plugin='plugin'),
     'lock':Lock(),'settings':SimpleNamespace(TZ='Asia/Shanghai')}
 exec(compile(module,str(source),'exec'),ns)
 Plugin=ns['RssEpisodeQuality']
@@ -112,8 +117,10 @@ class PluginTests(unittest.TestCase):
         clock=Mock(return_value=100000)
         with patch.object(time,'time',clock):
             ns['query_library'].return_value=self.library(34); self.run_check()
+            # “无需下载”缓存期内不查库；过期后才会发现删集
+            clock.return_value=100000+6*3600+1
             ns['query_library'].return_value=engine.Library(); self.run_check()
-            clock.return_value=100601; self.run_check()
+            clock.return_value+=601; self.run_check()
         self.assertEqual(Download.calls[0]['episodes'],set(range(1,13)))
     def test_recovery_resets_delete_confirmation(self):
         clock=Mock(return_value=100000)
@@ -283,6 +290,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(statuses,['skipped'])
     def test_changed_outcome_is_recorded_again(self):
         ns['query_library'].return_value=self.library(34); self.run_check()
+        self.plugin.data.pop('rss_skip_cache_v1')  # 模拟“无需下载”缓存过期
         ns['query_library'].side_effect=engine.UncertainLibrary('offline')
         with patch.object(time,'sleep'):self.run_check()
         self.assertEqual([r['status'] for r in self.plugin.data['decisions_v1']],['skipped','deferred'])
@@ -503,5 +511,80 @@ class PluginTests(unittest.TestCase):
         ns['query_library'].side_effect=engine.UncertainLibrary('offline')
         with patch.object(time,'sleep'):self.run_check()
         self.assertEqual(self.plugin.get_page()[0]['component'],'VCard')
+
+    # ---- 1.4.1 ----
+    def shows(self,count):
+        """count 部不同的剧，各一条单集 RSS。"""
+        medias={f'Show{i}.S01E01.2160p.WEB-DL':SimpleNamespace(**{**vars(self.plugin.media),'media_id':str(1000+i),
+                'title_year':f'剧{i} (2026)'}) for i in range(count)}
+        self.plugin.chain=SimpleNamespace(recognize_media=lambda meta=None,**kw:medias[meta.name])
+        self.plugin._RssEpisodeQuality__fetch_rss=lambda url:[{'title':t,'description':'',
+                'enclosure':f'https://feed.invalid/{t}.torrent','size':1} for t in medias]
+    def test_settled_skip_is_not_rechecked(self):
+        ns['query_library'].return_value=self.library(34)
+        self.run_check(); self.run_check()
+        self.assertEqual(ns['query_library'].call_count,1)
+        self.assertFalse(Download.calls)
+    def test_settled_skip_invalidated_by_mode_change(self):
+        ns['query_library'].return_value=self.library(34)
+        self.run_check(); self.plugin._mode='upgrade'; self.run_check()
+        self.assertEqual(ns['query_library'].call_count,2)
+    def test_pending_block_is_not_cached(self):
+        ns['query_library'].return_value=self.library(10)
+        DownloadHelper.services['QB'].instance.get_torrents.return_value=([{'progress':0.5}],False)
+        self.run_check()
+        self.assertEqual(len(Download.calls),1)
+        self.run_check()
+        self.assertEqual(ns['query_library'].call_count,2)
+        self.assertNotIn(self.plugin._RssEpisodeQuality__rss_key({'title':'Show.S01E01-E12.2160p.WEB-DL',
+            'enclosure':'https://feed.invalid/file.torrent'}),self.plugin.data['rss_skip_cache_v1']['items'])
+    def test_deferred_is_not_cached(self):
+        ns['query_library'].side_effect=engine.UncertainLibrary('offline')
+        with patch.object(time,'sleep'):self.run_check(); self.run_check()
+        self.assertEqual(self.plugin.data['rss_skip_cache_v1']['items'],{})
+    def test_breaker_stops_querying_after_consecutive_failures(self):
+        self.shows(6)
+        ns['query_library'].side_effect=engine.UncertainLibrary('分页不一致')
+        with patch.object(time,'sleep'):self.run_check()
+        self.assertEqual(ns['query_library'].call_count,3*self.plugin._query_retries)
+        self.assertEqual(len([r for r in self.plugin.data['decisions_v1'] if r['status']=='deferred']),6)
+        self.assertFalse(Download.calls)
+    def test_breaker_resets_on_success(self):
+        self.shows(5)
+        results=iter([engine.UncertainLibrary('x')]*3*2+[self.library(34)]+[engine.UncertainLibrary('x')]*3*2)
+        def query(*a):
+            r=next(results)
+            if isinstance(r,Exception):raise r
+            return r
+        ns['query_library'].side_effect=query
+        with patch.object(time,'sleep'):self.run_check()
+        self.assertEqual(ns['query_library'].call_count,13)
+        self.assertNotIn('_messages',self.plugin.data)
+    def test_outage_and_recovery_notify_once_each(self):
+        self.shows(3)
+        ns['query_library'].side_effect=engine.UncertainLibrary('offline')
+        with patch.object(time,'sleep'):self.run_check(); self.run_check()
+        self.assertEqual([m['title'] for m in self.plugin.data['_messages']],['【RSS剧集优选】媒体库查询失败'])
+        ns['query_library'].side_effect=None; ns['query_library'].return_value=self.library(34)
+        self.run_check(); self.run_check()
+        self.assertEqual([m['title'] for m in self.plugin.data['_messages']],
+                         ['【RSS剧集优选】媒体库查询失败','【RSS剧集优选】媒体库查询已恢复'])
+    def test_single_show_failure_does_not_notify(self):
+        ns['query_library'].side_effect=engine.UncertainLibrary('offline')
+        with patch.object(time,'sleep'):self.run_check()
+        self.assertNotIn('_messages',self.plugin.data)
+    def test_settled_skip_rechecked_after_expiry(self):
+        clock=Mock(return_value=100000)
+        with patch.object(time,'time',clock):
+            ns['query_library'].return_value=self.library(34); self.run_check()
+            clock.return_value+=6*3600-60; self.run_check()
+            self.assertEqual(ns['query_library'].call_count,1)
+            clock.return_value+=120; self.run_check()
+            self.assertEqual(ns['query_library'].call_count,2)
+    def test_mask_url_hides_credentials(self):
+        url='https://x.example/torrentrss.php?rows=10&passkey=abc123&linktype=dl&sign=s1&uid=9'
+        masked=ns['mask_url'](url)
+        self.assertNotIn('abc123',masked); self.assertNotIn('s1&',masked)
+        self.assertIn('rows=10',masked); self.assertIn('passkey=***',masked)
 
 if __name__=='__main__':unittest.main()
