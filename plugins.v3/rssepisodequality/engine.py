@@ -157,8 +157,8 @@ def decide(requested, season, library, candidate_quality, quality_of, mode='miss
     return plan
 
 
-def quality(title, item=None):
-    """Resolution/HDR/source from stream facts and filename. Unknown is never low quality."""
+def _title_quality(title):
+    """Single source of truth for resolution/HDR/source parsed from a release name."""
     title = title or ''
     resolution = next((value for pattern, value in [(r'\b(?:2160[pi]|4k|uhd)\b', 2160),
                         (r'\b1080[pi]\b', 1080), (r'\b720[pi]\b', 720)]
@@ -166,6 +166,29 @@ def quality(title, item=None):
     hdr = int(bool(re.search(r'\b(?:hdr\w*|dv|dovi)\b|dolby[ ._-]?vision', title, re.I)))
     source = 4 if re.search(r'\bremux\b', title, re.I) else (3 if re.search(r'blu[ ._-]?ray|\bb[dr]rip\b', title, re.I)
              else 2 if re.search(r'web[ ._-]?dl', title, re.I) else 1 if re.search(r'web[ ._-]?rip|\bhdtv\b', title, re.I) else 0)
+    return resolution, hdr, source
+
+
+def rank(title, priority=0):
+    """Cross-RSS ordering key: MP rule priority first, then the same quality facts used for upgrades.
+
+    Size is deliberately excluded; callers may use it only as a final tie-breaker.
+    """
+    resolution, hdr, source = _title_quality(title)
+    name = title or ''
+    fps = int(bool(re.search(r'(?i)\b(?:60|50|120)\s*fps\b', name)))
+    hevc = int(bool(re.search(r'(?i)(?:[hx][ ._-]?265|hevc)', name)))
+    try:
+        priority = int(priority or 0)
+    except (TypeError, ValueError):
+        priority = 0
+    return priority, resolution, source, hdr, fps, hevc
+
+
+def quality(title, item=None):
+    """Resolution/HDR/source from stream facts and filename. Unknown is never low quality."""
+    title = title or ''
+    resolution, hdr, source = _title_quality(title)
     if item is not None:
         streams = list(item.get('MediaStreams') or [])
         for media_source in item.get('MediaSources') or []:
@@ -190,6 +213,36 @@ VIDEO = {'.mkv', '.mp4', '.avi', '.ts', '.m2ts', '.mov', '.wmv'}
 SUBTITLES = {'.srt', '.ass', '.ssa', '.vtt', '.sup'}
 
 
+# "E05", "EP05", "EP.05", "S01EP05". The separator is only allowed after "EP" so that tokens
+# such as "E-AC3" or "HE 10" are never read as episodes.
+_EPISODE = r'(?:\b|(?<=\d))(?:EP[ ._]?|E)(\d{1,4})(?!\d)'
+_EPISODE_RANGE = r'(?:\b|(?<=\d))(?:EP[ ._]?|E)(\d{1,4})[ ._]*-[ ._]*(?:EP[ ._]?|E)?(\d{1,4})(?!\d)'
+# Fansub style, only consulted when nothing explicit matched: "Show - 05 [1080p]", "[Group][Show][05][1080p]".
+_ANIME_DASH = r'(?:^|\s)-\s?(\d{1,3})(?:v\d)?(?=\s|\[|\(|\.|$)'
+_ANIME_BRACKET = r'\[(\d{1,3})(?:v\d)?(?:\s?(?:END|FIN|完))?\]'
+_NOT_EPISODE = {480, 576, 720}
+
+
+def _episodes_in(text):
+    """Explicit episode numbers in one path component (file stem or directory name)."""
+    episodes = {int(v) for v in re.findall(r'(?i)' + _EPISODE, text)}
+    for begin, end in re.findall(r'(?i)' + _EPISODE_RANGE, text):
+        begin, end = int(begin), int(end)
+        if end < begin or end - begin > 100:
+            raise UnsafeSelection('文件集数范围异常')
+        episodes.update(range(begin, end + 1))
+    if not episodes:
+        episodes = {int(v) for v in re.findall(r'第\s*(\d{1,4})\s*[集话話]', text)}
+    if not episodes:
+        anime = {int(v) for v in re.findall(_ANIME_DASH, text)} or {
+            int(v) for v in re.findall(r'(?i)' + _ANIME_BRACKET, text)}
+        anime -= _NOT_EPISODE
+        # Several bare numbers in one name are ambiguous (e.g. "[01][1080][02]"); refuse to guess.
+        if len(anime) == 1:
+            episodes = anime
+    return episodes
+
+
 def file_scope(name, default_season):
     """Only explicit filename episodes count; pack/directory ranges never supply coverage."""
     path = PurePosixPath(name.replace('\\', '/'))
@@ -198,19 +251,26 @@ def file_scope(name, default_season):
     if len(seasons) > 1:
         raise UnsafeSelection('文件包含冲突季号')
     season = next(iter(seasons), default_season)
-    episode_numbers = {int(v) for v in re.findall(r'(?i)(?:\b|(?<=\d))E(\d{1,4})(?!\d)', filename)}
-    ranges = re.findall(r'(?i)E(\d{1,4})[ ._]*-[ ._]*E?(\d{1,4})', filename)
-    for begin, end in ranges:
-        begin, end = int(begin), int(end)
-        if end < begin or end - begin > 100:
-            raise UnsafeSelection('文件集数范围异常')
-        episode_numbers.update(range(begin, end + 1))
-    if not episode_numbers:
-        for value in re.findall(r'第\s*(\d{1,4})\s*集', filename):
-            episode_numbers.add(int(value))
+    stem = filename[:-len(path.suffix)] if path.suffix else filename
+    episode_numbers = _episodes_in(stem)
     if 0 in episode_numbers:
         raise UnsafeSelection('不支持第0集编号')
     return season, episode_numbers
+
+
+def subtitle_scope(name, default_season):
+    """Subtitles inside a per-episode folder ("Subs/Show.S01E05/2_English.srt") take that folder's episode.
+
+    Only a single explicit episode qualifies; a range folder never supplies coverage.
+    """
+    season, episodes = file_scope(name, default_season)
+    if episodes:
+        return season, episodes
+    for parent in reversed(PurePosixPath(name.replace('\\', '/')).parent.parts):
+        found = _episodes_in(parent)
+        if found:
+            return season, (found if len(found) == 1 and 0 not in found else set())
+    return season, set()
 
 
 def select_files(files, season, selected):
@@ -230,7 +290,7 @@ def select_files(files, season, selected):
         if suffix not in VIDEO | SUBTITLES or re.search(r'(?i)(?:^|[/ ._-])(?:sample|trailer)(?:[/ ._-]|$)', name):
             disabled.append(file_id)
             continue
-        file_season, episodes = file_scope(name, season)
+        file_season, episodes = (file_scope if suffix in VIDEO else subtitle_scope)(name, season)
         if suffix in VIDEO and not episodes:
             raise UnsafeSelection('视频文件无法识别明确集数')
         relevant = file_season == season and bool(episodes & selected)

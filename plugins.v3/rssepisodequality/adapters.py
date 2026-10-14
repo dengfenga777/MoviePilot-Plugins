@@ -1,6 +1,7 @@
 """MoviePilot runtime bridges. Failure always leaves new qBittorrent tasks paused."""
 import time
 import uuid
+from pathlib import PurePosixPath
 
 from .engine import EmbyLibrary, Library, UncertainLibrary, UnsafeSelection, select_files, quality, file_scope, VIDEO
 
@@ -11,14 +12,15 @@ def query_library(services, media, timeout=10):
         raise UncertainLibrary('未配置可用媒体服务器')
     result = Library(servers=tuple(sorted(services)))
     for name, service in services.items():
-        if str(service.type).lower() not in ('emby', 'jellyfin'):
+        server_type = str(service.type).lower()
+        if server_type not in ('emby', 'jellyfin'):
             raise UncertainLibrary('所选媒体服务器类型暂不支持严格查重')
         config = service.config.config or {}
         host = str(config.get('host') or '').rstrip('/')
         token = config.get('apikey')
         if not host.startswith(('http://', 'https://')) or not token:
             raise UncertainLibrary('媒体服务器连接配置不完整')
-        base = host + ('/' if host.endswith('/emby') else '/emby/' if service.type == 'emby' else '/')
+        base = host + ('/' if host.endswith('/emby') else '/emby/' if server_type == 'emby' else '/')
         def request(endpoint, params):
             try:
                 response = requests.get(base + endpoint, params=params,
@@ -45,7 +47,7 @@ def submit_selected(service, content, download_dir, cookie, category, label, sea
     A failure after addition leaves a paused task for inspection (never deletes data).
     """
     from torrentool.api import Torrent
-    if service.type != 'qbittorrent':
+    if str(service.type).lower() != 'qbittorrent':
         raise UnsafeSelection('严格选集目前仅支持 qBittorrent')
     if not isinstance(content, bytes) or content.startswith(b'magnet:'):
         raise UnsafeSelection('缺少可验证的 torrent 文件，拒绝磁力整包回退')
@@ -57,7 +59,7 @@ def submit_selected(service, content, download_dir, cookie, category, label, sea
         expected = upgrade.get("quality")
         axes = upgrade.get("axes")
         for file in preflight:
-            if file['id'] not in enabled or __import__('pathlib').PurePosixPath(file['name']).suffix.lower() not in VIDEO:
+            if file['id'] not in enabled or PurePosixPath(file['name']).suffix.lower() not in VIDEO:
                 continue
             _, scope = file_scope(file['name'], season)
             if not scope & upgrade['episodes']:

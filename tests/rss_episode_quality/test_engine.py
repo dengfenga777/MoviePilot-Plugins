@@ -117,4 +117,47 @@ class SelectionTests(unittest.TestCase):
     def test_conflicting_seasons_refused(self):
         with self.assertRaises(e.UnsafeSelection): e.file_scope('Season 02/Show.S01E11.mkv',None)
 
+class EpisodeNamingTests(unittest.TestCase):
+    """1.2.0: common Chinese-drama and fansub naming must not stall a pack forever."""
+    def scope(self, name): return e.file_scope(name, 1)[1]
+    def test_ep_prefix(self):
+        self.assertEqual(self.scope('某剧.EP05.2160p.WEB-DL.mkv'), {5})
+        self.assertEqual(self.scope('某剧.S01EP05.mkv'), {5})
+        self.assertEqual(self.scope('某剧.EP.05.mkv'), {5})
+        self.assertEqual(self.scope('某剧.EP01-EP03.mkv'), {1, 2, 3})
+    def test_chinese_hua(self):
+        self.assertEqual(self.scope('某剧 第5话.mkv'), {5})
+    def test_fansub_dash_and_bracket(self):
+        self.assertEqual(self.scope('[Lilith-Raws] Show - 05 [1080p].mkv'), {5})
+        self.assertEqual(self.scope('Show - 05v2 (1080p).mkv'), {5})
+        self.assertEqual(self.scope('[Grp][Show][12v2][720p].mkv'), {12})
+        self.assertEqual(self.scope('[Grp][Show][720][05].mkv'), {5})
+    def test_ambiguous_bare_numbers_refused(self):
+        self.assertEqual(self.scope('[Grp][Show][01][02].mkv'), set())
+    def test_codec_tokens_are_not_episodes(self):
+        self.assertEqual(self.scope('Show.S01E05.DDP5.1.E-AC3.mkv'), {5})
+        self.assertEqual(self.scope('Show.2160p.HE 10.mkv'), set())
+        self.assertEqual(self.scope('x264-Group.mkv'), set())
+    def test_explicit_episode_wins_over_fansub_number(self):
+        self.assertEqual(self.scope('Show - 03 - S01E05.mkv'), {5})
+    def test_ep_pack_selects_only_missing(self):
+        files = [{'id': i, 'name': f'某剧/某剧.EP{i+1:02}.2160p.mkv'} for i in range(12)]
+        enabled, disabled = e.select_files(files, 1, {11, 12})
+        self.assertEqual(enabled, [10, 11]); self.assertEqual(len(disabled), 10)
+    def test_subtitle_in_episode_folder(self):
+        files = [{'id': 0, 'name': 'Show/Show.S01E05.mkv'}, {'id': 1, 'name': 'Show/Subs/Show.S01E05/2_English.srt'},
+                 {'id': 2, 'name': 'Show/Show.S01E04.mkv'}, {'id': 3, 'name': 'Show/Subs/Show.S01E04/2_English.srt'}]
+        enabled, disabled = e.select_files(files, 1, {5})
+        self.assertEqual(enabled, [0, 1]); self.assertEqual(disabled, [2, 3])
+    def test_subtitle_in_range_folder_not_selected(self):
+        self.assertEqual(e.subtitle_scope('Show.S01E01-E12/Subs/en.srt', 1), (1, set()))
+
+class RankTests(unittest.TestCase):
+    def test_rank_shares_quality_parser(self):
+        title = 'Show.S01E05.2160p.WEB-DL.DV.H.265'
+        self.assertEqual(e.rank(title, 3)[:4], (3, 2160, 2, 1))
+        self.assertEqual(e.quality(title), (2160, 1, 2))
+    def test_bad_priority_is_zero(self):
+        self.assertEqual(e.rank('x', 'bad')[0], 0)
+
 if __name__=='__main__': unittest.main()
