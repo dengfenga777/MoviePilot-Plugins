@@ -37,7 +37,14 @@ SETTLED_SKIP_HOURS = 6
 # 这些理由只取决于媒体库已有版本与候选标题，不会因等待而改变
 SETTLED_REASONS = ("已达到目标画质", "媒体库已有", "同档或降级，保留已有版本", "已有版本画质未知，保留已有版本",
                    "实际画质未知，保留已有版本", "候选未达到目标画质，等待更高画质", "已达每集最多下载次数",
-                   "疑似标题虚标")
+                   "疑似标题虚标", "整包追新：")
+# 单部剧自身的数据问题：重试无用，也不代表媒体库整体不可用
+LIBRARY_DATA_ERRORS = ("缺少可信季集编号", "缺少媒体ID")
+# 已提交任务停滞多久后不再阻挡其他来源（追新优先：宁可换源也不干等）
+STALL_MINUTES = 30
+STALLED_STATES = ("stalleddl", "metadl", "forcedmetadl", "error", "missingfiles", "pauseddl", "stoppeddl")
+# RSS 请求失败后的重试间隔（秒）
+RSS_RETRY_SECONDS = 5
 _SECRET_PARAM = re.compile(r"((?:passkey|apikey|api_key|token|authkey|rsskey|sign|uid|key)=)[^&\s]+", re.IGNORECASE)
 
 
@@ -147,11 +154,11 @@ class RssEpisodeQuality(_PluginBase):
     # 插件名称
     plugin_name = "RSS剧集优选"
     # 插件描述
-    plugin_desc = "追更优先：新集立即下载（多站同时出现按站点优先级），之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本）、整包只选缺集，不发送系统通知。"
+    plugin_desc = "追更优先：新集立即下载（多站同时出现按站点优先级，整季/更新包也只取最新集，卡住的任务自动换源），之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本），不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -184,6 +191,7 @@ class RssEpisodeQuality(_PluginBase):
     _size_range: str = ""
     _smart_quality: bool = True
     _skip_unknown_episodes: bool = True
+    _pack_chase: bool = True
     _history_limit: int = 1000
     _library_servers: str = ""
     _mode: str = "missing"
@@ -226,6 +234,7 @@ class RssEpisodeQuality(_PluginBase):
             self._filter = config.get("filter", True)
             self._smart_quality = config.get("smart_quality", True)
             self._skip_unknown_episodes = config.get("skip_unknown_episodes", True)
+            self._pack_chase = config.get("pack_chase", True)
             self._clear = config.get("clear")
             self._action = config.get("action") or "download"
             self._save_path = str(config.get("save_path") or "").strip()
@@ -651,6 +660,17 @@ class RssEpisodeQuality(_PluginBase):
                                     },
                                 }],
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'pack_chase',
+                                        'label': '整包追新（追更优先模式：已在追的剧，整季/更新包只下比库里更新的集）',
+                                    },
+                                }],
+                            },
                         ],
                     }
                 ]
@@ -694,6 +714,7 @@ class RssEpisodeQuality(_PluginBase):
             "filter": True,
             "smart_quality": True,
             "skip_unknown_episodes": True,
+            "pack_chase": True,
             "action": "download",
             "save_path": "",
             "size_range": "",
@@ -926,6 +947,7 @@ class RssEpisodeQuality(_PluginBase):
             "filter": self._filter,
             "smart_quality": self._smart_quality,
             "skip_unknown_episodes": self._skip_unknown_episodes,
+            "pack_chase": self._pack_chase,
             "action": self._action,
             "save_path": self._save_path,
             "size_range": self._size_range,
@@ -992,7 +1014,7 @@ class RssEpisodeQuality(_PluginBase):
     def __config_fingerprint(self, filter_groups) -> str:
         """Cached negative results are only valid for the settings that produced them."""
         return self.__digest(json.dumps([self._include, self._exclude, self._filter, filter_groups,
-                                         self._size_range, self._skip_unknown_episodes,
+                                         self._size_range, self._skip_unknown_episodes, self._pack_chase,
                                          self._smart_quality, self._action, self._mode,
                                          self._target_quality, self._upgrade_policy, self._max_downloads,
                                          self._library_servers], default=str))
@@ -1076,6 +1098,9 @@ class RssEpisodeQuality(_PluginBase):
                 library = query_library(services, media)
                 break
             except UncertainLibrary as err:
+                if any(text in str(err) for text in LIBRARY_DATA_ERRORS):
+                    logger.warning(f"{media.title_year} 媒体库数据不完整，本轮暂缓（请在媒体服务器刷新元数据）：{err}")
+                    raise
                 logger.warning(f"{media.title_year} 媒体库查询 {attempt+1}/{self._query_retries}：{err}")
                 if attempt + 1 == self._query_retries:
                     raise LibraryUnavailable(str(err)) from err
@@ -1097,15 +1122,25 @@ class RssEpisodeQuality(_PluginBase):
         return library
 
     def __fetch_rss(self, url: str) -> List[dict]:
-        """读取单个 RSS 源；任何异常只影响当前源。"""
-        try:
-            results = RssHelper().parse(url, proxy=self._proxy, timeout=20)
-        except Exception as err:
-            logger.error(
-                f"刷新 RSS 源发生未预期异常，已跳过：{mask_url(url)}，"
-                f"错误：{mask_url(err)} - {mask_url(traceback.format_exc())}"
-            )
-            return []
+        """读取单个 RSS 源；请求或解析失败重试一次，任何异常只影响当前源。"""
+        for attempt in range(2):
+            try:
+                results = RssHelper().parse(url, proxy=self._proxy, timeout=20)
+            except Exception as err:
+                if attempt == 0:
+                    logger.warning(f"RSS 源读取异常，{RSS_RETRY_SECONDS} 秒后重试：{mask_url(url)}，错误：{mask_url(err)}")
+                    time.sleep(RSS_RETRY_SECONDS)
+                    continue
+                logger.error(
+                    f"刷新 RSS 源发生未预期异常，已跳过：{mask_url(url)}，"
+                    f"错误：{mask_url(err)} - {mask_url(traceback.format_exc())}"
+                )
+                return []
+            if results is False and attempt == 0:
+                logger.warning(f"RSS 请求或解析失败，{RSS_RETRY_SECONDS} 秒后重试：{mask_url(url)}")
+                time.sleep(RSS_RETRY_SECONDS)
+                continue
+            break
 
         if results is None:
             logger.warning(f"RSS 链接可能已经过期：{mask_url(url)}")
@@ -1224,8 +1259,46 @@ class RssEpisodeQuality(_PluginBase):
         progress = [float(task.get("progress", -1)) for task in tasks]
         if any(not 0 <= value <= 1 for value in progress):
             raise UncertainLibrary("下载任务进度无效")
+        if self.__stalled(record, tasks):
+            logger.info(f"已提交任务停滞超过 {STALL_MINUTES} 分钟，不再阻挡其他来源：{record.get('title')}")
+            return False
         return any(value < 1 for value in progress) or (
             time.time() - float(record.get("submitted_at", 0)) < self._pending_hours * 3600)
+
+    @staticmethod
+    def __pack_floor(library, season):
+        """整包追新只取“正在追的那一季里比库内最新一集更新的集”。
+
+        返回 (起点集号, 原因)：库里该剧最新季 → 库内最大集号；更新的季 → 0（整季都是新集）；
+        库里没有这部剧或是更旧的季 → (None, 原因)，不下载整包。
+        """
+        coverage = library.coverage()
+        seasons = sorted(int(s) for s, eps in coverage.items() if eps)
+        if season is None:
+            return None, "整包追新：无法确定季号"
+        if not seasons:
+            return None, "整包追新：媒体库没有这部剧，不下载整包"
+        latest = seasons[-1]
+        if int(season) < latest:
+            return None, "整包追新：不是正在追的最新季"
+        if int(season) > latest:
+            return 0, ""
+        return max(coverage[str(latest)]), ""
+
+    @staticmethod
+    def __stalled(record, tasks) -> bool:
+        """提交超过 STALL_MINUTES 仍未完成且当前没有下载速度（无人做种、卡元数据、出错或被暂停）。
+
+        旧任务原样保留在下载器中，只是不再阻止同一集从其他来源下载。
+        """
+        if time.time() - float(record.get("submitted_at", 0)) < STALL_MINUTES * 60:
+            return False
+        try:
+            return all(float(task.get("progress", 0)) < 1
+                       and str(task.get("state") or "").lower() in STALLED_STATES
+                       and float(task.get("dlspeed") or 0) == 0 for task in tasks)
+        except (TypeError, ValueError):
+            return False
 
     def __check(self):
         """
@@ -1384,7 +1457,11 @@ class RssEpisodeQuality(_PluginBase):
                 context = Context(meta_info=meta, media_info=mediainfo, torrent_info=torrentinfo)
                 smart = self._smart_quality and self._action == "download" and mediainfo.type == MediaType.TV
                 episode_keys = self.__episode_keys(meta, mediainfo) if smart else []
-                if smart and not episode_keys and self._skip_unknown_episodes:
+                # 整包追新：标题只有单一季号的整季包/更新包放行到查库阶段，只取比库里更新的集
+                pack_chase = (smart and not episode_keys and self._pack_chase and self._mode == "chase"
+                              and getattr(meta, "begin_season", None) is not None
+                              and len(list(getattr(meta, "season_list", None) or [])) <= 1)
+                if smart and not episode_keys and self._skip_unknown_episodes and not pack_chase:
                     logger.info(f"{title} - 剧集优选：无法识别明确集数，跳过以免误下载整季/更新包")
                     self.__remember_skip(skip_cache, rss_key, "标题无明确集数", 24)
                     continue
@@ -1465,7 +1542,15 @@ class RssEpisodeQuality(_PluginBase):
                 requested = sorted(set(meta.episode_list or []))
                 torrent_content = None
                 chosen_season = meta.begin_season
-                if not requested and not self._skip_unknown_episodes and len(seasons) <= 1:
+                # 走到这里且标题无集数：要么关闭了“跳过标题无集数资源”（整包取全部缺集），要么是整包追新
+                pack_chase = not requested and self._skip_unknown_episodes
+                if not requested and len(seasons) <= 1:
+                    if pack_chase:
+                        floor, why = self.__pack_floor(library, chosen_season)
+                        if floor is None:
+                            self.__audit(mediainfo, title, "skipped", key=rss_key, reasons={"pack": why})
+                            self.__remember_skip(skip_cache, rss_key, why, SETTLED_SKIP_HOURS)
+                            continue
                     try:
                         torrent_content, chosen_season, requested = self.__torrent_scope(context, downloadchain)
                         meta.begin_season = chosen_season
@@ -1473,6 +1558,15 @@ class RssEpisodeQuality(_PluginBase):
                     except UnsafeSelection as err:
                         self.__audit(mediainfo, title, "deferred", key=rss_key, reason=str(err))
                         continue
+                    if pack_chase:
+                        # 种子内实际季号可能与标题不同，按实际季号重新确定起点
+                        floor, why = self.__pack_floor(library, chosen_season)
+                        requested = [ep for ep in requested if floor is not None and ep > floor]
+                        if not requested:
+                            why = why or "整包追新：没有比媒体库更新的集"
+                            self.__audit(mediainfo, title, "skipped", key=rss_key, reasons={"pack": why})
+                            self.__remember_skip(skip_cache, rss_key, why, SETTLED_SKIP_HOURS)
+                            continue
                 if chosen_season is None or len(seasons) > 1 or not requested:
                     self.__audit(mediainfo, title, "deferred", key=rss_key, reason="候选没有可信的单季集数")
                     continue

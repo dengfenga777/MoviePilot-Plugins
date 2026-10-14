@@ -587,4 +587,100 @@ class PluginTests(unittest.TestCase):
         self.assertNotIn('abc123',masked); self.assertNotIn('s1&',masked)
         self.assertIn('rows=10',masked); self.assertIn('passkey=***',masked)
 
+    # ---- 1.5.0：追新优先 ----
+    def test_pack_chase_takes_only_newer_episodes(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertEqual([c['episodes'] for c in Download.calls],[{11,12}])
+    def test_pack_chase_never_fills_old_gaps(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        lib=self.chase_library()(12); del lib.episodes[(1,3)]
+        ns['query_library'].return_value=lib; self.run_check()
+        self.assertFalse(Download.calls)
+        self.assertIn('没有比媒体库更新的集',self.plugin.data['decisions_v1'][-1]['reasons']['pack'])
+    def test_pack_chase_skips_untracked_show_without_fetching_torrent(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        fetched=[]; original=Download.download_torrent
+        Download.download_torrent=lambda me,info:(fetched.append(1),original(me,info))[1]
+        try:
+            ns['query_library'].return_value=engine.Library(); self.run_check()
+        finally:
+            Download.download_torrent=original
+        self.assertFalse(Download.calls); self.assertFalse(fetched)
+        self.assertIn('媒体库没有这部剧',self.plugin.data['decisions_v1'][-1]['reasons']['pack'])
+    def test_pack_chase_skips_older_season(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        ns['query_library'].return_value=engine.Library({(2,1):[{'Path':'Show.S02E01.2160p.mkv'}]}); self.run_check()
+        self.assertFalse(Download.calls)
+        self.assertIn('不是正在追的最新季',self.plugin.data['decisions_v1'][-1]['reasons']['pack'])
+    def test_pack_floor_new_season_takes_all(self):
+        floor=self.plugin._RssEpisodeQuality__pack_floor
+        lib=engine.Library({(1,i):[{}] for i in range(1,11)})
+        self.assertEqual(floor(lib,2),(0,''))
+        self.assertEqual(floor(lib,1),(10,''))
+    def test_pack_chase_result_is_cached(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        ns['query_library'].return_value=self.chase_library()(12)
+        self.run_check(); self.run_check()
+        self.assertEqual(ns['query_library'].call_count,1)
+    def test_pack_chase_off_keeps_skipping_packs(self):
+        self.chase(); self.plugin._pack_chase=False; self.feed('Show.S01.2160p.WEB-DL')
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertFalse(Download.calls); self.assertEqual(ns['query_library'].call_count,0)
+    def test_pack_chase_only_in_chase_mode(self):
+        self.feed('Show.S01.2160p.WEB-DL')
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertFalse(Download.calls)
+    def test_stalled_submission_no_longer_blocks_other_sources(self):
+        self.chase(); qb=DownloadHelper.services['QB'].instance
+        clock=Mock(return_value=100000)
+        with patch.object(time,'time',clock):
+            self.feed('Show.S01E11.2160p.WEB-DL'); ns['query_library'].return_value=self.chase_library()(10)
+            self.run_check(); self.assertEqual(len(Download.calls),1)
+            qb.get_torrents.return_value=([{'progress':0.0,'state':'stalledDL','dlspeed':0}],False)
+            self.feed('Show.S01E11.2160p.HDR.WEB-DL')
+            clock.return_value=100000+29*60; self.run_check()
+            self.assertEqual(len(Download.calls),1)
+            clock.return_value=100000+31*60; self.run_check()
+        self.assertEqual(len(Download.calls),2)
+    def test_slow_but_moving_submission_still_blocks(self):
+        self.chase(); qb=DownloadHelper.services['QB'].instance
+        clock=Mock(return_value=100000)
+        with patch.object(time,'time',clock):
+            self.feed('Show.S01E11.2160p.WEB-DL'); ns['query_library'].return_value=self.chase_library()(10)
+            self.run_check()
+            qb.get_torrents.return_value=([{'progress':0.2,'state':'downloading','dlspeed':50000}],False)
+            self.feed('Show.S01E11.2160p.HDR.WEB-DL'); clock.return_value=100000+120*60; self.run_check()
+        self.assertEqual(len(Download.calls),1)
+    def test_data_error_is_not_retried_and_does_not_trip_breaker(self):
+        self.shows(5)
+        ns['query_library'].side_effect=engine.UncertainLibrary('媒体库剧集缺少可信季集编号')
+        with patch.object(time,'sleep'):self.run_check()
+        self.assertEqual(ns['query_library'].call_count,5)
+        self.assertNotIn('_messages',self.plugin.data)
+    def test_data_errors_between_outages_do_not_reset_breaker(self):
+        self.shows(4)
+        errors=[engine.UncertainLibrary('HTTP 500')]*3*2+[engine.UncertainLibrary('缺少可信季集编号')]+[engine.UncertainLibrary('HTTP 500')]*3
+        ns['query_library'].side_effect=errors
+        with patch.object(time,'sleep'):self.run_check()
+        self.assertEqual([m['title'] for m in self.plugin.data['_messages']],['【RSS剧集优选】媒体库查询失败'])
+    def test_rss_failure_is_retried_once(self):
+        results=iter([False,[{'title':'x'}]])
+        ns['RssHelper']=lambda:SimpleNamespace(parse=lambda *a,**k:next(results))
+        plugin=Plugin(); plugin._proxy=False
+        with patch.object(time,'sleep') as sleep:
+            self.assertEqual(plugin._RssEpisodeQuality__fetch_rss('https://x.invalid/?passkey=1'),[{'title':'x'}])
+        sleep.assert_called_once()
+    def test_rss_failure_twice_gives_up(self):
+        ns['RssHelper']=lambda:SimpleNamespace(parse=lambda *a,**k:False)
+        plugin=Plugin(); plugin._proxy=False
+        with patch.object(time,'sleep'):
+            self.assertEqual(plugin._RssEpisodeQuality__fetch_rss('https://x.invalid/'),[])
+    def test_expired_rss_is_not_retried(self):
+        calls=[]
+        ns['RssHelper']=lambda:SimpleNamespace(parse=lambda *a,**k:(calls.append(1),None)[1])
+        plugin=Plugin(); plugin._proxy=False
+        with patch.object(time,'sleep'):plugin._RssEpisodeQuality__fetch_rss('https://x.invalid/')
+        self.assertEqual(len(calls),1)
+
 if __name__=='__main__':unittest.main()
