@@ -38,7 +38,8 @@ class Download:
     def download_torrent(self,info):
         from torrentool.api import Torrent
         names=[f'Show.S01E{i:02}.2160p.WEB-DL.mkv' for i in range(1,13)]
-        return Torrent({'info':{'name':'Show','files':[{'length':1,'path':[name]} for name in names],
+        # Different releases are different torrents; the same release from two sites is identical.
+        return Torrent({'info':{'name':getattr(info,'title',None) or 'Show','files':[{'length':1,'path':[name]} for name in names],
                       'piece length':16384,'pieces':b'0'*20}}).to_string(),'Show',names
 class Subscribe:
     calls=[]
@@ -64,7 +65,7 @@ ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tu
     'MediaType':MediaType,'logger':Mock(),'time':time,'json':json,'re':re,'traceback':__import__('traceback'),
     'MediaServerHelper':MediaHelper,'DownloaderHelper':DownloadHelper,
     'query_library':Mock(),'Library':engine.Library,'UncertainLibrary':engine.UncertainLibrary,
-    'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,
+    'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,'TARGETS':engine.TARGETS,
     'file_scope':engine.file_scope,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
     'Context':SimpleNamespace,'TorrentInfo':TorrentInfo,'MediaInfo':SimpleNamespace,
     'SystemConfigKey':SimpleNamespace(SubscribeFilterRuleGroups='rules'),
@@ -225,14 +226,14 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(config['absence_minutes'],1); self.assertEqual(config['mode'],'missing')
     def test_ui_roundtrips_all_policy_fields(self):
         form, defaults=self.plugin.get_form()
-        self.assertEqual(defaults['mode'],'missing')
+        self.assertEqual(defaults['mode'],'chase')
         def models(nodes):
             result=set()
             for node in nodes:
                 if 'model' in node.get('props',{}):result.add(node['props']['model'])
                 result.update(models(node.get('content',[]) if isinstance(node.get('content',[]),list) else []))
             return result
-        expected={'library_servers','mode','upgrade_policy','query_retries','absence_minutes','pending_hours'}
+        expected={'library_servers','mode','upgrade_policy','query_retries','absence_minutes','pending_hours','target_quality','max_downloads'}
         self.assertTrue(expected<=models(form)); self.assertTrue(expected<=set(defaults))
         self.plugin._RssEpisodeQuality__update_config(); self.assertTrue(expected<=set(self.plugin.saved_config))
     # ---- 1.2.0 ----
@@ -366,6 +367,93 @@ class PluginTests(unittest.TestCase):
     def test_episode_formatter(self):
         fmt=self.plugin._RssEpisodeQuality__format_episodes
         self.assertEqual(fmt([1,2,3,5,7,8]),'E01-E03, E05, E07-E08')
+    # ---- 1.3.0 追更优先 ----
+    def feed(self,*titles):
+        self.plugin._RssEpisodeQuality__fetch_rss=lambda url:[
+            {'title':t,'description':'','enclosure':f'https://feed.invalid/{i}/{t}','size':1} for i,t in enumerate(titles)]
+    def chase_library(self,uhd=()):
+        def version(i):
+            h,w,tag=(2160,3840,'2160p') if i in uhd else (1080,1920,'1080p')
+            return [{'Path':f'Show.S01E{i:02}.{tag}.WEB-DL.mkv',
+                     'MediaStreams':[{'Type':'Video','Height':h,'Width':w,'VideoRange':'SDR'}]}]
+        return lambda last: engine.Library({(1,i):version(i) for i in range(1,last+1)})
+    def chase(self):
+        self.plugin._mode='chase'; self.plugin._target_quality='2160p'; self.plugin._max_downloads=2
+    def test_chase_fast_then_single_upgrade_then_stop(self):
+        self.chase(); lib=self.chase_library()
+        qb=DownloadHelper.services['QB'].instance
+        clock=Mock(return_value=100000)
+        with patch.object(time,'time',clock):
+            # E11 appears in 1080p only: download it right away.
+            self.feed('Show.S01E11.1080p.WEB-DL'); ns['query_library'].return_value=lib(10); self.run_check()
+            self.assertEqual([c['episodes'] for c in Download.calls],[{11}])
+            # 10 minutes later: imported and finished, 4K shows up -> upgrade without waiting 6 hours.
+            clock.return_value=100600; qb.get_torrents.return_value=([{'progress':1.0}],False)
+            self.feed('Show.S01E11.1080p.WEB-DL','Show.S01E11.2160p.WEB-DL')
+            ns['query_library'].return_value=lib(11); self.run_check()
+            self.assertEqual(len(Download.calls),2)
+            self.assertIn('2160p',Download.calls[1]['context'].torrent_info.title)
+            # The "4K" was mislabeled (library still 1080p); another 4K source must not trigger a 3rd download.
+            clock.return_value=200000; qb.get_torrents.return_value=([],False)
+            self.feed('Show.S01E11.2160p.HDR.WEB-DL'); self.run_check()
+        self.assertEqual(len(Download.calls),2)
+        self.assertIn('最多下载次数',self.plugin.data['decisions_v1'][-1]['reasons']['11'])
+    def test_chase_same_run_downloads_only_the_best(self):
+        self.chase()
+        self.feed('Show.S01E11.1080p.WEB-DL','Show.S01E11.2160p.WEB-DL','Show.S01E11.720p.HDTV')
+        ns['query_library'].return_value=self.chase_library()(10)
+        DownloadHelper.services['QB'].instance.get_torrents.return_value=([{'progress':0.1}],False)
+        self.run_check()
+        self.assertEqual(len(Download.calls),1)
+        self.assertIn('2160p',Download.calls[0]['context'].torrent_info.title)
+    def test_chase_skips_intermediate_tiers(self):
+        self.chase()
+        self.feed('Show.S01E05.1080p.HDR.BluRay')
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertFalse(Download.calls)
+        self.assertIn('等待更高画质',self.plugin.data['decisions_v1'][-1]['reasons']['5'])
+    def test_chase_never_touches_episodes_at_target(self):
+        self.chase()
+        self.feed('Show.S01E05.2160p.DV.REMUX')
+        ns['query_library'].return_value=self.chase_library(uhd={5})(10); self.run_check()
+        self.assertFalse(Download.calls)
+    def test_chase_does_not_upgrade_while_low_version_downloading(self):
+        self.chase(); lib=self.chase_library()
+        qb=DownloadHelper.services['QB'].instance
+        self.feed('Show.S01E11.1080p.WEB-DL'); ns['query_library'].return_value=lib(10); self.run_check()
+        qb.get_torrents.return_value=([{'progress':0.4}],False)
+        self.feed('Show.S01E11.2160p.WEB-DL'); self.run_check()
+        self.assertEqual(len(Download.calls),1)
+    def test_chase_waits_for_import_before_upgrade(self):
+        # Finished downloading but not yet in the library: keep protection.
+        self.chase(); lib=self.chase_library()
+        qb=DownloadHelper.services['QB'].instance
+        self.feed('Show.S01E11.1080p.WEB-DL'); ns['query_library'].return_value=lib(10); self.run_check()
+        qb.get_torrents.return_value=([{'progress':1.0}],False)
+        self.feed('Show.S01E11.2160p.WEB-DL'); self.run_check()
+        self.assertEqual(len(Download.calls),1)
+    def test_chase_refill_after_delete_ignores_cap(self):
+        self.chase(); self.plugin._max_downloads=1
+        clock=Mock(return_value=100000)
+        with patch.object(time,'time',clock):
+            self.feed('Show.S01E11.2160p.WEB-DL'); ns['query_library'].return_value=self.chase_library()(10)
+            self.run_check()
+            DownloadHelper.services['QB'].instance.get_torrents.return_value=([],False)
+            clock.return_value=200000; self.run_check()
+        self.assertEqual(len(Download.calls),2)
+    def test_hdr_target(self):
+        self.chase(); self.plugin._target_quality='2160p_hdr'
+        self.feed('Show.S01E05.2160p.HDR.WEB-DL')
+        ns['query_library'].return_value=self.chase_library(uhd={5})(10); self.run_check()
+        self.assertEqual(Download.calls[0]['episodes'],{5})
+    def test_old_default_config_migrates_to_chase(self):
+        self.plugin.init_plugin({'enabled':True,'mode':'missing'})
+        self.assertEqual(self.plugin._mode,'chase'); self.assertEqual(self.plugin.saved_config['mode'],'chase')
+        self.assertEqual(self.plugin.saved_config['target_quality'],'2160p')
+    def test_explicit_choices_are_not_migrated(self):
+        self.plugin.init_plugin({'enabled':True,'mode':'upgrade'}); self.assertEqual(self.plugin._mode,'upgrade')
+        self.plugin.init_plugin({'enabled':True,'mode':'missing','target_quality':'2160p'})
+        self.assertEqual(self.plugin._mode,'missing')
     def test_audit_page_without_download_history(self):
         ns['query_library'].side_effect=engine.UncertainLibrary('offline')
         with patch.object(time,'sleep'):self.run_check()

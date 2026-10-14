@@ -135,6 +135,24 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(e.decide([1],1,self.library((1080,-1,2)),(2160,0,2),lambda q:q,'upgrade',(0,1)).selected)
     def test_deleted_episode_not_permanently_blocked_by_history(self):
         self.assertEqual(e.decide([1],1,e.Library(),(1080,0,2),lambda q:q).selected,{1})
+    def chase(self, existing, candidate, target='2160p'):
+        lib = e.Library({(1, 1): existing})
+        return e.decide([1], 1, lib, candidate, lambda q: q, 'chase', target=e.TARGETS[target])
+    def test_chase_upgrades_straight_to_target(self):
+        self.assertEqual(self.chase([(1080, 0, 2)], (2160, 0, 2)).upgrades, {1})
+    def test_chase_ignores_intermediate_tier(self):
+        self.assertFalse(self.chase([(720, 0, 1)], (1080, 1, 3)).selected)
+    def test_chase_any_version_at_target_stops(self):
+        self.assertFalse(self.chase([(1080, 0, 2), (2160, 0, 2)], (2160, 1, 4)).selected)
+    def test_chase_hdr_target(self):
+        self.assertEqual(self.chase([(2160, 0, 2)], (2160, 1, 2), '2160p_hdr').upgrades, {1})
+        self.assertFalse(self.chase([(2160, 0, 2)], (2160, 0, 4), '2160p_hdr').selected)
+    def test_chase_unknown_existing_quality_is_kept(self):
+        self.assertFalse(self.chase([None], (2160, 0, 2)).selected)
+        self.assertFalse(self.chase([(2160, -1, 2)], (2160, 1, 2), '2160p_hdr').selected)
+    def test_chase_missing_episode_downloads_any_quality(self):
+        p = e.decide([2], 1, e.Library({(1, 1): [(1080, 0, 2)]}), (720, 0, 1), lambda q: q, 'chase', target=e.TARGETS['2160p'])
+        self.assertEqual(p.missing, {2})
     def test_actual_stream_height_overrides_filename(self):
         q=e.quality('Show.1080p.WEB-DL.mkv',{'MediaSources':[{'MediaStreams':[{'Type':'Video','Height':1600,'Width':3840,'VideoRange':'HDR'}]}]})
         self.assertEqual(q,(2160,1,2))

@@ -24,7 +24,7 @@ from app.sdk.services import RuleHelper, MediaServerHelper, DownloaderHelper
 from app.plugins import _PluginBase
 from app.schemas.types import MediaSource, SystemConfigKey, MediaType
 
-from .engine import Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO
+from .engine import Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO, TARGETS
 from .adapters import query_library, submit_selected
 
 lock = Lock()
@@ -127,11 +127,11 @@ class RssEpisodeQuality(_PluginBase):
     # 插件名称
     plugin_name = "RSS剧集优选"
     # 插件描述
-    plugin_desc = "跨 RSS 源优选剧集，严格媒体库查重、缺集选下、可配置实际版本升级，不发送系统通知。"
+    plugin_desc = "追更优先：新集立即下载，之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本）、整包只选缺集，不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -171,6 +171,8 @@ class RssEpisodeQuality(_PluginBase):
     _query_retries: int = 3
     _absence_minutes: int = 10
     _pending_hours: int = 6
+    _target_quality: str = "2160p"
+    _max_downloads: int = 2
     # 详情页最多展示的历史卡片数（存储上限仍为 _history_limit）
     _history_page_limit: int = 100
     # 单轮运行内的决策缓冲与去重状态
@@ -184,7 +186,13 @@ class RssEpisodeQuality(_PluginBase):
         self.stop_service()
 
         # 配置
+        migrate = False
         if config:
+            migrate ="target_quality" not in config and (config.get("mode") or "missing") == "missing"
+            if migrate:
+                # 1.3.0 起默认“追更优先”；仅迁移仍停留在旧默认值“只补缺集”的配置
+                config["mode"] = "chase"
+                logger.info("RSS剧集优选：下载模式已从旧默认“只补缺集”切换为“追更优先”")
             self.__validate_and_fix_config(config=config)
             self._enabled = config.get("enabled")
             self._cron = config.get("cron")
@@ -207,6 +215,8 @@ class RssEpisodeQuality(_PluginBase):
             self._query_retries = int(config.get("query_retries", 3))
             self._absence_minutes = int(config.get("absence_minutes", 10))
             self._pending_hours = int(config.get("pending_hours", 6))
+            self._target_quality = config.get("target_quality") or "2160p"
+            self._max_downloads = int(config.get("max_downloads", 2))
 
         self.__migrate_history_identity()
 
@@ -222,6 +232,9 @@ class RssEpisodeQuality(_PluginBase):
             if self._scheduler.get_jobs():
                 self._scheduler.print_jobs()
                 self._scheduler.start()
+
+        if config and migrate:
+            self.__update_config()
 
         if self._onlyonce or self._clear:
             # 关闭一次性开关
@@ -625,8 +638,15 @@ class RssEpisodeQuality(_PluginBase):
             'content': [{'component': 'VCardText', 'content': [
                 {'component': 'VTextField', 'props': {'model': 'library_servers', 'label': '查重媒体服务器名称（逗号分隔；留空使用全部启用服务）'}},
                 {'component': 'VSelect', 'props': {'model': 'mode', 'label': '下载模式', 'items': [
-                    {'title': '只补缺集', 'value': 'missing'}, {'title': '补缺集并允许实际版本升级', 'value': 'upgrade'}]}},
-                {'component': 'VSelect', 'props': {'model': 'upgrade_policy', 'label': '升级判断', 'items': [
+                    {'title': '追更优先：新集立即下，之后只升级一次到目标画质', 'value': 'chase'},
+                    {'title': '只补缺集', 'value': 'missing'},
+                    {'title': '补缺集并允许逐档升级', 'value': 'upgrade'}]}},
+                {'component': 'VSelect', 'props': {'model': 'target_quality', 'label': '目标画质（追更优先模式）', 'items': [
+                    {'title': '2160p', 'value': '2160p'},
+                    {'title': '2160p 且 HDR/杜比视界', 'value': '2160p_hdr'},
+                    {'title': '1080p', 'value': '1080p'}]}},
+                {'component': 'VTextField', 'props': {'model': 'max_downloads', 'label': '每集最多下载次数（追更优先模式，含首次，1–5）', 'type': 'number'}},
+                {'component': 'VSelect', 'props': {'model': 'upgrade_policy', 'label': '升级判断（逐档升级模式）', 'items': [
                     {'title': '分辨率与HDR均不降级，至少一项提升', 'value': 'balanced'},
                     {'title': '只比较分辨率（可能改变HDR版本）', 'value': 'resolution'},
                     {'title': '同时比较分辨率、HDR与来源档次', 'value': 'source'}]}},
@@ -650,7 +670,8 @@ class RssEpisodeQuality(_PluginBase):
             "action": "download",
             "save_path": "",
             "size_range": "",
-            "library_servers": "", "mode": "missing", "upgrade_policy": "balanced",
+            "library_servers": "", "mode": "chase", "upgrade_policy": "balanced",
+            "target_quality": "2160p", "max_downloads": 2,
             "query_retries": 3, "absence_minutes": 10, "pending_hours": 6,
         }
 
@@ -683,7 +704,7 @@ class RssEpisodeQuality(_PluginBase):
             time_str = history.get("time")
             episodes = history.get("selected_episodes") or []
             upgrades = history.get("upgrade_episodes") or []
-            mode = {"missing": "补缺集", "upgrade": "补缺集+升级"}.get(history.get("download_mode"), "")
+            mode = {"missing": "补缺集", "upgrade": "补缺集+升级", "chase": "追更优先"}.get(history.get("download_mode"), "")
             episode_text = f"选集：{self.__format_episodes(episodes)}" if episodes else "选集：-"
             if upgrades:
                 episode_text += f"（升级：{self.__format_episodes(upgrades)}）"
@@ -884,6 +905,8 @@ class RssEpisodeQuality(_PluginBase):
             "query_retries": self._query_retries,
             "absence_minutes": self._absence_minutes,
             "pending_hours": self._pending_hours,
+            "target_quality": self._target_quality,
+            "max_downloads": self._max_downloads,
         })
 
     def __audit(self, media, title, status, key=None, **details):
@@ -1114,6 +1137,44 @@ class RssEpisodeQuality(_PluginBase):
             raise UnsafeSelection("种子不是明确单季资源")
         season, episodes = next(iter(season_episodes.items()))
         return content, season, sorted(episodes)
+
+    def __task_downloading(self, record, services, cache) -> bool:
+        """True while the submitted task still has data to fetch; raises when unknown."""
+        identity = (record.get("downloader"), record.get("hash"))
+        if not all(identity) or identity[0] not in services:
+            raise UncertainLibrary("已提交记录对应下载器不可用")
+        if identity not in cache:
+            tasks, error = services[identity[0]].instance.get_torrents(ids=identity[1])
+            if error or tasks is None:
+                raise UncertainLibrary("无法查询已提交任务状态")
+            cache[identity] = tasks
+        progress = [float(task.get("progress", -1)) for task in cache[identity]]
+        if any(not 0 <= value <= 1 for value in progress):
+            raise UncertainLibrary("下载任务进度无效")
+        return any(value < 1 for value in progress)
+
+    def __released_by_import(self, record, library, season, episode, services, cache) -> bool:
+        """入库即解除保护：库里已有不低于该次提交分辨率的版本，且任务不在下载中。
+
+        这样升级版本不必等满“已提交任务重复保护”时长；查询失败时保持保护。
+        """
+        versions = library.episodes.get((season, episode), [])
+        if not versions:
+            return False
+        expected = record.get("quality")
+        if isinstance(expected, (list, tuple)) and expected and isinstance(expected[0], int) and expected[0] > 0:
+            reached = False
+            for item in versions:
+                actual = quality(str(item.get("Path") or item.get("Name") or ""), item)
+                if actual is not None and actual[0] >= expected[0]:
+                    reached = True
+                    break
+            if not reached:
+                return False
+        try:
+            return not self.__task_downloading(record, services, cache)
+        except (UncertainLibrary, TypeError, ValueError):
+            return False
 
     def __pending_active(self, record, services, cache):
         identity = (record.get("downloader"), record.get("hash"))
@@ -1363,16 +1424,25 @@ class RssEpisodeQuality(_PluginBase):
                 season = int(meta.begin_season)
                 for episode in requested:
                     pending_key = self.__episode_key(mediainfo, season, episode)
+                    if pending_key in ledger and self.__released_by_import(
+                            ledger[pending_key], library, season, episode, download_services, pending_cache):
+                        del ledger[pending_key]
+                        continue
                     if (season, episode) in library.episodes and pending_key in ledger:
                         record = ledger[pending_key]
                         if (time.time() - float(record.get("submitted_at", 0)) >= self._pending_hours * 3600
                                 and not self.__pending_active(record, download_services, pending_cache)):
                             del ledger[pending_key]
                 candidate = quality(title)
-                axes = {"resolution": (0,), "balanced": (0, 1), "source": (0, 1, 2)}[self._upgrade_policy]
+                if self._mode == "chase":
+                    target = TARGETS.get(self._target_quality, TARGETS["2160p"])
+                    axes = (0, 1) if target[1] else (0,)
+                else:
+                    target = None
+                    axes = {"resolution": (0,), "balanced": (0, 1), "source": (0, 1, 2)}[self._upgrade_policy]
                 plan = decide(requested, season, library, candidate,
                               lambda item: quality(str(item.get("Path") or item.get("Name") or ""), item),
-                              mode=self._mode, upgrade_axes=axes)
+                              mode=self._mode, upgrade_axes=axes, target=target)
                 # Any in-flight download protects its episodes across RSS sources, even if
                 # a better candidate arrives; reconsider upgrades after transfer or expiry.
                 blocked = []
@@ -1393,6 +1463,13 @@ class RssEpisodeQuality(_PluginBase):
                     if any(item.get("rss") == rss_key for item in tried):
                         plan.selected.discard(ep)
                         plan.reasons[str(ep)] = "已从该资源下载过但库内画质仍低于其标题，疑似标题虚标，不再重复升级"
+                # 追更优先：每集下载次数（含首次）达到上限后不再升级；缺集补回不受限制
+                if self._mode == "chase":
+                    for ep in sorted(plan.upgrades & plan.selected):
+                        count = len(upgrade_attempts.get(self.__episode_key(mediainfo, season, ep), []))
+                        if count >= self._max_downloads:
+                            plan.selected.discard(ep)
+                            plan.reasons[str(ep)] = f"已达每集最多下载次数（{count}/{self._max_downloads}）"
                 selected = plan.selected
 
                 def plan_details():
@@ -1561,16 +1638,19 @@ class RssEpisodeQuality(_PluginBase):
         """
         config = config if config is not None else {}
         for key, default, minimum, maximum in [("query_retries", 3, 1, 5),
-                ("absence_minutes", 10, 1, 120), ("pending_hours", 6, 1, 72)]:
+                ("absence_minutes", 10, 1, 120), ("pending_hours", 6, 1, 72),
+                ("max_downloads", 2, 1, 5)]:
             try:
                 value = int(config.get(key, default))
                 config[key] = max(minimum, min(maximum, value))
             except (TypeError, ValueError):
                 config[key] = default
-        if config.get("mode") not in ("missing", "upgrade"):
+        if config.get("mode") not in ("missing", "upgrade", "chase"):
             config["mode"] = "missing"
         if config.get("upgrade_policy") not in ("resolution", "balanced", "source"):
             config["upgrade_policy"] = "balanced"
+        if config.get("target_quality") not in TARGETS:
+            config["target_quality"] = "2160p"
         for key in ("include", "exclude"):
             pattern = config.get(key)
             if pattern:

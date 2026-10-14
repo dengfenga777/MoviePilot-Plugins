@@ -164,7 +164,26 @@ class Plan:
     reasons: dict = field(default_factory=dict)
 
 
-def decide(requested, season, library, candidate_quality, quality_of, mode='missing', upgrade_axes=(0,)):
+# Chase-mode targets: (minimum resolution, HDR/Dolby Vision required)
+TARGETS = {'2160p': (2160, False), '2160p_hdr': (2160, True), '1080p': (1080, False)}
+
+
+def meets_target(q, target):
+    """True/False when known; None when the needed facts are unknown."""
+    if q is None:
+        return None
+    resolution, need_hdr = target
+    if q[0] < resolution:
+        return False
+    if need_hdr:
+        if q[1] < 0:
+            return None
+        return q[1] == 1
+    return True
+
+
+def decide(requested, season, library, candidate_quality, quality_of, mode='missing', upgrade_axes=(0,),
+           target=None):
     plan = Plan()
     for ep in sorted(set(requested)):
         versions = library.episodes.get((season, ep), [])
@@ -172,6 +191,25 @@ def decide(requested, season, library, candidate_quality, quality_of, mode='miss
             plan.selected.add(ep)
             plan.missing.add(ep)
             plan.reasons[str(ep)] = '缺集'
+            continue
+        if mode == 'chase':
+            # Speed first, quality second: an existing episode is only replaced once, straight to
+            # the target tier. Intermediate tiers are never downloaded.
+            if target is None:
+                raise ValueError('追更优先模式缺少目标画质')
+            reached = [meets_target(quality_of(item), target) for item in versions]
+            if any(value is True for value in reached):
+                plan.reasons[str(ep)] = '已达到目标画质'
+                continue
+            if any(value is None for value in reached):
+                plan.reasons[str(ep)] = '已有版本画质未知，保留已有版本'
+                continue
+            if meets_target(candidate_quality, target) is not True:
+                plan.reasons[str(ep)] = '候选未达到目标画质，等待更高画质'
+                continue
+            plan.selected.add(ep)
+            plan.upgrades.add(ep)
+            plan.reasons[str(ep)] = '升级到目标画质'
             continue
         if mode != 'upgrade':
             plan.reasons[str(ep)] = '媒体库已有'
