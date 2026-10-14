@@ -25,7 +25,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaSource, SystemConfigKey, MediaType, MessageType
 
 from .engine import (Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO,
-                     TARGETS, meets_target, site_score)
+                     TARGETS, meets_target, site_score, is_special)
 from .adapters import query_library, submit_selected
 
 lock = Lock()
@@ -43,6 +43,9 @@ LIBRARY_DATA_ERRORS = ("缺少可信季集编号", "缺少媒体ID")
 # 已提交任务停滞多久后不再阻挡其他来源（追新优先：宁可换源也不干等）
 STALL_MINUTES = 30
 STALLED_STATES = ("stalleddl", "metadl", "forcedmetadl", "error", "missingfiles", "pauseddl", "stoppeddl")
+# 综艺：MoviePilot 默认二级分类名与 TMDB 真人秀/脱口秀类型；集号常混乱（上下期、加更、第0期）
+VARIETY_CATEGORY = "综艺"
+VARIETY_GENRES = {10764, 10767}
 # RSS 请求失败后的重试间隔（秒）
 RSS_RETRY_SECONDS = 5
 _SECRET_PARAM = re.compile(r"((?:passkey|apikey|api_key|token|authkey|rsskey|sign|uid|key)=)[^&\s]+", re.IGNORECASE)
@@ -158,7 +161,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -192,6 +195,7 @@ class RssEpisodeQuality(_PluginBase):
     _smart_quality: bool = True
     _skip_unknown_episodes: bool = True
     _pack_chase: bool = True
+    _exclude_variety: bool = True
     _history_limit: int = 1000
     _library_servers: str = ""
     _mode: str = "missing"
@@ -235,6 +239,7 @@ class RssEpisodeQuality(_PluginBase):
             self._smart_quality = config.get("smart_quality", True)
             self._skip_unknown_episodes = config.get("skip_unknown_episodes", True)
             self._pack_chase = config.get("pack_chase", True)
+            self._exclude_variety = config.get("exclude_variety", True)
             self._clear = config.get("clear")
             self._action = config.get("action") or "download"
             self._save_path = str(config.get("save_path") or "").strip()
@@ -671,6 +676,17 @@ class RssEpisodeQuality(_PluginBase):
                                     },
                                 }],
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'exclude_variety',
+                                        'label': '排除综艺（综艺集号混乱，交给其他订阅处理）',
+                                    },
+                                }],
+                            },
                         ],
                     }
                 ]
@@ -715,6 +731,7 @@ class RssEpisodeQuality(_PluginBase):
             "smart_quality": True,
             "skip_unknown_episodes": True,
             "pack_chase": True,
+            "exclude_variety": True,
             "action": "download",
             "save_path": "",
             "size_range": "",
@@ -948,6 +965,7 @@ class RssEpisodeQuality(_PluginBase):
             "smart_quality": self._smart_quality,
             "skip_unknown_episodes": self._skip_unknown_episodes,
             "pack_chase": self._pack_chase,
+            "exclude_variety": self._exclude_variety,
             "action": self._action,
             "save_path": self._save_path,
             "size_range": self._size_range,
@@ -1014,7 +1032,7 @@ class RssEpisodeQuality(_PluginBase):
     def __config_fingerprint(self, filter_groups) -> str:
         """Cached negative results are only valid for the settings that produced them."""
         return self.__digest(json.dumps([self._include, self._exclude, self._filter, filter_groups,
-                                         self._size_range, self._skip_unknown_episodes, self._pack_chase,
+                                         self._size_range, self._skip_unknown_episodes, self._pack_chase, self._exclude_variety,
                                          self._smart_quality, self._action, self._mode,
                                          self._target_quality, self._upgrade_policy, self._max_downloads,
                                          self._library_servers], default=str))
@@ -1105,6 +1123,8 @@ class RssEpisodeQuality(_PluginBase):
                 if attempt + 1 == self._query_retries:
                     raise LibraryUnavailable(str(err)) from err
                 time.sleep(1)
+        if getattr(library, "unplaced", 0):
+            logger.warning(f"{media.title_year} 媒体库有 {library.unplaced} 个条目无法确定季集，已忽略；其余集数照常判断")
         coverage = library.coverage()
         if previous and any(not set(episodes).issubset(set(coverage.get(season, [])))
                             for season, episodes in previous["coverage"].items()):
@@ -1195,7 +1215,7 @@ class RssEpisodeQuality(_PluginBase):
         torrent = Torrent.from_string(content)
         season_episodes = {}
         for file in torrent.files:
-            if Path(file.name).suffix.lower() not in VIDEO:
+            if Path(file.name).suffix.lower() not in VIDEO or is_special(file.name):
                 continue
             season, episodes = file_scope(file.name, None)
             if season is None or not episodes:
@@ -1264,6 +1284,16 @@ class RssEpisodeQuality(_PluginBase):
             return False
         return any(value < 1 for value in progress) or (
             time.time() - float(record.get("submitted_at", 0)) < self._pending_hours * 3600)
+
+    @staticmethod
+    def __is_variety(mediainfo) -> bool:
+        if (getattr(mediainfo, "category", None) or "") == VARIETY_CATEGORY:
+            return True
+        try:
+            genres = {int(g) for g in (getattr(mediainfo, "genre_ids", None) or [])}
+        except (TypeError, ValueError):
+            return False
+        return bool(genres & VARIETY_GENRES)
 
     @staticmethod
     def __pack_floor(library, season):
@@ -1410,6 +1440,10 @@ class RssEpisodeQuality(_PluginBase):
                 if mediainfo.type != MediaType.TV:
                     logger.info(f"{title} - RSS剧集优选仅处理电视剧，跳过{mediainfo.type.value}")
                     self.__remember_skip(skip_cache, rss_key, "非电视剧", 24)
+                    continue
+                if self._exclude_variety and self.__is_variety(mediainfo):
+                    logger.debug(f"{title} - 综艺不处理（集号混乱），跳过")
+                    self.__remember_skip(skip_cache, rss_key, "综艺不处理", 24)
                     continue
                 # 种子
                 torrentinfo = TorrentInfo(

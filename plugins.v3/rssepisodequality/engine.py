@@ -19,6 +19,8 @@ class Library:
     # All versions of an episode must participate in comparisons.
     episodes: dict = field(default_factory=dict)
     servers: tuple = ()
+    # 无法确定季集的条目数（已忽略，不阻止整部剧）
+    unplaced: int = 0
 
     def coverage(self):
         result = {}
@@ -144,17 +146,53 @@ class EmbyLibrary:
                 'Fields': 'MediaSources,MediaStreams,Path,ProviderIds',
             })
             for item in episodes:
-                season, episode = item.get('ParentIndexNumber'), item.get('IndexNumber')
-                end = item.get('IndexNumberEnd', episode)
-                if (isinstance(season, bool) or not isinstance(season, int) or season < 0
-                        or isinstance(episode, bool) or not isinstance(episode, int) or episode <= 0
-                        or isinstance(end, bool) or not isinstance(end, int) or not episode <= end <= episode + 100):
-                    raise UncertainLibrary('媒体库剧集缺少可信季集编号')
                 if item.get('IsMissing') or item.get('IsVirtualItem'):
                     continue
-                for ep in range(episode, end + 1):
+                placed = episode_numbers(item)
+                if placed is None:
+                    # 一个条目认不出来只忽略它本身，不让整部剧的新集都下不了
+                    library.unplaced += 1
+                    continue
+                season, numbers = placed
+                for ep in numbers:
                     library.episodes.setdefault((season, ep), []).append(item)
+        if library.unplaced and not library.episodes:
+            # 全部认不出来更可能是媒体服务器返回异常，不能当成“一集都没有”去整季重下
+            raise UncertainLibrary('媒体库剧集缺少可信季集编号')
         return library
+
+
+def _valid_int(value, minimum):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def episode_numbers(item):
+    """媒体库条目的 (季, 集号列表)。
+
+    特别篇/先导集（第 0 集）返回空列表：不参与集数覆盖，也不算异常。
+    元数据缺编号时退回文件名里的明确 SxxEyy；仍不明确返回 None。
+    """
+    season, episode = item.get('ParentIndexNumber'), item.get('IndexNumber')
+    end = item.get('IndexNumberEnd', episode)
+    if _valid_int(season, 0) and episode == 0 and end in (0, None) and not isinstance(episode, bool):
+        return season, []
+    if _valid_int(season, 0) and _valid_int(episode, 1) and _valid_int(end, 1) and episode <= end <= episode + 100:
+        return season, list(range(episode, end + 1))
+    path = str(item.get('Path') or '')
+    if is_special(path):
+        return None
+    try:
+        file_season, numbers = file_scope(path, None) if path else (None, set())
+    except UnsafeSelection:
+        return None
+    if not _valid_int(file_season, 0) or not numbers:
+        return None
+    return file_season, sorted(numbers)
+
+
+def is_special(name):
+    """明确标为第 0 集（SxxE00）的特别篇/先导集。"""
+    return re.search(r'(?i)\bS\d{1,3}E0+(?!\d)', str(name or '')) is not None
 
 
 @dataclass
@@ -400,7 +438,7 @@ def select_files(files, season, selected):
         if path.is_absolute() or '..' in path.parts:
             raise UnsafeSelection('文件路径异常')
         suffix = path.suffix.lower()
-        if suffix not in VIDEO | SUBTITLES or re.search(r'(?i)(?:^|[/ ._-])(?:sample|trailer)(?:[/ ._-]|$)', name):
+        if suffix not in VIDEO | SUBTITLES or is_special(name) or re.search(r'(?i)(?:^|[/ ._-])(?:sample|trailer)(?:[/ ._-]|$)', name):
             disabled.append(file_id)
             continue
         file_season, episodes = (file_scope if suffix in VIDEO else subtitle_scope)(name, season)

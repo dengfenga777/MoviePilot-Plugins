@@ -114,6 +114,41 @@ class LibraryTests(unittest.TestCase):
             return self.payload([])
         with self.assertRaises(e.UncertainLibrary): self.query(request)
 
+    # ---- 1.5.0：第 0 集与缺编号条目不再阻止整部剧 ----
+    def lib_with(self, episodes):
+        def request(endpoint, params):
+            if endpoint == 'Items': return self.payload([self.series()])
+            return self.payload(episodes)
+        return self.query(request)
+    def test_episode_zero_special_is_ignored_not_fatal(self):
+        lib = self.lib_with([{'Id': 's', 'ParentIndexNumber': 6, 'IndexNumber': 0, 'Path': '/tv/披荆斩棘 S06E00 1080p.strm'},
+                             {'Id': 'a', 'ParentIndexNumber': 6, 'IndexNumber': 1}])
+        self.assertEqual(lib.coverage(), {'6': [1]}); self.assertEqual(lib.unplaced, 0)
+    def test_missing_numbers_fall_back_to_filename(self):
+        lib = self.lib_with([{'Id': 'a', 'ParentIndexNumber': None, 'IndexNumber': None,
+                              'Path': '/tv/Show/Season 1/Show.S01E07.2160p.WEB-DL.mkv'}])
+        self.assertEqual(lib.coverage(), {'1': [7]})
+    def test_unplaceable_item_is_counted_not_fatal(self):
+        lib = self.lib_with([{'Id': 'a', 'ParentIndexNumber': None, 'IndexNumber': None, 'Path': '/tv/Show/extra.mkv'},
+                             {'Id': 'b', 'ParentIndexNumber': 1, 'IndexNumber': 2}])
+        self.assertEqual(lib.coverage(), {'1': [2]}); self.assertEqual(lib.unplaced, 1)
+    def test_absurd_range_falls_back_to_filename(self):
+        lib = self.lib_with([{'Id': 'a', 'ParentIndexNumber': 1, 'IndexNumber': 3, 'IndexNumberEnd': 1, 'Path': 'Show.S01E03.mkv'}])
+        self.assertEqual(lib.coverage(), {'1': [3]})
+    def test_special_filename_never_counts_as_episode(self):
+        lib = self.lib_with([{'Id': 'a', 'ParentIndexNumber': None, 'IndexNumber': None, 'Path': 'Show.S01E00.mkv'},
+                             {'Id': 'b', 'ParentIndexNumber': 1, 'IndexNumber': 1}])
+        self.assertEqual(lib.coverage(), {'1': [1]}); self.assertEqual(lib.unplaced, 1)
+    def test_all_items_unplaceable_is_uncertain(self):
+        with self.assertRaises(e.UncertainLibrary):
+            self.lib_with([{'Id': 'a', 'Path': 'extra1.mkv'}, {'Id': 'b', 'Path': 'extra2.mkv'}])
+    def test_only_specials_is_empty_not_uncertain(self):
+        lib = self.lib_with([{'Id': 's', 'ParentIndexNumber': 1, 'IndexNumber': 0}])
+        self.assertEqual(lib.coverage(), {})
+    def test_is_special(self):
+        self.assertTrue(e.is_special('披荆斩棘 S06E00 2160p.strm'))
+        self.assertFalse(e.is_special('Show.S01E05.mkv')); self.assertFalse(e.is_special('Show.S01E001.mkv'))
+
 class DecisionTests(unittest.TestCase):
     def library(self, quality): return e.Library({(1, i): [quality] for i in range(1, 11)})
     def test_pack_only_selects_new_episodes(self):
@@ -159,6 +194,9 @@ class DecisionTests(unittest.TestCase):
 
 class SelectionTests(unittest.TestCase):
     def files(self, names): return [{'id':i,'name':name} for i,name in enumerate(names)]
+    def test_special_episode_file_is_skipped_not_fatal(self):
+        enabled, disabled=e.select_files(self.files(['Show.S01E00.mkv','Show.S01E11.mkv','Show.S01E12.mkv']),1,{11,12})
+        self.assertEqual(enabled,[1,2]); self.assertEqual(disabled,[0])
     def test_update_pack_and_subtitles(self):
         files=self.files([f'Show.S01E{i:02}.mkv' for i in range(1,13)]+['Show.S01E11.ass','readme.txt'])
         enabled, disabled=e.select_files(files,1,{11,12})

@@ -70,7 +70,7 @@ ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tu
     'MediaServerHelper':MediaHelper,'DownloaderHelper':DownloadHelper,
     'query_library':Mock(),'Library':engine.Library,'UncertainLibrary':engine.UncertainLibrary,
     'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,'TARGETS':engine.TARGETS,'meets_target':engine.meets_target,'site_score':engine.site_score,
-    'file_scope':engine.file_scope,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
+    'file_scope':engine.file_scope,'is_special':engine.is_special,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
     'Context':SimpleNamespace,'TorrentInfo':TorrentInfo,'MediaInfo':SimpleNamespace,
     'SystemConfigKey':SimpleNamespace(SubscribeFilterRuleGroups='rules'),
     'RuleHelper':object,'SilentDownloadChain':Download,'SilentSubscribeChain':Subscribe,
@@ -682,5 +682,37 @@ class PluginTests(unittest.TestCase):
         plugin=Plugin(); plugin._proxy=False
         with patch.object(time,'sleep'):plugin._RssEpisodeQuality__fetch_rss('https://x.invalid/')
         self.assertEqual(len(calls),1)
+
+    def test_pack_with_special_episode_still_chases(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        original=Download.download_torrent
+        def with_special(me,info):
+            from torrentool.api import Torrent
+            names=['Show.S01E00.2160p.WEB-DL.mkv']+[f'Show.S01E{i:02}.2160p.WEB-DL.mkv' for i in range(1,13)]
+            return Torrent({'info':{'name':'Show','files':[{'length':1,'path':[n]} for n in names],
+                           'piece length':16384,'pieces':b'0'*20}}).to_string(),'Show',names
+        Download.download_torrent=with_special
+        try:
+            ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        finally:
+            Download.download_torrent=original
+        self.assertEqual([c['episodes'] for c in Download.calls],[{11,12}])
+
+    def test_variety_category_is_skipped(self):
+        self.plugin.media.category='综艺'
+        ns['query_library'].return_value=engine.Library(); self.run_check(); self.run_check()
+        self.assertFalse(Download.calls); self.assertEqual(ns['query_library'].call_count,0)
+    def test_variety_genre_is_skipped(self):
+        self.plugin.media.genre_ids=[18,10764]
+        ns['query_library'].return_value=engine.Library(); self.run_check()
+        self.assertFalse(Download.calls); self.assertEqual(ns['query_library'].call_count,0)
+    def test_variety_allowed_when_switch_off(self):
+        self.plugin.media.category='综艺'; self.plugin._exclude_variety=False
+        ns['query_library'].return_value=self.library(); self.run_check()
+        self.assertEqual(Download.calls[0]['episodes'],{11,12})
+    def test_drama_is_not_variety(self):
+        self.plugin.media.genre_ids=[18,80]
+        ns['query_library'].return_value=self.library(); self.run_check()
+        self.assertEqual(len(Download.calls),1)
 
 if __name__=='__main__':unittest.main()
