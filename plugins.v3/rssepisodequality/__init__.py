@@ -43,9 +43,15 @@ LIBRARY_DATA_ERRORS = ("缺少可信季集编号", "缺少媒体ID")
 # 已提交任务停滞多久后不再阻挡其他来源（追新优先：宁可换源也不干等）
 STALL_MINUTES = 30
 STALLED_STATES = ("stalleddl", "metadl", "forcedmetadl", "error", "missingfiles", "pauseddl", "stoppeddl")
-# 综艺：MoviePilot 默认二级分类名与 TMDB 真人秀/脱口秀类型；集号常混乱（上下期、加更、第0期）
+# 综艺：MoviePilot 默认二级分类名与 TMDB 真人秀/脱口秀类型；集号常混乱（按日期、上下期、加更），认不出就放宽
 VARIETY_CATEGORY = "综艺"
 VARIETY_GENRES = {10764, 10767}
+# 库里没有的剧：只有本季首播不满 N 天（新剧/新季）才下整包；长年连播的季（如周播综艺）不整季下载
+NEW_SEASON_DAYS = 60
+# 综艺认不出集号时，直接下载只限视频文件不多于此数的小种子（单期或上下期）
+VARIETY_DIRECT_MAX_FILES = 4
+# 综艺直接下载后，同一 RSS 条目不再重复处理的时长（小时）
+VARIETY_DIRECT_HOURS = 7 * 24
 # RSS 请求失败后的重试间隔（秒）
 RSS_RETRY_SECONDS = 5
 _SECRET_PARAM = re.compile(r"((?:passkey|apikey|api_key|token|authkey|rsskey|sign|uid|key)=)[^&\s]+", re.IGNORECASE)
@@ -95,9 +101,14 @@ class SilentDownloadChain(DownloadChain):
     last_downloader = None
     last_error = None
     selection_upgrade = None
+    # 综艺直接下载：整个种子交给 MoviePilot 原生下载，不做严格选集
+    direct = False
 
     def download(self, content, download_dir, cookie=None, episodes=None, category=None,
                  label=None, downloader=None):
+        if self.direct:
+            return super().download(content, download_dir, cookie, episodes=episodes, category=category,
+                                    label=label, downloader=downloader)
         try:
             if self.selection_season is None or not episodes:
                 raise UnsafeSelection("没有明确选集计划，拒绝提交")
@@ -161,7 +172,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -195,7 +206,6 @@ class RssEpisodeQuality(_PluginBase):
     _smart_quality: bool = True
     _skip_unknown_episodes: bool = True
     _pack_chase: bool = True
-    _exclude_variety: bool = True
     _history_limit: int = 1000
     _library_servers: str = ""
     _mode: str = "missing"
@@ -239,7 +249,6 @@ class RssEpisodeQuality(_PluginBase):
             self._smart_quality = config.get("smart_quality", True)
             self._skip_unknown_episodes = config.get("skip_unknown_episodes", True)
             self._pack_chase = config.get("pack_chase", True)
-            self._exclude_variety = config.get("exclude_variety", True)
             self._clear = config.get("clear")
             self._action = config.get("action") or "download"
             self._save_path = str(config.get("save_path") or "").strip()
@@ -676,17 +685,6 @@ class RssEpisodeQuality(_PluginBase):
                                     },
                                 }],
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [{
-                                    'component': 'VSwitch',
-                                    'props': {
-                                        'model': 'exclude_variety',
-                                        'label': '排除综艺（综艺集号混乱，交给其他订阅处理）',
-                                    },
-                                }],
-                            },
                         ],
                     }
                 ]
@@ -731,7 +729,6 @@ class RssEpisodeQuality(_PluginBase):
             "smart_quality": True,
             "skip_unknown_episodes": True,
             "pack_chase": True,
-            "exclude_variety": True,
             "action": "download",
             "save_path": "",
             "size_range": "",
@@ -965,7 +962,6 @@ class RssEpisodeQuality(_PluginBase):
             "smart_quality": self._smart_quality,
             "skip_unknown_episodes": self._skip_unknown_episodes,
             "pack_chase": self._pack_chase,
-            "exclude_variety": self._exclude_variety,
             "action": self._action,
             "save_path": self._save_path,
             "size_range": self._size_range,
@@ -1032,7 +1028,7 @@ class RssEpisodeQuality(_PluginBase):
     def __config_fingerprint(self, filter_groups) -> str:
         """Cached negative results are only valid for the settings that produced them."""
         return self.__digest(json.dumps([self._include, self._exclude, self._filter, filter_groups,
-                                         self._size_range, self._skip_unknown_episodes, self._pack_chase, self._exclude_variety,
+                                         self._size_range, self._skip_unknown_episodes, self._pack_chase,
                                          self._smart_quality, self._action, self._mode,
                                          self._target_quality, self._upgrade_policy, self._max_downloads,
                                          self._library_servers], default=str))
@@ -1214,12 +1210,18 @@ class RssEpisodeQuality(_PluginBase):
             raise UnsafeSelection("无法取得可信种子文件集数，暂缓")
         torrent = Torrent.from_string(content)
         season_episodes = {}
-        for file in torrent.files:
-            if Path(file.name).suffix.lower() not in VIDEO or is_special(file.name):
-                continue
-            season, episodes = file_scope(file.name, None)
+        videos = [file for file in torrent.files
+                  if Path(file.name).suffix.lower() in VIDEO and not is_special(file.name)]
+        for file in videos:
+            try:
+                season, episodes = file_scope(file.name, None)
+            except UnsafeSelection as err:
+                err.video_count = len(videos)
+                raise
             if season is None or not episodes:
-                raise UnsafeSelection("种子视频文件没有明确季集编号")
+                err = UnsafeSelection("种子视频文件没有明确季集编号")
+                err.video_count = len(videos)
+                raise err
             season_episodes.setdefault(season, set()).update(episodes)
         if len(season_episodes) != 1:
             raise UnsafeSelection("种子不是明确单季资源")
@@ -1296,18 +1298,106 @@ class RssEpisodeQuality(_PluginBase):
         return bool(genres & VARIETY_GENRES)
 
     @staticmethod
-    def __pack_floor(library, season):
-        """整包追新只取“正在追的那一季里比库内最新一集更新的集”。
+    def __tmdb_latest_season(mediainfo):
+        raw = getattr(mediainfo, "tmdb_info", None)
+        raw = raw if isinstance(raw, dict) else {}
+        numbers = [info.get("season_number") for info in (getattr(mediainfo, "season_info", None)
+                                                            or raw.get("seasons") or [])
+                   if isinstance(info, dict)]
+        numbers = [n for n in numbers if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+        if numbers:
+            return max(numbers)
+        count = getattr(mediainfo, "number_of_seasons", None) or raw.get("number_of_seasons")
+        return count if isinstance(count, int) and count > 0 else None
+
+    @classmethod
+    def __new_season(cls, mediainfo, season, today=None) -> bool:
+        """TMDB 显示这一季是新剧/新季：首播不满 NEW_SEASON_DAYS 天，或 TMDB 还没收录这一季。
+
+        只认最新一季（季号未知按最新季）。长年连播的季即使还在更新也不算，免得整季下载几百期。
+        """
+        today = today or datetime.date.today()
+        raw = getattr(mediainfo, "tmdb_info", None)
+        raw = raw if isinstance(raw, dict) else {}
+        latest = cls.__tmdb_latest_season(mediainfo)
+        season = latest if season is None else int(season)
+        if season is None or (latest is not None and season < latest):
+            return False
+        if latest is not None and season > latest:
+            return True  # TMDB 还没收录这一季：只可能是刚出的新季
+        for info in (getattr(mediainfo, "season_info", None) or raw.get("seasons") or []):
+            if isinstance(info, dict) and info.get("season_number") == season:
+                try:
+                    premiered = (today - datetime.date.fromisoformat(str(info.get("air_date"))[:10])).days
+                except (TypeError, ValueError):
+                    return False
+                return 0 <= premiered <= NEW_SEASON_DAYS
+        return False
+
+    @staticmethod
+    def __latest_season(library):
+        seasons = sorted(int(s) for s, eps in library.coverage().items() if eps)
+        return seasons[-1] if seasons else None
+
+    @classmethod
+    def __variety_tracked(cls, library, season) -> bool:
+        """在追的综艺：库里已有这部综艺，且不是更旧的季（季号未知视为当前季）。"""
+        latest = cls.__latest_season(library)
+        return latest is not None and (season is None or int(season) >= latest)
+
+    def __variety_direct(self, context, rss_key, cause, downloadchain, download_services, skip_cache,
+                         history, site_label):
+        """综艺认不出集号时不做严格选集，整个种子交给 MoviePilot 原生下载。"""
+        mediainfo, torrentinfo = context.media_info, context.torrent_info
+        title = torrentinfo.title
+        downloader_name = getattr(torrentinfo, "site_downloader", None)
+        if not downloader_name:
+            defaults = [name for name, config in DownloaderHelper().get_configs().items() if config.default]
+            downloader_name = defaults[0] if len(defaults) == 1 else None
+        if not downloader_name or downloader_name not in download_services:
+            self.__audit(mediainfo, title, "deferred", key=rss_key, reason="下载器不可用，综艺直接下载暂缓")
+            return history
+        reason = f"综艺认不出集号（{cause}），直接下载整个种子"
+        downloadchain.direct = True
+        try:
+            result = downloadchain.download_single(context=context, save_path=self._save_path or None,
+                                                   downloader=downloader_name, username="RSS剧集优选")
+        finally:
+            downloadchain.direct = False
+        if not result:
+            self.__audit(mediainfo, title, "failed", key=rss_key,
+                         reason=getattr(downloadchain, "last_error", None) or "下载链未接受资源", site=site_label)
+            return history
+        self.__audit(mediainfo, title, "submitted", key=rss_key, torrent_hash=str(result), site=site_label,
+                     reasons={"variety": reason})
+        self.__remember_skip(skip_cache, rss_key, "综艺已直接下载", VARIETY_DIRECT_HOURS)
+        item = {"title": f"{mediainfo.title} {context.meta_info.season}", "key": rss_key, "rss_title": title,
+                "rss_description": torrentinfo.description or "", "rss_size": torrentinfo.size or 0,
+                "selected_episodes": [], "upgrade_episodes": [], "site": site_label,
+                "download_mode": "variety_direct", "action": self._action, "type": mediainfo.type.value,
+                "year": mediainfo.year, "poster": mediainfo.get_poster_image(), "overview": mediainfo.overview,
+                "media_source": mediainfo.media_source.value, "media_id": str(mediainfo.media_id),
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        item["record_id"] = self.__history_record_id(item)
+        history = [record for record in history if record.get("key") != rss_key] + [item]
+        self.__persist_history(history)
+        return history
+
+    @staticmethod
+    def __pack_floor(library, season, airing=False):
+        """整包追新只取“正在追/正在播的那一季里比库内最新一集更新的集”。
 
         返回 (起点集号, 原因)：库里该剧最新季 → 库内最大集号；更新的季 → 0（整季都是新集）；
-        库里没有这部剧或是更旧的季 → (None, 原因)，不下载整包。
+        库里没有这部剧：本季是近期开播的新剧/新季 → 0（整包照下），否则不下载；更旧的季 → 不下载。
         """
         coverage = library.coverage()
         seasons = sorted(int(s) for s, eps in coverage.items() if eps)
         if season is None:
             return None, "整包追新：无法确定季号"
         if not seasons:
-            return None, "整包追新：媒体库没有这部剧，不下载整包"
+            if airing:
+                return 0, ""
+            return None, "整包追新：库里没有这部剧，也不是近期开播的新剧/新季，不下载整包"
         latest = seasons[-1]
         if int(season) < latest:
             return None, "整包追新：不是正在追的最新季"
@@ -1441,10 +1531,6 @@ class RssEpisodeQuality(_PluginBase):
                     logger.info(f"{title} - RSS剧集优选仅处理电视剧，跳过{mediainfo.type.value}")
                     self.__remember_skip(skip_cache, rss_key, "非电视剧", 24)
                     continue
-                if self._exclude_variety and self.__is_variety(mediainfo):
-                    logger.debug(f"{title} - 综艺不处理（集号混乱），跳过")
-                    self.__remember_skip(skip_cache, rss_key, "综艺不处理", 24)
-                    continue
                 # 种子
                 torrentinfo = TorrentInfo(
                     title=title,
@@ -1493,7 +1579,7 @@ class RssEpisodeQuality(_PluginBase):
                 episode_keys = self.__episode_keys(meta, mediainfo) if smart else []
                 # 整包追新：标题只有单一季号的整季包/更新包放行到查库阶段，只取比库里更新的集
                 pack_chase = (smart and not episode_keys and self._pack_chase and self._mode == "chase"
-                              and getattr(meta, "begin_season", None) is not None
+                              and (getattr(meta, "begin_season", None) is not None or self.__is_variety(mediainfo))
                               and len(list(getattr(meta, "season_list", None) or [])) <= 1)
                 if smart and not episode_keys and self._skip_unknown_episodes and not pack_chase:
                     logger.info(f"{title} - 剧集优选：无法识别明确集数，跳过以免误下载整季/更新包")
@@ -1578,10 +1664,13 @@ class RssEpisodeQuality(_PluginBase):
                 chosen_season = meta.begin_season
                 # 走到这里且标题无集数：要么关闭了“跳过标题无集数资源”（整包取全部缺集），要么是整包追新
                 pack_chase = not requested and self._skip_unknown_episodes
+                # 综艺集号常不规范：在追的综艺认不出集号时放宽，直接下载整个种子
+                variety = pack_chase and self.__is_variety(mediainfo)
                 if not requested and len(seasons) <= 1:
                     if pack_chase:
-                        floor, why = self.__pack_floor(library, chosen_season)
-                        if floor is None:
+                        airing = self.__new_season(mediainfo, chosen_season)
+                        floor, why = self.__pack_floor(library, chosen_season, airing)
+                        if floor is None and not (variety and (airing or self.__variety_tracked(library, chosen_season))):
                             self.__audit(mediainfo, title, "skipped", key=rss_key, reasons={"pack": why})
                             self.__remember_skip(skip_cache, rss_key, why, SETTLED_SKIP_HOURS)
                             continue
@@ -1590,11 +1679,22 @@ class RssEpisodeQuality(_PluginBase):
                         meta.begin_season = chosen_season
                         meta.end_season = None
                     except UnsafeSelection as err:
+                        small = 0 < getattr(err, "video_count", 0) <= VARIETY_DIRECT_MAX_FILES
+                        if variety and small and (self.__new_season(mediainfo, meta.begin_season)
+                                                  or self.__variety_tracked(library, meta.begin_season)):
+                            history = self.__variety_direct(context, rss_key, str(err), downloadchain,
+                                                            download_services, skip_cache, history,
+                                                            site_labels.get(rss_key, ""))
+                            continue
                         self.__audit(mediainfo, title, "deferred", key=rss_key, reason=str(err))
                         continue
                     if pack_chase:
+                        if variety and chosen_season is None:
+                            # 文件只有集号没有季号：按库里或 TMDB 上的最新季处理
+                            chosen_season = self.__latest_season(library) or self.__tmdb_latest_season(mediainfo)
+                            meta.begin_season = chosen_season
                         # 种子内实际季号可能与标题不同，按实际季号重新确定起点
-                        floor, why = self.__pack_floor(library, chosen_season)
+                        floor, why = self.__pack_floor(library, chosen_season, self.__new_season(mediainfo, chosen_season))
                         requested = [ep for ep in requested if floor is not None and ep > floor]
                         if not requested:
                             why = why or "整包追新：没有比媒体库更新的集"

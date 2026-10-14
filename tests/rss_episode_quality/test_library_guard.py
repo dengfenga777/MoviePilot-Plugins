@@ -607,7 +607,7 @@ class PluginTests(unittest.TestCase):
         finally:
             Download.download_torrent=original
         self.assertFalse(Download.calls); self.assertFalse(fetched)
-        self.assertIn('媒体库没有这部剧',self.plugin.data['decisions_v1'][-1]['reasons']['pack'])
+        self.assertIn('近期开播',self.plugin.data['decisions_v1'][-1]['reasons']['pack'])
     def test_pack_chase_skips_older_season(self):
         self.chase(); self.feed('Show.S01.2160p.WEB-DL')
         ns['query_library'].return_value=engine.Library({(2,1):[{'Path':'Show.S02E01.2160p.mkv'}]}); self.run_check()
@@ -698,21 +698,102 @@ class PluginTests(unittest.TestCase):
             Download.download_torrent=original
         self.assertEqual([c['episodes'] for c in Download.calls],[{11,12}])
 
-    def test_variety_category_is_skipped(self):
-        self.plugin.media.category='综艺'
-        ns['query_library'].return_value=engine.Library(); self.run_check(); self.run_check()
-        self.assertFalse(Download.calls); self.assertEqual(ns['query_library'].call_count,0)
-    def test_variety_genre_is_skipped(self):
-        self.plugin.media.genre_ids=[18,10764]
+    def variety_pack(self, names):
+        """综艺整包：种子内文件名由调用方给定。"""
+        self.chase(); self.plugin.media.category='综艺'; self.feed('Show.S01.2160p.WEB-DL')
+        original=Download.download_torrent
+        def torrent(me,info):
+            from torrentool.api import Torrent
+            return Torrent({'info':{'name':'Show','files':[{'length':1,'path':[n]} for n in names],
+                           'piece length':16384,'pieces':b'0'*20}}).to_string(),'Show',names
+        Download.download_torrent=torrent
+        self.addCleanup(setattr,Download,'download_torrent',original)
+    def test_variety_with_episode_numbers_follows_drama_rules(self):
+        self.variety_pack([f'Show.S01E{i:02}.mkv' for i in range(1,13)])
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertEqual([c['episodes'] for c in Download.calls],[{11,12}])
+    def test_variety_unrecognized_files_download_whole_torrent(self):
+        self.variety_pack(['节目 20261010 第一期.mkv','节目 20261017 第二期.mkv'])
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertEqual(len(Download.calls),1); self.assertNotIn('episodes',Download.calls[0])
+        record=self.plugin.data['decisions_v1'][-1]
+        self.assertEqual(record['status'],'submitted'); self.assertIn('直接下载',record['reasons']['variety'])
+        self.assertEqual(self.plugin.data['history'][-1]['download_mode'],'variety_direct')
+    def test_variety_direct_download_happens_once(self):
+        self.variety_pack(['节目 20261010.mkv'])
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check(); self.run_check()
+        self.assertEqual(len(Download.calls),1)
+    def test_untracked_variety_is_not_downloaded(self):
+        self.variety_pack(['节目 20261010.mkv'])
         ns['query_library'].return_value=engine.Library(); self.run_check()
-        self.assertFalse(Download.calls); self.assertEqual(ns['query_library'].call_count,0)
-    def test_variety_allowed_when_switch_off(self):
-        self.plugin.media.category='综艺'; self.plugin._exclude_variety=False
-        ns['query_library'].return_value=self.library(); self.run_check()
-        self.assertEqual(Download.calls[0]['episodes'],{11,12})
-    def test_drama_is_not_variety(self):
-        self.plugin.media.genre_ids=[18,80]
-        ns['query_library'].return_value=self.library(); self.run_check()
+        self.assertFalse(Download.calls)
+    def test_older_variety_season_is_not_downloaded(self):
+        self.variety_pack(['节目 20261010.mkv'])
+        ns['query_library'].return_value=engine.Library({(2,1):[{'Path':'Show.S02E01.mkv'}]}); self.run_check()
+        self.assertFalse(Download.calls)
+    def test_drama_with_unrecognized_files_still_deferred(self):
+        self.variety_pack(['节目 20261010.mkv']); self.plugin.media.category='电视剧'
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertFalse(Download.calls)
+        self.assertEqual(self.plugin.data['decisions_v1'][-1]['status'],'deferred')
+    def test_variety_by_genre_is_recognized(self):
+        self.variety_pack(['节目 20261010.mkv']); self.plugin.media.category='电视剧'; self.plugin.media.genre_ids=[10764]
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertEqual(len(Download.calls),1)
+
+    # ---- 新剧/新季：TMDB 首播不满 60 天 ----
+    def tmdb(self, premiered, last_aired=None, upcoming=None, extra=()):
+        today=datetime.date.today(); ago=lambda d:(today-datetime.timedelta(days=d)).isoformat()
+        self.plugin.media.season_info=[{'season_number':n,'air_date':ago(d)} for n,d in extra]+[{'season_number':1,'air_date':ago(premiered)}]
+        self.plugin.media.last_air_date=ago(last_aired) if last_aired is not None else None
+        self.plugin.media.next_episode_to_air=upcoming or {}
+    def test_new_show_pack_downloads_all_episodes(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL'); self.tmdb(premiered=10)
+        ns['query_library'].return_value=engine.Library(); self.run_check()
+        self.assertEqual([c['episodes'] for c in Download.calls],[set(range(1,13))])
+    def test_long_running_season_of_untracked_show_is_not_downloaded(self):
+        # 周播综艺一季连播多年：还在更新，但不能整季下载
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL')
+        self.tmdb(premiered=1400, last_aired=3, upcoming={'season_number':1})
+        ns['query_library'].return_value=engine.Library(); self.run_check()
+        self.assertFalse(Download.calls)
+        self.assertIn('近期开播',self.plugin.data['decisions_v1'][-1]['reasons']['pack'])
+    def test_long_running_season_of_tracked_show_takes_only_new_episodes(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL'); self.tmdb(premiered=1400, last_aired=3)
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertEqual([c['episodes'] for c in Download.calls],[{11,12}])
+    def test_old_complete_season_of_untracked_show_is_skipped(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL'); self.tmdb(premiered=400, last_aired=300)
+        ns['query_library'].return_value=engine.Library(); self.run_check()
+        self.assertFalse(Download.calls)
+    def test_older_season_is_not_new_even_if_show_is(self):
+        self.chase(); self.feed('Show.S01.2160p.WEB-DL'); self.tmdb(premiered=800, extra=[(2,20)])
+        ns['query_library'].return_value=engine.Library(); self.run_check()
+        self.assertFalse(Download.calls)
+    def test_new_season_rules(self):
+        new=self.plugin._RssEpisodeQuality__new_season; today=datetime.date(2026,10,15)
+        m=lambda info,**kw:SimpleNamespace(season_info=info,**kw)
+        s2=[{'season_number':1,'air_date':'2024-01-01'},{'season_number':2,'air_date':'2026-09-01'}]
+        self.assertTrue(new(m(s2),2,today)); self.assertTrue(new(m(s2),None,today))
+        self.assertFalse(new(m(s2),1,today)); self.assertTrue(new(m(s2),3,today))
+        both=[{'season_number':1,'air_date':'2026-10-01'},{'season_number':2,'air_date':'2026-10-10'}]
+        self.assertFalse(new(m(both),1,today))
+        self.assertFalse(new(m([{'season_number':1,'air_date':'2022-01-01'}]),1,today))
+        self.assertFalse(new(m([{'season_number':1,'air_date':None}]),1,today))
+        self.assertFalse(new(SimpleNamespace(),1,today))
+        self.assertTrue(new(SimpleNamespace(tmdb_info={'seasons':[{'season_number':1,'air_date':'2026-10-01'}]}),1,today))
+    def test_new_variety_unrecognized_files_downloads(self):
+        self.variety_pack(['节目 20261010.mkv']); self.tmdb(premiered=5)
+        ns['query_library'].return_value=engine.Library(); self.run_check()
+        self.assertEqual(len(Download.calls),1); self.assertNotIn('episodes',Download.calls[0])
+    def test_large_unrecognized_variety_pack_is_not_direct_downloaded(self):
+        self.variety_pack([f'节目 202610{d:02}.mkv' for d in range(1,6)])
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
+        self.assertFalse(Download.calls)
+        self.assertEqual(self.plugin.data['decisions_v1'][-1]['status'],'deferred')
+    def test_variety_two_part_episode_is_direct_downloaded(self):
+        self.variety_pack(['节目 第12期 上.mkv','节目 第12期 下.mkv'])
+        ns['query_library'].return_value=self.chase_library()(10); self.run_check()
         self.assertEqual(len(Download.calls),1)
 
 if __name__=='__main__':unittest.main()
