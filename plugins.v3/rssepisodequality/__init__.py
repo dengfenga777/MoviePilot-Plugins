@@ -24,7 +24,8 @@ from app.sdk.services import RuleHelper, MediaServerHelper, DownloaderHelper
 from app.plugins import _PluginBase
 from app.schemas.types import MediaSource, SystemConfigKey, MediaType
 
-from .engine import Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO, TARGETS
+from .engine import (Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO,
+                     TARGETS, meets_target, site_score)
 from .adapters import query_library, submit_selected
 
 lock = Lock()
@@ -127,11 +128,11 @@ class RssEpisodeQuality(_PluginBase):
     # 插件名称
     plugin_name = "RSS剧集优选"
     # 插件描述
-    plugin_desc = "追更优先：新集立即下载，之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本）、整包只选缺集，不发送系统通知。"
+    plugin_desc = "追更优先：新集立即下载（多站同时出现按站点优先级），之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本）、整包只选缺集，不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -173,6 +174,7 @@ class RssEpisodeQuality(_PluginBase):
     _pending_hours: int = 6
     _target_quality: str = "2160p"
     _max_downloads: int = 2
+    _site_priority: str = ""
     # 详情页最多展示的历史卡片数（存储上限仍为 _history_limit）
     _history_page_limit: int = 100
     # 单轮运行内的决策缓冲与去重状态
@@ -217,6 +219,7 @@ class RssEpisodeQuality(_PluginBase):
             self._pending_hours = int(config.get("pending_hours", 6))
             self._target_quality = config.get("target_quality") or "2160p"
             self._max_downloads = int(config.get("max_downloads", 2))
+            self._site_priority = str(config.get("site_priority") or "").strip()
 
         self.__migrate_history_identity()
 
@@ -646,6 +649,11 @@ class RssEpisodeQuality(_PluginBase):
                     {'title': '2160p 且 HDR/杜比视界', 'value': '2160p_hdr'},
                     {'title': '1080p', 'value': '1080p'}]}},
                 {'component': 'VTextField', 'props': {'model': 'max_downloads', 'label': '每集最多下载次数（追更优先模式，含首次，1–5）', 'type': 'number'}},
+                {'component': 'VTextarea', 'props': {
+                    'model': 'site_priority', 'label': '站点优先级（每行一个站点域名关键词，越靠上越优先）', 'rows': 3,
+                    'placeholder': '例如：\nhdsky\nourbits\n留空则按上方RSS地址顺序，越靠上越优先',
+                    'hint': '同一集同时出现在多个站时，先下优先级高的站；已有目标画质的资源仍优先，避免多下一次',
+                    'persistent-hint': True}},
                 {'component': 'VSelect', 'props': {'model': 'upgrade_policy', 'label': '升级判断（逐档升级模式）', 'items': [
                     {'title': '分辨率与HDR均不降级，至少一项提升', 'value': 'balanced'},
                     {'title': '只比较分辨率（可能改变HDR版本）', 'value': 'resolution'},
@@ -671,7 +679,7 @@ class RssEpisodeQuality(_PluginBase):
             "save_path": "",
             "size_range": "",
             "library_servers": "", "mode": "chase", "upgrade_policy": "balanced",
-            "target_quality": "2160p", "max_downloads": 2,
+            "target_quality": "2160p", "max_downloads": 2, "site_priority": "",
             "query_retries": 3, "absence_minutes": 10, "pending_hours": 6,
         }
 
@@ -710,6 +718,8 @@ class RssEpisodeQuality(_PluginBase):
                 episode_text += f"（升级：{self.__format_episodes(upgrades)}）"
             if mode:
                 episode_text += f" · {mode}"
+            if history.get("site"):
+                episode_text += f" · {history.get('site')}"
             contents.append(
                 {
                     'component': 'VCard',
@@ -832,8 +842,9 @@ class RssEpisodeQuality(_PluginBase):
                 for value in record['reasons'].values():
                     counts[value] = counts.get(value, 0) + 1
                 reason = "；".join(f"{value}×{count}" for value, count in counts.items())
+            site = f"[{record.get('site')}] " if record.get('site') else ""
             text = (f"{record.get('time')} · {labels.get(record.get('status'), record.get('status'))} · "
-                    f"{record.get('title')} · {reason or '-'}")
+                    f"{site}{record.get('title')} · {reason or '-'}")
             if selected:
                 text += f" · 选择：{self.__format_episodes(selected)}"
             return {"component": "div", "text": text}
@@ -907,6 +918,7 @@ class RssEpisodeQuality(_PluginBase):
             "pending_hours": self._pending_hours,
             "target_quality": self._target_quality,
             "max_downloads": self._max_downloads,
+            "site_priority": self._site_priority,
         })
 
     def __audit(self, media, title, status, key=None, **details):
@@ -1240,13 +1252,15 @@ class RssEpisodeQuality(_PluginBase):
         cache_hits = 0
         candidates = []
         feed_results = []
-        for url in self._address.splitlines():
-            url = url.strip()
-            if url:
-                logger.info("剧集优选：读取 RSS 源")
-                feed_results.extend(self.__fetch_rss(url))
+        urls = [url.strip() for url in self._address.splitlines() if url.strip()]
+        for feed_index, url in enumerate(urls):
+            logger.info(f"剧集优选：读取第 {feed_index + 1} 个 RSS 源")
+            feed_results.extend((feed_index, url, result) for result in self.__fetch_rss(url))
+        site_keys = [line.strip() for line in self._site_priority.splitlines() if line.strip()]
+        chase_target = TARGETS.get(self._target_quality, TARGETS["2160p"]) if self._mode == "chase" else None
+        site_labels = {}
         seen_feed_keys = set()
-        for result in feed_results:
+        for feed_index, feed_url, result in feed_results:
             try:
                 title = result.get("title")
                 description = result.get("description")
@@ -1353,7 +1367,11 @@ class RssEpisodeQuality(_PluginBase):
                     logger.info(f"{title} - 剧集优选：无法识别明确集数，跳过以免误下载整季/更新包")
                     self.__remember_skip(skip_cache, rss_key, "标题无明确集数", 24)
                     continue
-                order = rank(title, getattr(torrentinfo, "pri_order", 0))
+                # 排序：已达目标画质（追更优先）> 站点优先级 > MP 规则优先级 > 画质细节
+                site, site_label = site_score([feed_url, link, enclosure], site_keys, feed_index)
+                site_labels[rss_key] = site_label
+                at_target = int(chase_target is not None and meets_target(quality(title), chase_target) is True)
+                order = (at_target, site) + rank(title, getattr(torrentinfo, "pri_order", 0))
                 candidates.append((context, rss_key, episode_keys, order, smart))
             except Exception as err:
                 logger.error(f'解析RSS候选出错：{err} - {traceback.format_exc()}')
@@ -1473,7 +1491,7 @@ class RssEpisodeQuality(_PluginBase):
                 selected = plan.selected
 
                 def plan_details():
-                    return {"season": season, "requested": requested,
+                    return {"site": site_labels.get(rss_key, ""), "season": season, "requested": requested,
                             "existing": library.coverage().get(str(season), []),
                             "missing": sorted(plan.missing), "upgrades": sorted(plan.upgrades & selected),
                             "selected": sorted(selected), "pending": sorted(blocked),
@@ -1598,6 +1616,7 @@ class RssEpisodeQuality(_PluginBase):
                     "rss_size": torrentinfo.size or 0,
                     "selected_episodes": sorted(selected),
                     "upgrade_episodes": sorted(set(plan.upgrades) & selected),
+                    "site": site_labels.get(rss_key, ""),
                     "download_mode": self._mode,
                     "action": self._action,
                     "type": mediainfo.type.value,

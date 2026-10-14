@@ -221,6 +221,20 @@ class EpisodeNamingTests(unittest.TestCase):
     def test_subtitle_in_range_folder_not_selected(self):
         self.assertEqual(e.subtitle_scope('Show.S01E01-E12/Subs/en.srt', 1), (1, set()))
 
+class SiteTests(unittest.TestCase):
+    def test_keyword_order(self):
+        keys = ['hdsky', 'ourbits']
+        self.assertEqual(e.site_score(['https://hdsky.me/rss'], keys, 5), (2, 'hdsky'))
+        self.assertEqual(e.site_score(['https://ourbits.club/rss'], keys, 0), (1, 'ourbits'))
+    def test_download_link_host_also_matches(self):
+        self.assertEqual(e.site_score(['https://proxy.local/feed', None, 'https://hdsky.me/dl/1'], ['hdsky'], 0)[0], 1)
+    def test_unlisted_is_lowest(self):
+        self.assertEqual(e.site_score(['https://x.example/rss'], ['hdsky'], 0)[0], 0)
+    def test_rss_order_without_list(self):
+        self.assertGreater(e.site_score(['https://a/rss'], [], 0)[0], e.site_score(['https://b/rss'], [], 1)[0])
+    def test_bad_urls_ignored(self):
+        self.assertEqual(e.site_score(['not a url', None], [], 0), (0, ''))
+
 class RankTests(unittest.TestCase):
     def test_rank_shares_quality_parser(self):
         title = 'Show.S01E05.2160p.WEB-DL.DV.H.265'

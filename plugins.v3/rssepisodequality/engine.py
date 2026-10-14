@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 import re
 from typing import Callable
+from urllib.parse import urlparse
 
 
 class UncertainLibrary(RuntimeError):
@@ -264,6 +265,37 @@ def rank(title, priority=0):
     except (TypeError, ValueError):
         priority = 0
     return priority, resolution, source, hdr, fps, hevc
+
+
+def _hosts(*urls):
+    names = set()
+    for url in urls:
+        try:
+            host = urlparse(str(url or '')).hostname
+        except ValueError:
+            host = None
+        if host:
+            names.add(host.lower())
+    return names
+
+
+def site_score(urls, priorities, feed_index):
+    """Higher is better.
+
+    With a configured list (one domain keyword per line, top = highest), the first keyword found
+    in the RSS address, details link or download link decides; unlisted sites rank lowest.
+    Without a list, the order of RSS addresses is the priority (first line = highest).
+    Returns (score, label) where label names the matched site for logs and history.
+    """
+    names = _hosts(*urls)
+    keys = [str(key).strip().lower() for key in (priorities or []) if str(key).strip()]
+    if keys:
+        for index, key in enumerate(keys):
+            if any(key in host for host in names):
+                return len(keys) - index, key
+        return 0, next(iter(sorted(names)), '')
+    first = _hosts(urls[0]) if urls else set()
+    return -int(feed_index), next(iter(sorted(first or names)), '')
 
 
 def quality(title, item=None):

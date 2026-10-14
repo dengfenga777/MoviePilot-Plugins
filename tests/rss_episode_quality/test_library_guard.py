@@ -65,7 +65,7 @@ ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tu
     'MediaType':MediaType,'logger':Mock(),'time':time,'json':json,'re':re,'traceback':__import__('traceback'),
     'MediaServerHelper':MediaHelper,'DownloaderHelper':DownloadHelper,
     'query_library':Mock(),'Library':engine.Library,'UncertainLibrary':engine.UncertainLibrary,
-    'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,'TARGETS':engine.TARGETS,
+    'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,'TARGETS':engine.TARGETS,'meets_target':engine.meets_target,'site_score':engine.site_score,
     'file_scope':engine.file_scope,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
     'Context':SimpleNamespace,'TorrentInfo':TorrentInfo,'MediaInfo':SimpleNamespace,
     'SystemConfigKey':SimpleNamespace(SubscribeFilterRuleGroups='rules'),
@@ -233,7 +233,7 @@ class PluginTests(unittest.TestCase):
                 if 'model' in node.get('props',{}):result.add(node['props']['model'])
                 result.update(models(node.get('content',[]) if isinstance(node.get('content',[]),list) else []))
             return result
-        expected={'library_servers','mode','upgrade_policy','query_retries','absence_minutes','pending_hours','target_quality','max_downloads'}
+        expected={'library_servers','mode','upgrade_policy','query_retries','absence_minutes','pending_hours','target_quality','max_downloads','site_priority'}
         self.assertTrue(expected<=models(form)); self.assertTrue(expected<=set(defaults))
         self.plugin._RssEpisodeQuality__update_config(); self.assertTrue(expected<=set(self.plugin.saved_config))
     # ---- 1.2.0 ----
@@ -454,6 +454,51 @@ class PluginTests(unittest.TestCase):
         self.plugin.init_plugin({'enabled':True,'mode':'upgrade'}); self.assertEqual(self.plugin._mode,'upgrade')
         self.plugin.init_plugin({'enabled':True,'mode':'missing','target_quality':'2160p'})
         self.assertEqual(self.plugin._mode,'missing')
+    # ---- 1.3.0 站点优先级 ----
+    def sites(self,feeds,priority=''):
+        self.plugin._address='\n'.join(feeds); self.plugin._site_priority=priority
+        self.plugin._RssEpisodeQuality__fetch_rss=lambda url:[
+            {'title':t,'description':'','link':f'{url}/details/{i}','enclosure':f'{url}/download/{i}','size':s}
+            for i,(t,s) in enumerate(feeds[url])]
+        DownloadHelper.services['QB'].instance.get_torrents.return_value=([{'progress':0.1}],False)
+        ns['query_library'].return_value=self.chase_library()(10)
+    def picked(self):
+        self.assertEqual(len(Download.calls),1)
+        return Download.calls[0]['context'].torrent_info
+    def test_rss_order_is_site_priority_by_default(self):
+        feeds={'https://first.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
+               'https://second.example/rss':[('Show.S01E11.1080p.BluRay',9)]}
+        self.sites(feeds); self.run_check()
+        self.assertIn('first.example',self.picked().enclosure)
+    def test_configured_site_priority_beats_rss_order_and_quality(self):
+        feeds={'https://low.example/rss':[('Show.S01E11.1080p.BluRay.HDR',9)],
+               'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',1)]}
+        self.sites(feeds,'high\nlow'); self.run_check()
+        self.assertIn('high.example',self.picked().enclosure)
+    def test_unlisted_site_ranks_last(self):
+        feeds={'https://other.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
+               'https://listed.example/rss':[('Show.S01E11.720p.WEB-DL',1)]}
+        self.sites(feeds,'listed'); self.run_check()
+        self.assertIn('listed.example',self.picked().enclosure)
+    def test_chase_target_quality_beats_site_priority(self):
+        # Taking the high site's 1080p would cost a second download for the low site's 4K later.
+        self.chase()
+        feeds={'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
+               'https://low.example/rss':[('Show.S01E11.2160p.WEB-DL',1)]}
+        self.sites(feeds,'high\nlow'); self.run_check()
+        self.assertIn('2160p',self.picked().title)
+    def test_chase_site_priority_among_target_quality(self):
+        self.chase()
+        feeds={'https://low.example/rss':[('Show.S01E11.2160p.BluRay.REMUX.DV',9)],
+               'https://high.example/rss':[('Show.S01E11.2160p.WEB-DL',1)]}
+        self.sites(feeds,'high\nlow'); self.run_check()
+        self.assertIn('high.example',self.picked().enclosure)
+    def test_site_recorded_in_history_and_decisions(self):
+        feeds={'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',1)]}
+        self.sites(feeds,'high'); self.run_check()
+        self.assertEqual(self.plugin.data['history'][-1]['site'],'high')
+        self.assertEqual(self.plugin.data['decisions_v1'][-1]['site'],'high')
+        self.assertIn('[high]',json.dumps(self.plugin.get_page(),ensure_ascii=False))
     def test_audit_page_without_download_history(self):
         ns['query_library'].side_effect=engine.UncertainLibrary('offline')
         with patch.object(time,'sleep'):self.run_check()
