@@ -1,0 +1,2 @@
+requests>=2.32,<3
+torrentool==1.2.0

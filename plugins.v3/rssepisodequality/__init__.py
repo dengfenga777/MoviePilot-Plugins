@@ -2,6 +2,8 @@ import datetime
 import hashlib
 import re
 import traceback
+import time
+import json
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Any, List, Dict, Tuple
@@ -18,10 +20,12 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.media import Context, MediaInfo, MetaInfo, TorrentInfo, resolve_media_identity
 from app.sdk.network import RssHelper
-from app.sdk.services import RuleHelper
+from app.sdk.services import RuleHelper, MediaServerHelper, DownloaderHelper
 from app.plugins import _PluginBase
-from app.schemas import ExistMediaInfo
 from app.schemas.types import MediaSource, SystemConfigKey, MediaType
+
+from .engine import Library, UncertainLibrary, UnsafeSelection, decide, quality, file_scope, VIDEO
+from .adapters import query_library, submit_selected
 
 lock = Lock()
 
@@ -57,6 +61,41 @@ class SilentDownloadChain(DownloadChain):
         super().__init__(*args, **kwargs)
         self.messagehelper = _SilentMessageHelper(self.messagehelper)
 
+    selection_season = None
+    last_downloader = None
+    last_error = None
+    selection_upgrade = None
+
+    def download(self, content, download_dir, cookie=None, episodes=None, category=None,
+                 label=None, downloader=None):
+        try:
+            if self.selection_season is None or not episodes:
+                raise UnsafeSelection("没有明确选集计划，拒绝提交")
+            helper = DownloaderHelper()
+            configs = helper.get_configs()
+            if not downloader:
+                defaults = [name for name, conf in configs.items() if conf.default]
+                if len(defaults) != 1:
+                    raise UnsafeSelection("默认下载器不唯一或未设置")
+                downloader = defaults[0]
+            service = helper.get_service(downloader)
+            if not service:
+                raise UnsafeSelection("下载器服务不可用")
+            from app.runtime.settings import get_runtime_setting
+            builtin_tag = get_runtime_setting("TORRENT_TAG")
+            self.last_downloader = service.name
+            self.last_error = None
+            return submit_selected(service, content, download_dir, cookie, category,
+                                   label, self.selection_season, set(episodes), self.selection_upgrade, builtin_tag)
+        except UnsafeSelection as err:
+            self.last_error = str(err)
+            logger.warning(f"RSS严格选集提交失败：{err}")
+            return None, None, None, self.last_error
+        except Exception:
+            self.last_error = "下载器或种子解析发生异常，未启动整包回退"
+            logger.warning(self.last_error)
+            return None, None, None, "严格选集提交失败，保留暂停任务供检查"
+
     def post_message(self, *args, **kwargs):
         logger.info("RSS剧集优选：已屏蔽下载链通知")
         return None
@@ -88,11 +127,11 @@ class RssEpisodeQuality(_PluginBase):
     # 插件名称
     plugin_name = "RSS剧集优选"
     # 插件描述
-    plugin_desc = "跨 RSS 源优选剧集，同集去重、拦截降级，允许质量升级，不发送系统通知。"
+    plugin_desc = "跨 RSS 源优选剧集，严格媒体库查重、缺集选下、可配置实际版本升级，不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -126,6 +165,13 @@ class RssEpisodeQuality(_PluginBase):
     _smart_quality: bool = True
     _skip_unknown_episodes: bool = True
     _history_limit: int = 1000
+    _library_servers: str = ""
+    _mode: str = "missing"
+    _upgrade_policy: str = "balanced"
+    _query_retries: int = 3
+    _absence_minutes: int = 10
+    _pending_hours: int = 6
+
 
     def init_plugin(self, config: dict = None):
 
@@ -147,9 +193,15 @@ class RssEpisodeQuality(_PluginBase):
             self._smart_quality = config.get("smart_quality", True)
             self._skip_unknown_episodes = config.get("skip_unknown_episodes", True)
             self._clear = config.get("clear")
-            self._action = config.get("action")
+            self._action = config.get("action") or "download"
             self._save_path = str(config.get("save_path") or "").strip()
             self._size_range = config.get("size_range")
+            self._library_servers = str(config.get("library_servers") or "").strip()
+            self._mode = config.get("mode") or "missing"
+            self._upgrade_policy = config.get("upgrade_policy") or "balanced"
+            self._query_retries = int(config.get("query_retries", 3))
+            self._absence_minutes = int(config.get("absence_minutes", 10))
+            self._pending_hours = int(config.get("pending_hours", 6))
 
         self.__migrate_history_identity()
 
@@ -544,7 +596,7 @@ class RssEpisodeQuality(_PluginBase):
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'smart_quality',
-                                        'label': '剧集优选：同集去重，允许质量升级',
+                                        'label': '跨RSS优选排序（查重和提交去重始终启用）',
                                     },
                                 }],
                             },
@@ -555,7 +607,7 @@ class RssEpisodeQuality(_PluginBase):
                                     'component': 'VSwitch',
                                     'props': {
                                         'model': 'skip_unknown_episodes',
-                                        'label': '剧集优选时跳过无法识别集数的资源',
+                                        'label': '跳过标题无集数资源（关闭后读取种子文件确认）',
                                     },
                                 }],
                             },
@@ -563,7 +615,21 @@ class RssEpisodeQuality(_PluginBase):
                     }
                 ]
             }
-        ], {
+        ] + [{
+            'component': 'VCard',
+            'content': [{'component': 'VCardText', 'content': [
+                {'component': 'VTextField', 'props': {'model': 'library_servers', 'label': '查重媒体服务器名称（逗号分隔；留空使用全部启用服务）'}},
+                {'component': 'VSelect', 'props': {'model': 'mode', 'label': '下载模式', 'items': [
+                    {'title': '只补缺集', 'value': 'missing'}, {'title': '补缺集并允许实际版本升级', 'value': 'upgrade'}]}},
+                {'component': 'VSelect', 'props': {'model': 'upgrade_policy', 'label': '升级判断', 'items': [
+                    {'title': '分辨率与HDR均不降级，至少一项提升', 'value': 'balanced'},
+                    {'title': '只比较分辨率（可能改变HDR版本）', 'value': 'resolution'},
+                    {'title': '同时比较分辨率、HDR与来源档次', 'value': 'source'}]}},
+                {'component': 'VTextField', 'props': {'model': 'query_retries', 'label': '查询重试次数（1–5）', 'type': 'number'}},
+                {'component': 'VTextField', 'props': {'model': 'absence_minutes', 'label': '删除集数复核间隔（1–120分钟）', 'type': 'number'}},
+                {'component': 'VTextField', 'props': {'model': 'pending_hours', 'label': '已提交任务重复保护（1–72小时）', 'type': 'number'}},
+            ]}],
+        }], {
             "enabled": False,
             "notify": False,
             "onlyonce": False,
@@ -578,7 +644,9 @@ class RssEpisodeQuality(_PluginBase):
             "skip_unknown_episodes": True,
             "action": "download",
             "save_path": "",
-            "size_range": ""
+            "size_range": "",
+            "library_servers": "", "mode": "missing", "upgrade_policy": "balanced",
+            "query_retries": 3, "absence_minutes": 10, "pending_hours": 6,
         }
 
     def get_page(self) -> List[dict]:
@@ -588,7 +656,7 @@ class RssEpisodeQuality(_PluginBase):
         # 查询同步详情
         historys = self.get_data('history')
         if not historys:
-            return [
+            return self.__decision_page() + [
                 {
                     'component': 'div',
                     'text': '暂无数据',
@@ -598,7 +666,8 @@ class RssEpisodeQuality(_PluginBase):
                 }
             ]
         # 数据按时间降序排序
-        historys = sorted(historys, key=lambda x: x.get('time'), reverse=True)
+        historys = sorted((item for item in historys if isinstance(item, dict)),
+                          key=lambda x: str(x.get('time') or ''), reverse=True)
         # 拼装页面
         contents = []
         for history in historys:
@@ -680,7 +749,7 @@ class RssEpisodeQuality(_PluginBase):
                 }
             )
 
-        return [
+        return self.__decision_page() + [
             {
                 'component': 'div',
                 'props': {
@@ -689,6 +758,23 @@ class RssEpisodeQuality(_PluginBase):
                 'content': contents
             }
         ]
+
+    def __decision_page(self):
+        records = self.get_data("decisions_v1") or []
+        if not isinstance(records, list):
+            return []
+        labels = {"deferred": "暂缓", "skipped": "跳过", "planned": "待提交",
+                  "failed": "失败", "submitted": "已提交", "reserved": "已记录提交计划"}
+        return [{"component": "VCard", "content": [
+            {"component": "VCardTitle", "text": "最近下载判断"},
+            {"component": "VCardText", "content": [
+                {"component": "div", "text":
+                 f"{record.get('time')} · {labels.get(record.get('status'), record.get('status'))} · "
+                 f"{record.get('title')} · {record.get('reason') or record.get('reasons')} · "
+                 f"选择集数：{record.get('selected', [])}"}
+                for record in reversed(records[-50:]) if isinstance(record, dict)
+            ]},
+        ]}]
 
     def stop_service(self):
         """
@@ -739,8 +825,59 @@ class RssEpisodeQuality(_PluginBase):
             "skip_unknown_episodes": self._skip_unknown_episodes,
             "action": self._action,
             "save_path": self._save_path,
-            "size_range": self._size_range
+            "size_range": self._size_range,
+            "library_servers": self._library_servers,
+            "mode": self._mode,
+            "upgrade_policy": self._upgrade_policy,
+            "query_retries": self._query_retries,
+            "absence_minutes": self._absence_minutes,
+            "pending_hours": self._pending_hours,
         })
+
+    def __audit(self, media, title, status, **details):
+        """Bounded decision history contains no RSS URLs or service credentials."""
+        record = {"time": datetime.datetime.now().isoformat(timespec="seconds"),
+                  "media": f"{media.media_source.value}:{media.media_id}",
+                  "title": title, "status": status, **details}
+        records = self.get_data("decisions_v1") or []
+        if not isinstance(records, list):
+            raise ValueError("下载决策记录格式异常")
+        self.save_data("decisions_v1", (records + [record])[-500:])
+        logger.info(f"RSS下载决策：{json.dumps(record, ensure_ascii=False)}")
+
+    def __library(self, media, services):
+        key = json.dumps([sorted(services), media.media_source.value, str(media.media_id)])
+        snapshots = self.get_data("library_snapshot_v2") or {}
+        if not isinstance(snapshots, dict):
+            raise ValueError("媒体库缓存格式异常")
+        now = time.time()
+        snapshots = {k: v for k, v in snapshots.items() if isinstance(v, dict)
+                     and 0 <= now-float(v.get("checked_at", 0)) < 86400}
+        previous = snapshots.get(key)
+        for attempt in range(self._query_retries):
+            try:
+                library = query_library(services, media)
+                break
+            except UncertainLibrary as err:
+                logger.warning(f"{media.title_year} 媒体库查询 {attempt+1}/{self._query_retries}：{err}")
+                if attempt + 1 == self._query_retries:
+                    raise
+                time.sleep(1)
+        coverage = library.coverage()
+        if previous and any(not set(episodes).issubset(set(coverage.get(season, [])))
+                            for season, episodes in previous["coverage"].items()):
+            fingerprint = json.dumps(coverage, sort_keys=True)
+            pending = previous.get("pending") or {}
+            if pending.get("coverage") != fingerprint:
+                previous["pending"] = {"coverage": fingerprint, "since": now}
+                snapshots[key] = previous
+                self.save_data("library_snapshot_v2", snapshots)
+                raise UncertainLibrary("已确认集数减少，等待下一轮成功查询复核")
+            if now - float(pending["since"]) < self._absence_minutes * 60:
+                raise UncertainLibrary("已确认集数减少，尚未达到删除复核间隔")
+        snapshots[key] = {"checked_at": now, "coverage": coverage}
+        self.save_data("library_snapshot_v2", snapshots)
+        return library
 
     def __fetch_rss(self, url: str) -> List[dict]:
         """读取单个 RSS 源；任何异常只影响当前源。"""
@@ -814,65 +951,42 @@ class RssEpisodeQuality(_PluginBase):
         hevc = int(bool(re.search(r"(?i)(?:[hx][ ._-]?265|hevc)", name)))
         return (int(priority or 0), resolution, source, hdr, fps, hevc)
 
-    def __repair_episode_quality(self, ledger: dict) -> dict:
-        """Once-only repair: retain only coverage explicitly supported by each record's title."""
-        if self.get_data("episode_quality_scope_version") == 2:
-            return ledger
-        repaired = {}
-        for key, record in ledger.items():
-            try:
-                meta = MetaInfo(title=record.get("title") or "")
-                seasons = list(getattr(meta, "season_list", None) or [])
-                episodes = set(getattr(meta, "episode_list", None) or [])
-                scope = re.search(r":S(\d+):E(\d+)$", key)
-                if (scope and len(seasons) <= 1 and episodes
-                        and int(scope.group(1)) == meta.begin_season
-                        and int(scope.group(2)) in episodes):
-                    repaired[key] = record
-            except Exception as err:
-                # Preserve the complete pre-repair data for recovery; never guess episode coverage.
-                logger.warning(f"质量记录无法确认标题集数，移除去重标记：{key}，{err}")
-        if self.get_data("episode_quality_before_title_scope_v2") is None:
-            self.save_data("episode_quality_before_title_scope_v2", ledger)
-        # Mark completion only after the repaired data has been saved successfully.
-        self.save_data("episode_quality_v1", repaired)
-        self.save_data("episode_quality_scope_version", 2)
-        logger.info(f"标题集数修复完成：保留 {len(repaired)} 条，移除 {len(ledger)-len(repaired)} 条错误或无法确认的质量标记；原记录已备份")
-        return repaired
+    def __torrent_scope(self, context, downloader):
+        from torrentool.api import Torrent
+        content, _, _ = downloader.download_torrent(context.torrent_info)
+        if not isinstance(content, bytes):
+            raise UnsafeSelection("无法取得可信种子文件集数，暂缓")
+        torrent = Torrent.from_string(content)
+        season_episodes = {}
+        for file in torrent.files:
+            if Path(file.name).suffix.lower() not in VIDEO:
+                continue
+            season, episodes = file_scope(file.name, None)
+            if season is None or not episodes:
+                raise UnsafeSelection("种子视频文件没有明确季集编号")
+            season_episodes.setdefault(season, set()).update(episodes)
+        if len(season_episodes) != 1:
+            raise UnsafeSelection("种子不是明确单季资源")
+        season, episodes = next(iter(season_episodes.items()))
+        return content, season, sorted(episodes)
 
-    def __seed_quality(self, history, mediainfo, filter_groups, ledger) -> None:
-        """Migrate retained successful downloads without fetching RSS or downloading again."""
-        for item in history:
-            if (not isinstance(item, dict)
-                    or str(item.get("media_id")) != str(mediainfo.media_id)
-                    or item.get("media_source") != mediainfo.media_source.value
-                    or item.get("type") != MediaType.TV.value):
-                continue
-            title = item.get("rss_title")
-            if not title:
-                continue
-            try:
-                old_meta = MetaInfo(title=title)
-                keys = self.__episode_keys(old_meta, mediainfo)
-                if not keys:
-                    continue
-                old_torrent = TorrentInfo(title=title, description=item.get("rss_description") or "",
-                                          size=item.get("rss_size") or 0)
-                if self._filter:
-                    matched = self.chain.filter_torrents(
-                        rule_groups=filter_groups, torrent_list=[old_torrent], mediainfo=mediainfo)
-                    # An old record rejected by today's rules cannot safely receive a rule score.
-                    if not matched:
-                        continue
-                    old_torrent = matched[0]
-                rank = self.__quality_rank(title, getattr(old_torrent, "pri_order", 0))
-                for key in keys:
-                    previous = ledger.get(key)
-                    if not previous or tuple(previous["rank"]) < rank:
-                        ledger[key] = {"rank": list(rank), "title": title,
-                                       "time": item.get("time"), "migrated": True}
-            except Exception as err:
-                logger.warning(f"历史质量记录迁移失败，保留原历史：{title}，{err}")
+    def __pending_active(self, record, services, cache):
+        identity = (record.get("downloader"), record.get("hash"))
+        if not all(identity) or identity[0] not in services:
+            raise UncertainLibrary("已提交记录对应下载器不可用")
+        if identity not in cache:
+            tasks, error = services[identity[0]].instance.get_torrents(ids=identity[1])
+            if error or tasks is None:
+                raise UncertainLibrary("无法查询已提交任务状态")
+            cache[identity] = tasks
+        tasks = cache[identity]
+        if not tasks:
+            return False
+        progress = [float(task.get("progress", -1)) for task in tasks]
+        if any(not 0 <= value <= 1 for value in progress):
+            raise UncertainLibrary("下载任务进度无效")
+        return any(value < 1 for value in progress) or (
+            time.time() - float(record.get("submitted_at", 0)) < self._pending_hours * 3600)
 
     def __check(self):
         """
@@ -888,11 +1002,7 @@ class RssEpisodeQuality(_PluginBase):
             if not isinstance(history, list):
                 logger.warning("RSS剧集优选历史数据格式异常，将从空历史重新开始")
                 history = []
-        processed_keys = {
-            str(item.get("key"))
-            for item in history
-            if isinstance(item, dict) and item.get("key")
-        }
+        history = [item for item in history if isinstance(item, dict)]
         downloadchain = SilentDownloadChain()
         subscribechain = SilentSubscribeChain()
         rulehelper = RuleHelper()
@@ -915,7 +1025,7 @@ class RssEpisodeQuality(_PluginBase):
                 pubdate: datetime.datetime = result.get("pubdate")
                 # 检查是否处理过
                 rss_key = self.__rss_key(result)
-                if not title or not rss_key or rss_key in processed_keys or title in processed_keys:
+                if not title or not rss_key:
                     continue
                 if rss_key in seen_feed_keys:
                     continue
@@ -1009,50 +1119,120 @@ class RssEpisodeQuality(_PluginBase):
                                     key=lambda item: (item[3], float(item[0].torrent_info.size or 0)),
                                     reverse=True))
             candidates = [next(sorted_tv) if item[4] else item for item in candidates]
-        ledger = (self.get_data("episode_quality_v1") or {}) if self._smart_quality and self._action == "download" and not self._clearflag else {}
+        ledger = self.get_data("pending_downloads_v2") or {}
         if not isinstance(ledger, dict):
-            raise ValueError("剧集质量记录格式异常；停止本轮，避免重复下载")
-        if self._smart_quality and self._action == "download" and not self._clearflag:
-            ledger = self.__repair_episode_quality(ledger)
-        if self._clearflag and self._smart_quality and self._action == "download":
-            self.save_data("episode_quality_v1", {})
-        seeded_media = set()
-        logger.info(f"剧集优选：{len(feed_results)} 条RSS记录，{len(candidates)} 条有效候选")
+            raise ValueError("待完成下载记录格式异常，停止本轮")
+        now = time.time()
+        if any(not isinstance(value, dict) for value in ledger.values()):
+            raise ValueError("待完成下载记录条目异常")
+        download_services = DownloaderHelper().get_services()
+        pending_cache = {}
+        helper = MediaServerHelper()
+        services = helper.get_services()
+        if self._library_servers:
+            names = {name.strip() for name in self._library_servers.split(",") if name.strip()}
+            if not names.issubset(services):
+                raise ValueError("指定查重媒体服务器未全部启用或不可用")
+            services = {name: services[name] for name in names}
+        enabled_names = set(helper.get_configs())
+        if not self._library_servers and set(services) != enabled_names:
+            raise ValueError("部分已启用媒体服务器没有运行实例，本轮停止")
+        libraries = {}
         for context, rss_key, episode_keys, rank, smart in candidates:
             meta, mediainfo, torrentinfo = context.meta_info, context.media_info, context.torrent_info
             title = torrentinfo.title
             try:
-                if rss_key in processed_keys:
+                selected = set()
+                try:
+                    identity = (mediainfo.media_source.value, str(mediainfo.media_id))
+                    if identity not in libraries:
+                        libraries[identity] = self.__library(mediainfo, services)
+                    library = libraries[identity]
+                except UncertainLibrary as err:
+                    libraries[identity] = None
+                    self.__audit(mediainfo, title, "deferred", reason=str(err))
                     continue
-                if smart and episode_keys:
-                    identity = (mediainfo.media_source.value, str(mediainfo.media_id), mediainfo.category)
-                    if identity not in seeded_media:
-                        self.__seed_quality(history, mediainfo, filter_groups, ledger)
-                        self.save_data("episode_quality_v1", ledger)
-                        seeded_media.add(identity)
-                    covered = [key for key in episode_keys if key in ledger and tuple(ledger[key]["rank"]) >= rank]
-                    if len(covered) == len(episode_keys):
-                        logger.info(f"{title} - 剧集优选：所有集数已有同档或更好下载，拦截重复/降级")
+                if library is None:
+                    continue
+                seasons = list(getattr(meta, "season_list", None) or [])
+                requested = sorted(set(meta.episode_list or []))
+                torrent_content = None
+                chosen_season = meta.begin_season
+                if not requested and not self._skip_unknown_episodes and len(seasons) <= 1:
+                    try:
+                        torrent_content, chosen_season, requested = self.__torrent_scope(context, downloadchain)
+                        meta.begin_season = chosen_season
+                        meta.end_season = None
+                    except UnsafeSelection as err:
+                        self.__audit(mediainfo, title, "deferred", reason=str(err))
                         continue
-                    if covered:
-                        logger.info(f"{title} - 剧集优选：更新包含 {len(episode_keys)-len(covered)} 集新增或升级，允许下载")
-                # 媒体库已存在的剧集
-                exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
-                if mediainfo.type == MediaType.TV:
-                    if exist_info:
-                        exist_season = exist_info.seasons
-                        if exist_season:
-                            exist_episodes = exist_season.get(meta.begin_season)
-                            if exist_episodes and set(meta.episode_list).issubset(set(exist_episodes)):
-                                logger.info(f'{mediainfo.title_year} {meta.season_episode} 己存在')
-                                continue
-                elif exist_info:
-                    # 电影已存在
-                    logger.info(f'{mediainfo.title_year} 己存在')
+                if chosen_season is None or len(seasons) > 1 or not requested:
+                    self.__audit(mediainfo, title, "deferred", reason="候选没有可信的单季集数")
+                    continue
+                for episode in requested:
+                    pending_key = f"{mediainfo.media_source.value}:{mediainfo.media_id}:S{int(meta.begin_season)}:E{episode}"
+                    if (int(meta.begin_season), episode) in library.episodes and pending_key in ledger:
+                        record = ledger[pending_key]
+                        if (time.time() - float(record.get("submitted_at", 0)) >= self._pending_hours * 3600
+                                and not self.__pending_active(record, download_services, pending_cache)):
+                            del ledger[pending_key]
+                candidate = quality(title)
+                axes = {"resolution": (0,), "balanced": (0, 1), "source": (0, 1, 2)}[self._upgrade_policy]
+                plan = decide(requested, int(meta.begin_season), library, candidate,
+                              lambda item: quality(str(item.get("Path") or item.get("Name") or ""), item),
+                              mode=self._mode, upgrade_axes=axes)
+                # Any in-flight download protects its episodes across RSS sources, even if
+                # a better candidate arrives; reconsider upgrades after transfer or expiry.
+                blocked = []
+                for ep in list(plan.selected):
+                    pending_key = f"{mediainfo.media_source.value}:{mediainfo.media_id}:S{int(meta.begin_season)}:E{ep}"
+                    if pending_key in ledger:
+                        if self.__pending_active(ledger[pending_key], download_services, pending_cache):
+                            plan.selected.remove(ep)
+                            plan.reasons[str(ep)] = "已有下载中或待入库的提交任务"
+                            blocked.append(ep)
+                        else:
+                            del ledger[pending_key]
+                selected = plan.selected
+                details = {"season": int(meta.begin_season), "requested": requested,
+                           "existing": library.coverage().get(str(int(meta.begin_season)), []),
+                           "missing": sorted(plan.missing), "upgrades": sorted(plan.upgrades),
+                           "selected": sorted(selected), "pending": sorted(blocked),
+                           "candidate_quality": candidate, "reasons": plan.reasons}
+                self.__audit(mediainfo, title, "planned" if selected else "skipped", **details)
+                if not selected:
                     continue
                 # 下载或订阅
                 if self._action == "download":
-                    # 添加下载
+                    # Every download goes through the strict qBittorrent adapter.
+                    downloadchain.selection_season = int(meta.begin_season)
+                    downloadchain.selection_upgrade = {"episodes": set(plan.upgrades) & selected,
+                                                       "quality": candidate, "axes": axes}
+                    # Save exact torrent identity before any downloader side effect. A crash
+                    # after starting can then be reconciled against the real task on restart.
+                    if torrent_content is None:
+                        torrent_content, _, _ = downloadchain.download_torrent(torrentinfo)
+                    if not isinstance(torrent_content, bytes):
+                        raise UnsafeSelection("无法验证种子文件，拒绝磁力或整包回退")
+                    from torrentool.api import Torrent
+                    intent_hash = Torrent.from_string(torrent_content).info_hash
+                    if not intent_hash:
+                        raise UnsafeSelection("种子缺少可确认的任务Hash")
+                    downloader_name = getattr(torrentinfo, "site_downloader", None)
+                    if not downloader_name:
+                        defaults = [name for name, config in DownloaderHelper().get_configs().items() if config.default]
+                        if len(defaults) != 1:
+                            raise UnsafeSelection("默认下载器不唯一或未设置")
+                        downloader_name = defaults[0]
+                    if downloader_name not in download_services or download_services[downloader_name].type != "qbittorrent":
+                        raise UnsafeSelection("下载器不可用或不支持严格选集")
+                    for ep in selected:
+                        key = f"{mediainfo.media_source.value}:{mediainfo.media_id}:S{int(meta.begin_season)}:E{ep}"
+                        ledger[key] = {"submitted_at": time.time(), "hash": intent_hash,
+                                       "downloader": downloader_name, "quality": candidate,
+                                       "title": title, "state": "reserved"}
+                    self.save_data("pending_downloads_v2", ledger)
+                    self.__audit(mediainfo, title, "reserved", torrent_hash=intent_hash, **details)
                     result = downloadchain.download_single(
                         context=Context(
                             meta_info=meta,
@@ -1060,10 +1240,21 @@ class RssEpisodeQuality(_PluginBase):
                             torrent_info=torrentinfo,
                         ),
                         save_path=self._save_path or None,
+                        episodes=set(selected),
+                        torrent_content=torrent_content,
+                        downloader=downloader_name,
                         username="RSS剧集优选"
                     )
                     if not result:
-                        logger.error(f'{title} 下载失败')
+                        # Release an intent only after a successful empty downloader lookup.
+                        # Paused tasks and unreachable downloaders retain duplicate protection.
+                        tasks, error = download_services[downloader_name].instance.get_torrents(ids=intent_hash)
+                        if not error and tasks is not None and not tasks:
+                            for ep in selected:
+                                key = f"{mediainfo.media_source.value}:{mediainfo.media_id}:S{int(meta.begin_season)}:E{ep}"
+                                ledger.pop(key, None)
+                            self.save_data("pending_downloads_v2", ledger)
+                        self.__audit(mediainfo, title, "failed", reason=downloadchain.last_error or "下载链未接受资源", **details)
                         continue
                 else:
                     # 检查是否在订阅中
@@ -1089,13 +1280,14 @@ class RssEpisodeQuality(_PluginBase):
                             f"{subscribe_message or '未知错误'}"
                         )
                         continue
-                if smart and episode_keys:
-                    for key in episode_keys:
-                        previous = ledger.get(key)
-                        if not previous or tuple(previous["rank"]) < rank:
-                            ledger[key] = {"rank": list(rank), "title": title,
-                                           "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                    self.save_data("episode_quality_v1", ledger)
+                if self._action == "download":
+                    for ep in selected:
+                        key = f"{mediainfo.media_source.value}:{mediainfo.media_id}:S{int(meta.begin_season)}:E{ep}"
+                        ledger[key] = {"submitted_at": time.time(), "hash": str(result),
+                                       "downloader": downloadchain.last_downloader,
+                                       "quality": candidate, "title": title, "state": "submitted"}
+                    self.save_data("pending_downloads_v2", ledger)
+                    self.__audit(mediainfo, title, "submitted", torrent_hash=str(result), **details)
                 # 存储历史记录
                 history_item = {
                     "title": f"{mediainfo.title} {meta.season}",
@@ -1103,6 +1295,8 @@ class RssEpisodeQuality(_PluginBase):
                     "rss_title": title,
                     "rss_description": torrentinfo.description or "",
                     "rss_size": torrentinfo.size or 0,
+                    "selected_episodes": sorted(selected),
+                    "download_mode": self._mode,
                     "type": mediainfo.type.value,
                     "year": mediainfo.year,
                     "poster": mediainfo.get_poster_image(),
@@ -1112,11 +1306,15 @@ class RssEpisodeQuality(_PluginBase):
                     "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 history_item["record_id"] = self.__history_record_id(history_item)
+                history = [item for item in history if item.get("key") != rss_key]
                 history.append(history_item)
-                processed_keys.add(rss_key)
                 self.__persist_history(history)
+            except (UncertainLibrary, UnsafeSelection) as err:
+                self.__audit(mediainfo, title, "deferred", reason=str(err))
             except Exception as err:
                 logger.error(f'处理RSS候选出错：{err} - {traceback.format_exc()}')
+        # Persist pending removals as well as successful additions.
+        self.save_data("pending_downloads_v2", ledger)
         # 保存历史记录
         self.__persist_history(history)
         # 缓存只清理一次
@@ -1133,6 +1331,18 @@ class RssEpisodeQuality(_PluginBase):
         """
         检查并修正配置值
         """
+        config = config if config is not None else {}
+        for key, default, minimum, maximum in [("query_retries", 3, 1, 5),
+                ("absence_minutes", 10, 1, 120), ("pending_hours", 6, 1, 72)]:
+            try:
+                value = int(config.get(key, default))
+                config[key] = max(minimum, min(maximum, value))
+            except (TypeError, ValueError):
+                config[key] = default
+        if config.get("mode") not in ("missing", "upgrade"):
+            config["mode"] = "missing"
+        if config.get("upgrade_policy") not in ("resolution", "balanced", "source"):
+            config["upgrade_policy"] = "balanced"
         size_range = config.get("size_range")
         if size_range and not self.__is_number_or_range(str(size_range)):
             self.__log_and_notify_error(f"RSS剧集优选出错，种子大小设置错误：{size_range}")

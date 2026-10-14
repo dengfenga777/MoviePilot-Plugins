@@ -86,10 +86,10 @@ plugins.v3/
 
 ## RSS剧集优选（V3）
 
-独立插件 `RssEpisodeQuality`，当前版本 `v1.0.1`，要求 MoviePilot `>= 3.0.0`。
+独立插件 `RssEpisodeQuality`，当前版本 `v1.1.0`，要求 MoviePilot `>= 3.0.0`。
 
-汇总多个 RSS 源后按现有订阅优先级规则优选剧集，逐集记录成功加入下载队列的质量，拦截同档重复和降级，允许后续质量升级。文件大小只用于同档候选选择。默认仅处理明确集数的电视剧，不发送通知。
+汇总多个 RSS 源后按现有订阅规则优选剧集，严格查询媒体库完整分页并合并已有版本。默认只补缺集，更新包通过 qBittorrent 暂停、选集和复核后仅下载目标集数；查询或选集失败时暂缓，不整包回退。可配置按实际版本信息升级，保存待完成任务与下载决策，不发送通知。
 
 启用本插件前，请停用负责同一批剧集的旧 RSS 下载任务，再将 RSS 地址复制到本插件；独立插件之间不共享下载质量记录。插件默认关闭，不会自动修改其他插件。
 
-详细配置与处理边界见 [插件说明](plugins.v3/rssepisodequality/README.md)。离线测试：`python3 -m unittest discover -s tests -v`。
+详细配置与处理边界见 [插件说明](plugins.v3/rssepisodequality/README.md)。验证与测试命令见 [测试说明](tests/rss_episode_quality/VALIDATION.md)。
