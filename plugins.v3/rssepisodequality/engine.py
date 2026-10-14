@@ -36,31 +36,74 @@ class EmbyLibrary:
         self.request = request
         self.page_size = page_size
 
+    @staticmethod
+    def _describe(endpoint):
+        """Endpoint kind for diagnostics; never includes host, token or query values."""
+        return '剧集列表' if endpoint.endswith('/Episodes') else '剧集搜索'
+
+    def all_items(self, endpoint, params):
+        """One unpaged request, for per-series episode lists.
+
+        With multiple versions per episode, TotalRecordCount may count episodes while Items lists
+        every version, so paging by StartIndex against that count can stop early and silently drop
+        versions. A single request avoids paging entirely. It is still uncertain if fewer items
+        than reported come back (whatever the server counts, it must have returned at least that many).
+        """
+        kind = self._describe(endpoint)
+        payload = self.request(endpoint, dict(params))
+        if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+            raise UncertainLibrary(f'媒体库{kind}响应缺少 Items 列表')
+        total = payload.get('TotalRecordCount')
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise UncertainLibrary(f'媒体库{kind}响应缺少有效 TotalRecordCount')
+        items = payload['Items']
+        if any(not isinstance(item, dict) or not re.fullmatch(r'[A-Za-z0-9-]+', str(item.get('Id') or '')) for item in items):
+            raise UncertainLibrary(f'媒体库{kind}返回无效条目')
+        if len(items) < total:
+            raise UncertainLibrary(f'媒体库{kind}返回不完整（取得 {len(items)} / 报告 {total}）')
+        if len(items) > 20000:
+            raise UncertainLibrary(f'媒体库{kind}超过保护上限')
+        return items
+
     def items(self, endpoint, params):
-        all_items = []
+        """Read every page and only fail when results may be *missing*.
+
+        Emby/Jellyfin sometimes return more items than TotalRecordCount claims (estimated counts
+        for searches, versions counted per episode) or ignore Limit and return everything at once.
+        Extra items can only make an episode look present, never absent, so they are accepted.
+        Fewer collected items than reported, a count change mid-way, or a server that ignores
+        StartIndex (no new IDs on the next page) still mean the lookup is uncertain.
+        """
+        kind = self._describe(endpoint)
+        all_items, seen = [], set()
         start = 0
         expected_total = None
         while True:
             payload = self.request(endpoint, {**params, 'StartIndex': start, 'Limit': self.page_size})
             if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
-                raise UncertainLibrary('媒体库响应缺少 Items 列表')
+                raise UncertainLibrary(f'媒体库{kind}响应缺少 Items 列表')
             total = payload.get('TotalRecordCount')
             if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-                raise UncertainLibrary('媒体库响应缺少有效 TotalRecordCount')
+                raise UncertainLibrary(f'媒体库{kind}响应缺少有效 TotalRecordCount')
             if expected_total is not None and expected_total != total:
-                raise UncertainLibrary('分页期间媒体库数量变化')
+                raise UncertainLibrary(f'分页期间媒体库{kind}数量变化（{expected_total}→{total}）')
             expected_total = total
             items = payload['Items']
-            if len(items) > self.page_size or start + len(items) > total:
-                raise UncertainLibrary('媒体库分页数量不一致')
             if any(not isinstance(item, dict) or not re.fullmatch(r'[A-Za-z0-9-]+', str(item.get('Id') or '')) for item in items):
-                raise UncertainLibrary('媒体库返回无效条目')
-            all_items.extend(items)
+                raise UncertainLibrary(f'媒体库{kind}返回无效条目')
+            # De-duplicate only against earlier pages (a server ignoring StartIndex repeats them).
+            fresh = [item for item in items if str(item['Id']) not in seen]
+            seen.update(str(item['Id']) for item in items)
+            all_items.extend(fresh)
             start += len(items)
-            if start == total:
-                return all_items
-            if not items or start > 20000:
-                raise UncertainLibrary('媒体库分页不完整或超过保护上限')
+            # A short page ends the listing; a page with no new IDs means paging is ignored.
+            if len(items) < self.page_size or not fresh:
+                break
+            if start > 20000:
+                raise UncertainLibrary(f'媒体库{kind}超过分页保护上限')
+        if len(all_items) < expected_total:
+            raise UncertainLibrary(f'媒体库{kind}返回不完整（取得 {len(all_items)} / 报告 {expected_total}）')
+        return all_items
 
     @staticmethod
     def identity(item, source):
@@ -95,7 +138,7 @@ class EmbyLibrary:
                 raise UncertainLibrary('同名同年份剧集缺少媒体ID，不能确认缺集')
         library = Library()
         for item_id in matched:
-            episodes = self.items(f'Shows/{item_id}/Episodes', {
+            episodes = self.all_items(f'Shows/{item_id}/Episodes', {
                 'IsMissing': 'false', 'IsVirtual': 'false',
                 'Fields': 'MediaSources,MediaStreams,Path,ProviderIds',
             })

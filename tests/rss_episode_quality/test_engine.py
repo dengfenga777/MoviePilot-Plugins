@@ -44,23 +44,74 @@ class LibraryTests(unittest.TestCase):
             if endpoint == 'Shows/1/Episodes': return self.payload([self.episode(IndexNumberEnd=2)])
             return self.payload([self.episode(id='e3', ep=3)])
         self.assertEqual(self.query(request).coverage(), {'1': [1, 2, 3]})
-    def test_complete_pagination(self):
+    def test_complete_series_pagination(self):
+        series = [self.series(id=str(i)) for i in range(1, 6)]
+        def request(endpoint, params):
+            if endpoint == 'Items':
+                start = params['StartIndex']
+                return {'Items': series[start:start+2], 'TotalRecordCount': 5}
+            sid = endpoint.split('/')[1]
+            return self.payload([self.episode(id=f'e{sid}', ep=int(sid))])
+        self.assertEqual(self.query(request).coverage(), {'1': [1, 2, 3, 4, 5]})
+    def test_episode_list_is_one_unpaged_request(self):
+        calls = []
         def request(endpoint, params):
             if endpoint == 'Items': return self.payload([self.series()])
-            all_items = [self.episode(id=f'e{i}', ep=i) for i in range(1, 6)]
-            start = params['StartIndex']
-            return {'Items': all_items[start:start+2], 'TotalRecordCount': 5}
+            calls.append(params)
+            return self.payload([self.episode(id=f'e{i}', ep=i) for i in range(1, 6)])
         self.assertEqual(self.query(request).coverage(), {'1': [1, 2, 3, 4, 5]})
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('StartIndex', calls[0]); self.assertNotIn('Limit', calls[0])
+    def test_multi_version_library_counts_episodes_not_versions(self):
+        # 34 episodes, several versions each: Emby reports 34 but lists 280 version items.
+        versions = [self.episode(id=f'v{n}', ep=(n % 34) + 1) for n in range(280)]
+        def request(endpoint, params):
+            if endpoint == 'Items': return self.payload([self.series()])
+            return {'Items': versions, 'TotalRecordCount': 34}
+        library = self.query(request)
+        self.assertEqual(library.coverage(), {'1': list(range(1, 35))})
+        self.assertEqual(sum(len(v) for v in library.episodes.values()), 280)
     def test_incomplete_page_never_means_missing(self):
         with self.assertRaises(e.UncertainLibrary): self.query(lambda *_: {'Items': [], 'TotalRecordCount': 3})
     def test_unknown_episode_number_is_uncertain(self):
         def request(endpoint, params):
             return self.payload([self.series()]) if endpoint == 'Items' else self.payload([{'Id': 'e1'}])
         with self.assertRaises(e.UncertainLibrary): self.query(request)
-    def test_changing_page_count_is_uncertain(self):
+    def test_more_items_than_reported_total_is_accepted(self):
+        # Emby search counts can under-report; extra items only make episodes look present.
+        def request(endpoint, params):
+            if endpoint == 'Items': return {'Items': [self.series()], 'TotalRecordCount': 0}
+            return {'Items': [self.episode(id='e1', ep=1)], 'TotalRecordCount': 0}
+        self.assertEqual(self.query(request).coverage(), {'1': [1]})
+    def test_server_ignoring_limit_returns_everything(self):
         def request(endpoint, params):
             if endpoint == 'Items': return self.payload([self.series()])
-            return {'Items': [self.episode()], 'TotalRecordCount': 2 if params['StartIndex']==0 else 3}
+            return self.payload([self.episode(id=f'e{i}', ep=i) for i in range(1, 6)])
+        self.assertEqual(self.query(request).coverage(), {'1': [1, 2, 3, 4, 5]})
+    def test_server_ignoring_start_index_is_uncertain(self):
+        # Series search honors Limit but always returns the first page: the rest can never be read.
+        def request(endpoint, params):
+            if endpoint == 'Items':
+                return {'Items': [self.series(id='1'), self.series(id='2')], 'TotalRecordCount': 5}
+            return self.payload([])
+        with self.assertRaises(e.UncertainLibrary) as ctx: self.query(request)
+        self.assertIn('2 / 报告 5', str(ctx.exception))
+    def test_fewer_items_than_reported_is_uncertain(self):
+        def request(endpoint, params):
+            if endpoint == 'Items': return self.payload([self.series()])
+            return {'Items': [self.episode()], 'TotalRecordCount': 3}
+        with self.assertRaises(e.UncertainLibrary): self.query(request)
+    def test_duplicate_ids_within_one_page_are_kept(self):
+        def request(endpoint, params):
+            if endpoint == 'Items': return self.payload([self.series()])
+            return {'Items': [self.episode(id='e1', ep=1)], 'TotalRecordCount': 1}
+        e.EmbyLibrary(request, page_size=5).query('tmdb', '301494', '余红旧事', 2026)
+    def test_changing_page_count_is_uncertain(self):
+        def request(endpoint, params):
+            if endpoint == 'Items':
+                return {'Items': [self.series(id=str(params['StartIndex']+1)), self.series(id=str(params['StartIndex']+2))],
+                        'TotalRecordCount': 4 if params['StartIndex']==0 else 5}
+            return self.payload([])
         with self.assertRaises(e.UncertainLibrary): self.query(request)
 
 class DecisionTests(unittest.TestCase):
