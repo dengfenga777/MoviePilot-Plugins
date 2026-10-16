@@ -40,6 +40,18 @@ BARE_IGNORE = {480, 576, 720, 1080, 1440, 2160, 4320}
 
 CN_N = r"[0-9零一二两三四五六七八九十]+"
 
+# 自动识别（不带 /mp）时，太长、多行或提到多个 TMDB ID 的消息多半是公告 / 教程，不处理
+AUTO_MAX_LEN = 120
+AUTO_MAX_LINES = 3
+
+
+def is_chatter(text: str) -> bool:
+    text = (text or "").strip()
+    if len(text) > AUTO_MAX_LEN or len([l for l in text.splitlines() if l.strip()]) > AUTO_MAX_LINES:
+        return True
+    ids = {m.group("id") for p in TMDB_PATTERNS for m in p.finditer(text)}
+    return len(ids) > 1
+
 
 def cn2int(s: str) -> int:
     if s.isdigit():
