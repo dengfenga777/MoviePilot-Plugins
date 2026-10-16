@@ -100,9 +100,9 @@ class SimpleCalls:
         self.library, self.lib_checks = None, 0  # 媒体库里已有的 {季: [集]}，None = 库里没有
 
 
-def ctx(title, season, b=None, e=None, seeders=5, pri=0, free=True):
+def ctx(title, season, b=None, e=None, seeders=5, pri=0, free=True, gb=2):
     return NS(meta_info=NS(begin_season=season, begin_episode=b, end_episode=e, episode_list=[]),
-              torrent_info=NS(title=title, seeders=seeders, site_name="X", size=2 * 1024 ** 3,
+              torrent_info=NS(title=title, seeders=seeders, site_name="X", size=gb * 1024 ** 3,
                               downloadvolumefactor=0 if free else 1, pri_order=pri),
               media_info=NS(title="某剧", year="2026"))
 
@@ -206,6 +206,32 @@ class PickTest(unittest.TestCase):
               ctx("free 5", 1, 5, seeders=5)]
         # 60 和 40 同一档 → 免费优先；5 做种低一档排后面
         self.assertEqual(self.titles(pick(rs, 1, 5)), ["free 40", "paid 60", "free 5"])
+
+
+class SizeRankTest(unittest.TestCase):
+    titles = staticmethod(PickTest.titles)
+
+    def test_bigger_per_episode_wins_within_same_quality(self):
+        rs = [ctx("small free busy", 1, 11, 12, seeders=80, gb=0.9),   # 两集包，每集 0.45G
+              ctx("big paid", 1, 11, seeders=12, free=False, gb=3),
+              ctx("big pack", 1, 11, 12, seeders=12, gb=6)]             # 两集包，每集 3G
+        self.assertEqual(self.titles(pick(rs, 1, 11)), ["big pack", "big paid", "small free busy"])
+
+    def test_quality_and_low_seeders_still_first(self):
+        rs = [ctx("huge 1080p", 1, 5, seeders=40, pri=10, gb=12), ctx("2160p", 1, 5, seeders=40, pri=90, gb=3),
+              ctx("huge dead", 1, 5, seeders=1, pri=90, gb=20)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["2160p", "huge 1080p", "huge dead"])
+
+    def test_similar_size_falls_back_to_seeders_and_free(self):
+        rs = [ctx("2.2G paid", 1, 5, seeders=40, free=False, gb=2.2), ctx("2.6G free", 1, 5, seeders=40, gb=2.6)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["2.6G free", "2.2G paid"])
+        rs = [ctx("2.2G free", 1, 5, seeders=40, gb=2.2), ctx("3.9G paid", 1, 5, seeders=40, free=False, gb=3.9)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["2.2G free", "3.9G paid"])   # 同一档，免费优先
+
+    def test_season_pack_uses_season_episode_count(self):
+        rs = [ctx("pack 30G", 1, gb=30), ctx("single 1G", 1, 5, gb=1)]
+        self.assertEqual(self.titles(pick(rs, 1, 5, season_eps=10)), ["pack 30G", "single 1G"])
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["single 1G", "pack 30G"])  # 不知道总集数就不比大小
 
 
 class HideSiteTest(unittest.TestCase):
