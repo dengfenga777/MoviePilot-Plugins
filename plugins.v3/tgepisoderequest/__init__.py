@@ -46,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -80,6 +80,7 @@ class TgEpisodeRequest(_PluginBase):
     _admin_ids: Set[int] = set()
     _trigger: str = "auto"
     _auto_download: bool = True
+    _check_library: bool = True
     _allow_bare_id: bool = True
     _allow_pack: bool = True
     _min_seeders: int = 1
@@ -118,6 +119,7 @@ class TgEpisodeRequest(_PluginBase):
             self._admin_ids = self.__ids(config.get("admin_ids"))
             self._trigger = config.get("trigger") or "auto"
             self._auto_download = bool(config.get("auto_download", True))
+            self._check_library = bool(config.get("check_library", True))
             self._allow_bare_id = config.get("allow_bare_id", True)
             self._allow_pack = config.get("allow_pack", True)
             self._min_seeders = self.__int(config.get("min_seeders"), 1)
@@ -357,6 +359,12 @@ class TgEpisodeRequest(_PluginBase):
         if not job:
             return
         req = job.req
+        in_library, lib_note = self.__check_library(job)
+        if in_library:
+            bot.edit(job.chat_id, job.message_id, in_library)
+            self.__expire_job(job)
+            self.__record(job, "已在库里")
+            return
         refuse = self.__check_credits(job)
         if refuse:
             bot.edit(job.chat_id, job.message_id, refuse)
@@ -393,7 +401,47 @@ class TgEpisodeRequest(_PluginBase):
         note = ""
         if self._auto_download:
             note = self.__download_all(job)
-        self.__render(bot, jid, note)
+        self.__render(bot, jid, "\n".join(n for n in (lib_note, note) if n))
+
+    def __check_library(self, job: Job) -> Tuple[str, str]:
+        """求片 / 缺集先查媒体库：全在库里返回 (回复, "")；部分在库里只留缺的集，返回 ("", 说明)。
+        报资源有问题的不查，直接重下；查询出错时不拦，照常搜索。"""
+        req = job.req
+        if not self._check_library or req.intent == "replace":
+            return "", ""
+        mtype = MediaType.MOVIE if req.is_movie else MediaType.TV
+        try:
+            media = self.chain.recognize_media(mtype=mtype, media_source=MediaSource.TMDB,
+                                               media_id=str(req.tmdbid))
+            exist = self.chain.media_exists(mediainfo=media) if media else None
+        except Exception as e:
+            logger.warning(f"TG群组智能补集：查询媒体库失败，照常搜索 {req.describe()}：{e}")
+            return "", ""
+        if not media or not exist:
+            return "", ""
+        job.title = f"{media.title} ({media.year})" if media.year else (media.title or "")
+        title = f"<b>{html.escape(job.title)}</b>"
+        tip = "\n如果是资源有问题（花屏、没字幕、音画不同步等），请带上具体问题再发一次，会重新下载别的版本。"
+        if req.is_movie:
+            return f"📚 {title} 已经在库里了，可以直接去看。{tip}", ""
+        have = set((exist.seasons or {}).get(req.season) or [])
+        if not have:
+            return "", ""
+        wanted = req.episodes or sorted((getattr(media, "seasons", None) or {}).get(req.season) or [])
+        if not wanted:
+            return "", ""
+        exists = [e for e in wanted if e in have]
+        missing = [e for e in wanted if e not in have]
+        season = f"S{req.season:02d}" if req.season else ""
+        if not missing:
+            what = " ".join(self.__ep_label(e) for e in exists) if req.episodes else "整季"
+            return f"📚 {title} {season} {what} 已经在库里了，可以直接去看。{tip}", ""
+        if not exists:
+            return "", ""
+        req.episodes = missing
+        shown = exists if len(exists) <= 8 else exists[:8]
+        more = f" 等 {len(exists)} 集" if len(exists) > 8 else ""
+        return "", f"📚 {' '.join(self.__ep_label(e) for e in shown)}{more} 已在库里，只下缺的 {len(missing)} 集"
 
     def __download_all(self, job: Job) -> str:
         """每集按排序依次尝试，第一个失败就换下一个候选。"""
@@ -774,6 +822,7 @@ class TgEpisodeRequest(_PluginBase):
                         col(4, "VSwitch", model="enabled", label="启用插件"),
                         col(4, "VSwitch", model="proxy", label="使用系统代理访问 Telegram"),
                         col(4, "VSwitch", model="auto_download", label="自动下载最优资源（关闭则需点按钮选择）"),
+                        col(4, "VSwitch", model="check_library", label="求片前先查媒体库（已有的不下，报问题的照常重下）"),
                     ]},
                     {"component": "VRow", "content": [
                         col(12, "VTextField", model="token", label="机器人 Token",
@@ -864,6 +913,7 @@ class TgEpisodeRequest(_PluginBase):
             "token": "",
             "proxy": True,
             "auto_download": True,
+            "check_library": True,
             "allowed_chats": "",
             "admin_ids": "",
             "trigger": "auto",
