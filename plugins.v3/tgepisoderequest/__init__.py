@@ -17,7 +17,7 @@ from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 
 from .billing import PmsClient, PmsError, PmsInsufficient, PmsUserNotFound, Usage, charge_key
-from .picker import brief, clean_title, episodes_of, pick
+from .picker import brief, clean_title, episode_size, episodes_of, pick
 from .telegram import TelegramBot, TelegramConflict, button
 from .tgparse import Request, is_chatter, parse
 
@@ -46,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -393,10 +393,12 @@ class TgEpisodeRequest(_PluginBase):
         media = results[0].media_info
         if media:
             job.title = f"{media.title} ({media.year})" if media.year else (media.title or "")
+        season_eps = len(((getattr(media, "seasons", None) or {}).get(req.season) or [])) or None
         for ep in req.episodes or [0]:
             job.choices[ep] = pick(results, req.season, ep or None, allow_pack=self._allow_pack,
                                    min_seeders=self._min_seeders, low_seeders=self._low_seeders,
-                                   limit=self._candidates)
+                                   limit=self._candidates, season_eps=season_eps)
+            self.__log_candidates(req, ep, job.choices[ep], season_eps)
 
         note = ""
         if self._auto_download:
@@ -442,6 +444,21 @@ class TgEpisodeRequest(_PluginBase):
         shown = exists if len(exists) <= 8 else exists[:8]
         more = f" 等 {len(exists)} 集" if len(exists) > 8 else ""
         return "", f"📚 {' '.join(self.__ep_label(e) for e in shown)}{more} 已在库里，只下缺的 {len(missing)} 集"
+
+    def __log_candidates(self, req: Request, ep: int, cands: list, season_eps: Optional[int]):
+        if not cands:
+            logger.info(f"TG群组智能补集：{req.describe()} {self.__ep_label(ep)} 没有合适的候选")
+            return
+        lines = []
+        for i, c in enumerate(cands, 1):
+            t = c.torrent_info
+            size = episode_size(c, ep or None, season_eps)
+            dvf = getattr(t, "downloadvolumefactor", None)
+            lines.append(f"  {i}. 做种 {getattr(t, 'seeders', 0) or 0}"
+                         f" | 每集 {f'{size / 1024 ** 3:.2f}G' if size else '?'}"
+                         f" | {'免费' if dvf == 0 else '不免费' if dvf is None or dvf >= 1 else f'{int(dvf * 100)}%'}"
+                         f" | 规则等级 {getattr(t, 'pri_order', 0) or 0} | {getattr(t, 'title', '')}")
+        logger.info(f"TG群组智能补集：{req.describe()} {self.__ep_label(ep)} 候选排序：\n" + "\n".join(lines))
 
     def __download_all(self, job: Job) -> str:
         """每集按排序依次尝试，第一个失败就换下一个候选。"""

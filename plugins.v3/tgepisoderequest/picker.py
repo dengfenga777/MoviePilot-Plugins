@@ -1,6 +1,7 @@
 """从 MoviePilot 搜索结果（Context 列表）里为某一集挑候选。纯函数，不依赖 MoviePilot。"""
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, List, Optional
 
@@ -42,17 +43,38 @@ def _seed_tier(seeders: int) -> int:
     return 0
 
 
+def episode_size(ctx: Any, episode: Optional[int], season_eps: Optional[int] = None) -> Optional[float]:
+    """每集大约多大（字节）。电影 / 整季请求按整个种子算；整季包认不出集数又不知道总集数时返回 None。"""
+    size = getattr(getattr(ctx, "torrent_info", None), "size", 0) or 0
+    if not size:
+        return None
+    if episode is None:
+        return float(size)
+    eps = episodes_of(ctx)
+    n = len(eps) if eps else season_eps
+    return size / n if n else None
+
+
+def _size_tier(size: Optional[float]) -> int:
+    """大小翻一倍升一档（256MB 起算），差不多大的算同一档，再比做种和免费。"""
+    base = 256 * 1024 ** 2
+    if not size or size < base:
+        return 0
+    return min(10, int(math.log2(size / base)) + 1)
+
+
 def pick(results: List[Any], season: Optional[int], episode: Optional[int],
          allow_pack: bool = True, min_seeders: int = 1, low_seeders: int = 3,
-         limit: int = 3) -> List[Any]:
+         limit: int = 3, season_eps: Optional[int] = None) -> List[Any]:
     """兼顾速度和画质的排序：
 
     1. 做种数少于 low_seeders 的排到最后（下不动）
     2. 画质：MoviePilot 规则组匹配等级 pri_order，越高越好
-    3. 同画质下做种多的优先（按档）
-    4. 免费优先
-    5. 单集 > 多集包 > 整季包（包只勾选需要的集，差别不大，放最后）
-    6. 做种数、MoviePilot 原始顺序兜底
+    3. 同画质下每集越大越好（按档，大小翻倍算一档）
+    4. 做种多的优先（按档）
+    5. 免费优先
+    6. 单集 > 多集包 > 整季包（包只勾选需要的集，差别不大，放最后）
+    7. 做种数、MoviePilot 原始顺序兜底
     """
     scored = []
     for idx, ctx in enumerate(results):
@@ -77,7 +99,8 @@ def pick(results: List[Any], season: Optional[int], episode: Optional[int],
             else:
                 continue
         free = getattr(torrent, "downloadvolumefactor", None) == 0
-        key = (seeders < low_seeders, -(getattr(torrent, "pri_order", 0) or 0), -_seed_tier(seeders),
+        key = (seeders < low_seeders, -(getattr(torrent, "pri_order", 0) or 0),
+               -_size_tier(episode_size(ctx, episode, season_eps)), -_seed_tier(seeders),
                not free, kind, -seeders, idx)
         scored.append((key, ctx))
     scored.sort(key=lambda x: x[0])
