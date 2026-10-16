@@ -11,10 +11,12 @@ from app.chain.download import DownloadChain
 from app.chain.search.facade import SearchChain
 from app.chain.tmdb import TmdbChain
 from app.plugins import _PluginBase
-from app.schemas.types import MediaSource, MediaType
+from app.schemas.types import EventType, MediaSource, MediaType
 from app.sdk.config import settings
+from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 
+from .billing import PmsClient, PmsError, PmsInsufficient, PmsUserNotFound, Usage, charge_key
 from .picker import brief, clean_title, episodes_of, pick
 from .telegram import TelegramBot, TelegramConflict, button
 from .tgparse import Request, parse
@@ -27,6 +29,7 @@ class Job:
     user_name: str
     chat_id: int
     message_id: int = 0
+    reply_to: int = 0  # 群友发的原始求片消息
     title: str = ""
     # 集数（0 = 整季 / 电影）-> 候选 Context
     choices: Dict[int, list] = field(default_factory=dict)
@@ -43,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -67,6 +70,7 @@ class TgEpisodeRequest(_PluginBase):
     _jobs: Dict[str, Job] = {}
     _jobs_lock = threading.Lock()
     _bot_username: str = ""
+    _data_lock = threading.Lock()
 
     # 配置
     _enabled: bool = False
@@ -84,6 +88,16 @@ class TgEpisodeRequest(_PluginBase):
     _max_episodes: int = 12
     _downloader: str = ""
     _save_path: str = ""
+    _notify_arrival: bool = True
+    _pending_days: int = 7
+    _pms_enabled: bool = False
+    _pms_url: str = ""
+    _pms_token: str = ""
+    _movie_price: float = 10
+    _season_price: float = 20
+    _free_movies: int = 3
+    _free_seasons: int = 2
+    _admin_free: bool = True
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -109,6 +123,16 @@ class TgEpisodeRequest(_PluginBase):
             self._max_episodes = self.__int(config.get("max_episodes"), 12)
             self._downloader = str(config.get("downloader") or "").strip()
             self._save_path = str(config.get("save_path") or "").strip()
+            self._notify_arrival = config.get("notify_arrival", True)
+            self._pending_days = max(1, self.__int(config.get("pending_days"), 7))
+            self._pms_enabled = bool(config.get("pms_enabled"))
+            self._pms_url = str(config.get("pms_url") or "").strip()
+            self._pms_token = str(config.get("pms_token") or "").strip()
+            self._movie_price = self.__num(config.get("movie_price"), 10)
+            self._season_price = self.__num(config.get("season_price"), 20)
+            self._free_movies = self.__int(config.get("free_movies"), 3)
+            self._free_seasons = self.__int(config.get("free_seasons"), 2)
+            self._admin_free = config.get("admin_free", True)
 
         self._jobs = {}
         self._search_lock = threading.Semaphore(2)
@@ -161,6 +185,13 @@ class TgEpisodeRequest(_PluginBase):
     def __int(value, default: int) -> int:
         try:
             return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def __num(value, default: float) -> float:
+        try:
+            return max(0.0, float(value))
         except (TypeError, ValueError):
             return default
 
@@ -258,8 +289,8 @@ class TgEpisodeRequest(_PluginBase):
             return
         user = msg.get("from") or {}
         job = Job(req=req, user_id=user.get("id", 0),
-                  user_name=user.get("username") or user.get("first_name") or str(user.get("id", "")),
-                  chat_id=chat_id)
+                  user_name=user.get("first_name") or user.get("username") or str(user.get("id", "")),
+                  chat_id=chat_id, reply_to=reply_to or 0)
         jid = secrets.token_hex(4)
         with self._jobs_lock:
             self._jobs[jid] = job
@@ -299,6 +330,11 @@ class TgEpisodeRequest(_PluginBase):
         if not job:
             return
         req = job.req
+        refuse = self.__check_credits(job)
+        if refuse:
+            bot.edit(job.chat_id, job.message_id, refuse)
+            self.__record(job, "积分不足" if "积分不足" in refuse else "未通过积分检查")
+            return
         try:
             with self._search_lock:
                 results = SearchChain().search_by_id(
@@ -372,6 +408,7 @@ class TgEpisodeRequest(_PluginBase):
             return error or "添加下载失败"
         for e in covered:
             job.done[e] = title
+        self.__track(job, str(did), sorted(e for e in covered if e))
         self.__record(job, "已下载", title, sorted(e for e in covered if e))
         logger.info(f"TG群组智能补集：{job.user_name} 请求 {job.req.describe()}，已推送 {title}")
         return None
@@ -452,6 +489,178 @@ class TgEpisodeRequest(_PluginBase):
             bot.edit(job.chat_id, job.message_id, f"已取消：{job.req.describe()}")
             self.__record(job, "已取消")
 
+    # ---------------- PMS 积分 ----------------
+
+    def __billable(self, job: Job) -> bool:
+        if not (self._pms_enabled and self._pms_url and self._pms_token):
+            return False
+        if job.req.intent == "replace":  # 报错重下不收费
+            return False
+        return not (self._admin_free and job.user_id in self._admin_ids)
+
+    def __price(self, is_movie: bool) -> Tuple[str, float, int]:
+        """(额度类型, 价格, 每月免费数)"""
+        if is_movie:
+            return "movie", self._movie_price, self._free_movies
+        return "season", self._season_price, self._free_seasons
+
+    @staticmethod
+    def __kind_name(kind: str) -> str:
+        return "电影" if kind == "movie" else "剧集一季"
+
+    def __usage(self) -> Usage:
+        return Usage(self.get_data("pms_usage"))
+
+    def __check_credits(self, job: Job) -> Optional[str]:
+        """求片前检查：有免费额度或积分够就放行，否则返回拒绝理由。真正扣费在入库后。"""
+        if not self.__billable(job):
+            return None
+        req = job.req
+        kind, price, quota = self.__price(req.is_movie)
+        usage = self.__usage()
+        if price <= 0 or usage.is_paid(job.user_id, charge_key(req.tmdbid, req.is_movie, req.season)):
+            return None
+        if usage.left(job.user_id, kind, quota) > 0:
+            return None
+        try:
+            balance = PmsClient(self._pms_url, self._pms_token).balance(job.user_id)
+        except PmsUserNotFound:
+            return "❌ 你还没有在 PMS 绑定账号，绑定后才能求片"
+        except PmsError as e:
+            logger.error(f"TG群组智能补集：查询积分失败：{e}")
+            return "❌ 积分系统暂时连不上，稍后再试"
+        if balance < price:
+            return (f"❌ 积分不足：本月免费的{self.__kind_name(kind)}额度已用完，"
+                    f"求{self.__kind_name(kind)}需要 {price:g} 积分，你当前 {balance:g}")
+        return None
+
+    def __settle(self, rec: Dict) -> str:
+        """入库后结算一次：先用免费额度，用完扣 PMS 积分。返回附在提醒里的说明。"""
+        if not rec.get("billable") or rec.get("settled"):
+            return ""
+        uid = rec["user_id"]
+        key = charge_key(rec["tmdbid"], rec["is_movie"], rec.get("season"))
+        kind, price, quota = self.__price(rec["is_movie"])
+        name = self.__kind_name(kind)
+        with self._data_lock:
+            usage = self.__usage()
+            if price <= 0 or usage.is_paid(uid, key):
+                rec["settled"] = True
+                return ""
+            if usage.left(uid, kind, quota) > 0:
+                usage.consume(uid, kind)
+                usage.mark_paid(uid, key)
+                self.save_data("pms_usage", usage.to_dict())
+                rec["settled"] = True
+                return f"（使用本月免费{name}额度，还剩 {usage.left(uid, kind, quota)} 次）"
+        reason = f"求片 {rec.get('title') or ''} {rec.get('label') or ''}".strip()
+        try:
+            res = PmsClient(self._pms_url, self._pms_token).charge(uid, price, f"mp:{uid}:{key}", reason)
+        except PmsInsufficient as e:
+            rec["settled"] = True
+            logger.warning(f"TG群组智能补集：{rec['user_name']} 入库扣费失败（积分不足）：{e}")
+            return f"（积分不足，{price:g} 积分没能扣除）"
+        except PmsError as e:
+            logger.error(f"TG群组智能补集：{rec['user_name']} 入库扣费失败：{e}")
+            return "（积分暂未扣除，下一集入库时会重试）" if not rec["is_movie"] else "（积分暂未扣除）"
+        rec["settled"] = True
+        with self._data_lock:
+            usage = self.__usage()
+            usage.mark_paid(uid, key)
+            self.save_data("pms_usage", usage.to_dict())
+        return f"（扣除 {price:g} 积分，余额 {res.get('balance', 0):g}）"
+
+    # ---------------- 入库提醒 ----------------
+
+    def __track(self, job: Job, download_hash: str, episodes: List[int]):
+        """记下这个下载是谁求的，等 MoviePilot 整理完成后提醒他。"""
+        if not (self._notify_arrival or self.__billable(job)) or not download_hash:
+            return
+        req = job.req
+        with self._data_lock:
+            arrivals = self.__live_arrivals()
+            arrivals[download_hash.lower()] = {
+                "user_id": job.user_id, "user_name": job.user_name, "chat_id": job.chat_id,
+                "reply_to": job.reply_to, "tmdbid": req.tmdbid, "is_movie": req.is_movie,
+                "season": req.season, "episodes": episodes, "arrived": [], "title": job.title,
+                "label": "" if req.is_movie else f"S{req.season or 0:02d}",
+                "billable": self.__billable(job), "settled": False, "created": time.time(),
+            }
+            self.save_data("arrivals", arrivals)
+
+    def __live_arrivals(self) -> Dict[str, Dict]:
+        ttl = self._pending_days * 86400
+        now = time.time()
+        return {h: r for h, r in (self.get_data("arrivals") or {}).items() if now - r.get("created", 0) < ttl}
+
+    @staticmethod
+    def __field(data, name):
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            return data.get(name)
+        return getattr(data, name, None)
+
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event):
+        if not self.get_state():
+            return
+        data = getattr(event, "event_data", None)
+        download_hash = str(self.__field(data, "download_hash") or "").lower()
+        if not download_hash:
+            return
+        transferinfo = self.__field(data, "transferinfo")
+        if transferinfo is not None and self.__field(transferinfo, "success") is False:
+            return
+        meta = self.__field(data, "meta")
+        meta_eps = set(self.__field(meta, "episode_list") or [])
+        begin, end = self.__field(meta, "begin_episode"), self.__field(meta, "end_episode")
+        if not meta_eps and begin:
+            meta_eps = set(range(begin, (end or begin) + 1))
+
+        with self._data_lock:
+            arrivals = self.__live_arrivals()
+            rec = arrivals.get(download_hash)
+            if not rec:
+                return
+            wanted = set(rec["episodes"]) - set(rec["arrived"])
+            # 认不出集数（或电影）时当作这次请求的都到了
+            new = sorted(wanted & meta_eps) if (wanted and meta_eps) else sorted(wanted)
+            if wanted and not new:
+                return
+            rec["arrived"] = sorted(set(rec["arrived"]) | set(new))
+            if rec["arrived"] == sorted(rec["episodes"]):
+                arrivals.pop(download_hash, None)
+            self.save_data("arrivals", arrivals)
+
+        note = self.__settle(rec)
+        if rec.get("settled"):
+            # 剧集还有没到的集：记下已结算，后面的集只提醒不再扣费
+            with self._data_lock:
+                cur = self.__live_arrivals()
+                if download_hash in cur:
+                    cur[download_hash]["settled"] = True
+                    self.save_data("arrivals", cur)
+        if self._notify_arrival:
+            self.__notify(rec, new, note)
+
+    def __notify(self, rec: Dict, episodes: List[int], note: str):
+        bot = self._bot
+        if not bot:
+            return
+        who = f'<a href="tg://user?id={rec["user_id"]}">{html.escape(rec["user_name"] or "你")}</a>'
+        title = rec.get("title") or f"TMDB {rec['tmdbid']}"
+        what = f"《{html.escape(title)}》"
+        if not rec["is_movie"]:
+            what += " " + (rec.get("label") or "")
+            if episodes:
+                what += " " + "、".join(f"E{e:02d}" for e in episodes)
+        text = f"🎬 {who} 你求的 {what} 已入库，可以去看了！{note}"
+        try:
+            bot.send(rec["chat_id"], text, reply_to=rec.get("reply_to") or None)
+        except Exception as e:
+            logger.warning(f"TG群组智能补集：发送入库提醒失败：{e}")
+
     # ---------------- 历史 ----------------
 
     def __record(self, job: Job, status: str, torrent: str = "", episodes: Optional[List[int]] = None):
@@ -522,6 +731,35 @@ class TgEpisodeRequest(_PluginBase):
                         col(6, "VTextField", model="save_path", label="保存路径", placeholder="留空按目录设置自动选择"),
                     ]},
                     {"component": "VRow", "content": [
+                        col(4, "VSwitch", model="notify_arrival", label="入库后在群里 @ 求片的人"),
+                        col(4, "VTextField", model="pending_days", label="等待入库天数", type="number",
+                            hint="超过这么多天还没入库就不再提醒、不扣积分", persistent_hint=True),
+                    ]},
+                    {"component": "VDivider"},
+                    {"component": "VRow", "content": [
+                        col(4, "VSwitch", model="pms_enabled", label="对接 PMS 积分"),
+                        col(4, "VSwitch", model="admin_free", label="管理员求片免费"),
+                    ]},
+                    {"component": "VRow", "content": [
+                        col(6, "VTextField", model="pms_url", label="PMS 地址", placeholder="https://pms.example.com"),
+                        col(6, "VTextField", model="pms_token", label="PMS 接口密钥",
+                            hint="PMSManageBot 里的 MP_CREDITS_API_TOKEN", persistent_hint=True),
+                    ]},
+                    {"component": "VRow", "content": [
+                        col(3, "VTextField", model="movie_price", label="电影 积分/部", type="number"),
+                        col(3, "VTextField", model="season_price", label="剧集 积分/季", type="number"),
+                        col(3, "VTextField", model="free_movies", label="每月免费电影（部）", type="number"),
+                        col(3, "VTextField", model="free_seasons", label="每月免费剧集（季）", type="number"),
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [{
+                            "component": "VAlert",
+                            "props": {"type": "info", "variant": "tonal", "density": "compact", "text":
+                                      "求片前检查免费额度和积分，不够直接拒绝；入库后才用掉额度或扣积分，没入库不收。"
+                                      "同一个人求同一部电影 / 同一季只收一次；「资源有问题」重下不收费。"},
+                        }]},
+                    ]},
+                    {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [{
                             "component": "VAlert",
                             "props": {"type": "info", "variant": "tonal", "text":
@@ -549,6 +787,16 @@ class TgEpisodeRequest(_PluginBase):
             "max_episodes": 12,
             "downloader": "",
             "save_path": "",
+            "notify_arrival": True,
+            "pending_days": 7,
+            "pms_enabled": False,
+            "pms_url": "",
+            "pms_token": "",
+            "admin_free": True,
+            "movie_price": 10,
+            "season_price": 20,
+            "free_movies": 3,
+            "free_seasons": 2,
         }
 
     def get_page(self) -> List[dict]:

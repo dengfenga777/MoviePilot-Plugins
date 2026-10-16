@@ -21,6 +21,14 @@ def _stub_moviepilot():
         MOVIE = "电影"
         TV = "电视剧"
 
+    class EventType(Enum):
+        TransferComplete = "transfer.complete"
+
+    class _EventManager:
+        @staticmethod
+        def register(_etype):
+            return lambda fn: fn
+
     class _PluginBase:
         def __init__(self):
             self._data = {}
@@ -57,8 +65,10 @@ def _stub_moviepilot():
         "app.chain.search.facade": {"SearchChain": SearchChain},
         "app.chain.tmdb": {"TmdbChain": TmdbChain},
         "app.plugins": {"_PluginBase": _PluginBase},
-        "app.schemas": {}, "app.schemas.types": {"MediaSource": MediaSource, "MediaType": MediaType},
+        "app.schemas": {},
+        "app.schemas.types": {"MediaSource": MediaSource, "MediaType": MediaType, "EventType": EventType},
         "app.sdk": {}, "app.sdk.config": {"settings": NS(PROXY_HOST=None)},
+        "app.sdk.events": {"eventmanager": _EventManager(), "Event": object},
         "app.sdk.logging": {"logger": NS(info=print, warning=print, error=lambda *a, **k: print(*a))},
     }
     for name, attrs in mods.items():
@@ -286,6 +296,121 @@ class FlowTest(unittest.TestCase):
     def test_allowed_chats(self):
         self.p._allowed_chats = {-1}
         self.handle(self.msg("tmdb 123 缺第5集"))
+        self.assertEqual(self.bot.sent, [])
+
+
+billing = importlib.import_module("tgepisoderequest.billing")
+
+
+class FakePms:
+    def __init__(self, balances):
+        self.balances, self.charges, self.refs = dict(balances), [], set()
+
+    def __call__(self, url, token):
+        return self
+
+    def balance(self, tg_id):
+        if tg_id not in self.balances:
+            raise billing.PmsUserNotFound("用户不存在")
+        return self.balances[tg_id]
+
+    def charge(self, tg_id, amount, ref, reason=""):
+        if ref in self.refs:
+            return {"duplicate": True, "balance": self.balances[tg_id]}
+        if self.balances[tg_id] < amount:
+            raise billing.PmsInsufficient("积分不足", self.balances[tg_id])
+        self.refs.add(ref)
+        self.balances[tg_id] -= amount
+        self.charges.append((tg_id, amount, ref))
+        return {"duplicate": False, "balance": self.balances[tg_id]}
+
+
+def arrived(hash_="hash1", eps=()):
+    eps = list(eps)
+    return NS(event_data={"download_hash": hash_.upper(), "transferinfo": NS(success=True),
+                          "meta": NS(episode_list=eps, begin_episode=None, end_episode=None)})
+
+
+class BillingTest(unittest.TestCase):
+    def setUp(self):
+        calls.search.clear()
+        calls.download.clear()
+        calls.seasons = [1]
+        self.pms = FakePms({1: 50, 2: 5})
+        self._orig = plugin_mod.PmsClient
+        plugin_mod.PmsClient = self.pms
+        self.p = plugin_mod.TgEpisodeRequest()
+        self.p.init_plugin({"enabled": False, "admin_ids": "999", "config_version": 2,
+                            "pms_enabled": True, "pms_url": "http://pms", "pms_token": "k",
+                            "movie_price": 10, "season_price": 20, "free_movies": 1, "free_seasons": 0})
+        self.p.get_state = lambda: True
+        self.bot = FakeBot()
+        self.p._bot = self.bot
+
+    def tearDown(self):
+        plugin_mod.PmsClient = self._orig
+
+    def msg(self, text, uid=1):
+        return {"message": {"message_id": 7, "text": text, "chat": {"id": -100},
+                            "from": {"id": uid, "first_name": f"U{uid}"}}}
+
+    def handle(self, text, uid=1):
+        self.p._TgEpisodeRequest__handle_update(self.bot, self.msg(text, uid))
+
+    def test_movie_uses_free_quota_then_needs_credits(self):
+        calls.results = [ctx("Movie A 2160p", None, seeders=30)]
+        self.handle("tmdb movie 550 求", uid=2)
+        self.assertEqual(len(calls.download), 1)
+        self.p.on_transfer_complete(arrived())
+        text = self.bot.sent[-1][0]
+        self.assertIn("已入库", text)
+        self.assertIn("tg://user?id=2", text)
+        self.assertIn("免费电影额度", text)
+        self.assertEqual(self.pms.charges, [])
+        # 额度用完，余额 5 < 10：拒绝且不搜索
+        self.handle("tmdb movie 551 求", uid=2)
+        self.assertEqual(len(calls.search), 1)
+        self.assertIn("积分不足", self.bot.edits[-1][0])
+        # 同一部电影再求不再收费也不拦
+        self.handle("tmdb movie 550 求", uid=2)
+        self.assertEqual(len(calls.search), 2)
+
+    def test_season_charged_once_on_first_arrival(self):
+        calls.results = [ctx("S01 整季", 1)]
+        self.handle("tmdb 123 缺第5、6集")
+        self.assertEqual(calls.download[0]["episodes"], {5, 6})
+        self.p.on_transfer_complete(arrived(eps=[5]))
+        self.assertEqual(self.pms.charges, [(1, 20, "mp:1:tv:123:s1")])
+        self.assertIn("E05", self.bot.sent[-1][0])
+        self.assertIn("扣除 20 积分，余额 30", self.bot.sent[-1][0])
+        self.p.on_transfer_complete(arrived(eps=[6]))
+        self.assertEqual(len(self.pms.charges), 1)
+        self.assertIn("E06", self.bot.sent[-1][0])
+        self.assertNotIn("积分", self.bot.sent[-1][0])
+        n = len(self.bot.sent)
+        self.p.on_transfer_complete(arrived(eps=[6]))  # 重复事件
+        self.assertEqual(len(self.bot.sent), n)
+        # 同一季再求：不再收费
+        self.handle("tmdb 123 缺第7集")
+        self.p.on_transfer_complete(arrived(eps=[7]))
+        self.assertEqual(len(self.pms.charges), 1)
+
+    def test_replace_and_admin_are_free(self):
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle("tmdb 123 S01E05 资源有问题", uid=2)  # 余额只有 5
+        self.handle("tmdb 124 S01E05 缺", uid=999)        # 管理员，PMS 里都没有
+        self.assertEqual(len(calls.download), 2)
+        self.p.on_transfer_complete(arrived(eps=[5]))
+        self.assertEqual(self.pms.charges, [])
+
+    def test_unbound_user_rejected(self):
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle("tmdb 123 S01E05 缺", uid=3)
+        self.assertEqual(calls.search, [])
+        self.assertIn("绑定", self.bot.edits[-1][0])
+
+    def test_unknown_hash_ignored(self):
+        self.p.on_transfer_complete(arrived("other"))
         self.assertEqual(self.bot.sent, [])
 
 
