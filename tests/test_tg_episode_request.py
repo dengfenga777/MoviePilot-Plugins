@@ -1,6 +1,7 @@
 """TG群组智能补集：消息识别、候选挑选和完整求片流程（MoviePilot 用桩替换）。"""
 import importlib
 import sys
+import threading
 import types
 import unittest
 from enum import Enum
@@ -412,6 +413,51 @@ class BillingTest(unittest.TestCase):
     def test_unknown_hash_ignored(self):
         self.p.on_transfer_complete(arrived("other"))
         self.assertEqual(self.bot.sent, [])
+
+
+class ReloadConflictTest(unittest.TestCase):
+    def test_startup_conflict_is_quiet(self):
+        tg = importlib.import_module("tgepisoderequest.telegram")
+        logs = []
+        orig = plugin_mod.logger
+        plugin_mod.logger = NS(info=lambda m: logs.append(("info", m)), warning=lambda m: logs.append(("warn", m)),
+                               error=lambda m, **k: logs.append(("error", m)))
+
+        class Bot:
+            def get_me(self):
+                return {"username": "b"}
+
+            def poll(self, stop, on_update, on_error, on_ok):
+                on_error(tg.TelegramConflict("409"))
+                on_ok()
+
+        try:
+            p = plugin_mod.TgEpisodeRequest()
+            p._TgEpisodeRequest__run(Bot(), threading.Event())
+        finally:
+            plugin_mod.logger = orig
+        self.assertFalse([m for lvl, m in logs if lvl == "error"])
+
+    def test_poll_reports_ok(self):
+        tg = importlib.import_module("tgepisoderequest.telegram")
+        bot = tg.TelegramBot.__new__(tg.TelegramBot)
+        stop, seen = threading.Event(), []
+        replies = iter([tg.TelegramConflict("409"), []])
+
+        def call(method, **kw):
+            r = next(replies, None)
+            if r is None:
+                stop.set()
+                return []
+            if isinstance(r, Exception):
+                raise r
+            return r
+        bot.call = call
+        stop_wait = stop.wait
+        stop.wait = lambda t: None
+        bot.poll(stop, lambda u: None, lambda e: seen.append("err"), lambda: seen.append("ok"))
+        stop.wait = stop_wait
+        self.assertEqual(seen[:2], ["err", "ok"])
 
 
 if __name__ == "__main__":

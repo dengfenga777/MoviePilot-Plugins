@@ -63,7 +63,7 @@ class TelegramBot:
             pass
 
     def poll(self, stop: threading.Event, on_update: Callable[[Dict], None],
-             on_error: Callable[[Exception], None]) -> None:
+             on_error: Callable[[Exception], None], on_ok: Optional[Callable[[], None]] = None) -> None:
         offset = None
         while not stop.is_set():
             try:
@@ -71,8 +71,10 @@ class TelegramBot:
                                     allowed_updates=["message", "callback_query"])
             except Exception as e:  # noqa: BLE001 - 网络错误不能让轮询线程退出
                 on_error(e)
-                stop.wait(30 if isinstance(e, TelegramConflict) else 5)
+                stop.wait(10 if isinstance(e, TelegramConflict) else 5)
                 continue
+            if on_ok:
+                on_ok()
             for u in updates or []:
                 offset = u["update_id"] + 1
                 if stop.is_set():

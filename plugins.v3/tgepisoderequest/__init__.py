@@ -46,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -198,6 +198,15 @@ class TgEpisodeRequest(_PluginBase):
     # ---------------- Telegram 轮询 ----------------
 
     def __run(self, bot: TelegramBot, stop: threading.Event):
+        # 插件更新 / 重载时旧实例的轮询线程可能还挂在 getUpdates 上（最多 30 秒），
+        # 同一个 Token 同时拉消息会 409，先等它退出
+        me_thread = threading.current_thread()
+        for t in threading.enumerate():
+            if t is not me_thread and t.name == me_thread.name and t.is_alive():
+                t.join(40)
+        if stop.is_set():
+            return
+        started = time.time()
         try:
             me = bot.get_me()
             self._bot_username = me.get("username") or ""
@@ -207,6 +216,10 @@ class TgEpisodeRequest(_PluginBase):
         last_error = [""]
 
         def on_error(e: Exception):
+            if isinstance(e, TelegramConflict) and time.time() - started < 90:
+                # 刚启动时多半是旧连接还没断开，重试几次就好，不算错误
+                last_error[0] = last_error[0] or "conflict-startup"
+                return
             msg = str(e)
             if msg == last_error[0]:
                 return
@@ -217,13 +230,18 @@ class TgEpisodeRequest(_PluginBase):
             else:
                 logger.warning(f"TG群组智能补集：获取消息失败：{e}")
 
+        def on_ok():
+            if last_error[0]:
+                if last_error[0] != "conflict-startup":
+                    logger.info("TG群组智能补集：已恢复接收群消息")
+                last_error[0] = ""
+
         def on_update(update: Dict):
-            last_error[0] = ""
             executor = self._executor
             if executor:
                 executor.submit(self.__safe, self.__handle_update, bot, update)
 
-        bot.poll(stop, on_update, on_error)
+        bot.poll(stop, on_update, on_error, on_ok)
 
     @staticmethod
     def __safe(fn, *args):
