@@ -201,11 +201,11 @@ class PickTest(unittest.TestCase):
         rs = [ctx("2160p slow", 1, 5, seeders=2, pri=90), ctx("1080p fast", 1, 5, seeders=40, pri=10)]
         self.assertEqual(self.titles(pick(rs, 1, 5)), ["1080p fast", "2160p slow"])
 
-    def test_seed_tier_then_free(self):
+    def test_seed_tier_ignores_free(self):
         rs = [ctx("paid 60", 1, 5, seeders=60, free=False), ctx("free 40", 1, 5, seeders=40),
               ctx("free 5", 1, 5, seeders=5)]
-        # 60 和 40 同一档 → 免费优先；5 做种低一档排后面
-        self.assertEqual(self.titles(pick(rs, 1, 5)), ["free 40", "paid 60", "free 5"])
+        # 60 和 40 同一档，不看免费 → 做种多的在前；5 做种低一档排后面
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["paid 60", "free 40", "free 5"])
 
 
 class SizeRankTest(unittest.TestCase):
@@ -215,18 +215,30 @@ class SizeRankTest(unittest.TestCase):
         rs = [ctx("small free busy", 1, 11, 12, seeders=80, gb=0.9),   # 两集包，每集 0.45G
               ctx("big paid", 1, 11, seeders=12, free=False, gb=3),
               ctx("big pack", 1, 11, 12, seeders=12, gb=6)]             # 两集包，每集 3G
-        self.assertEqual(self.titles(pick(rs, 1, 11)), ["big pack", "big paid", "small free busy"])
+        # 两个大的同一档、做种一样 → 单集优先；小的做种再多也排后面
+        self.assertEqual(self.titles(pick(rs, 1, 11)), ["big paid", "big pack", "small free busy"])
 
     def test_quality_and_low_seeders_still_first(self):
         rs = [ctx("huge 1080p", 1, 5, seeders=40, pri=10, gb=12), ctx("2160p", 1, 5, seeders=40, pri=90, gb=3),
               ctx("huge dead", 1, 5, seeders=1, pri=90, gb=20)]
         self.assertEqual(self.titles(pick(rs, 1, 5)), ["2160p", "huge 1080p", "huge dead"])
 
-    def test_similar_size_falls_back_to_seeders_and_free(self):
-        rs = [ctx("2.2G paid", 1, 5, seeders=40, free=False, gb=2.2), ctx("2.6G free", 1, 5, seeders=40, gb=2.6)]
-        self.assertEqual(self.titles(pick(rs, 1, 5)), ["2.6G free", "2.2G paid"])
-        rs = [ctx("2.2G free", 1, 5, seeders=40, gb=2.2), ctx("3.9G paid", 1, 5, seeders=40, free=False, gb=3.9)]
-        self.assertEqual(self.titles(pick(rs, 1, 5)), ["2.2G free", "3.9G paid"])   # 同一档，免费优先
+    def test_similar_size_falls_back_to_seeders(self):
+        rs = [ctx("2.2G free", 1, 5, seeders=40, gb=2.2), ctx("3.9G paid", 1, 5, seeders=45, free=False, gb=3.9)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["3.9G paid", "2.2G free"])   # 同一档，免费不加分
+        rs = [ctx("free busy", 1, 5, seeders=120, gb=2.2), ctx("paid", 1, 5, seeders=40, free=False, gb=2.4)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["free busy", "paid"])          # 同一档，做种档位高的优先
+
+    def test_files_to_enable(self):
+        files = [{"id": 0, "name": "Show/Show.S01E10.2160p.mkv", "priority": 1},
+                 {"id": 1, "name": "Show/Show.S01E11.2160p.mkv", "priority": 0},
+                 {"id": 2, "name": "Show/Show.S01E12.2160p.mkv", "priority": 0},
+                 {"id": 3, "name": "Show/Sample.mkv", "priority": 0},
+                 {"id": 4, "name": "第11集.nfo", "priority": 0}]
+        self.assertEqual(picker.files_to_enable(files, [11]), [1, 4])
+        self.assertEqual(picker.files_to_enable(files, [10]), [])           # 已经勾选的不动
+        self.assertEqual(picker.file_episodes("Show.S01E03-E04.mkv"), [3, 4])
+        self.assertEqual(picker.file_episodes("Show.EP07.1080p.mkv"), [7])
 
     def test_season_pack_uses_season_episode_count(self):
         rs = [ctx("pack 30G", 1, gb=30), ctx("single 1G", 1, 5, gb=1)]
@@ -295,6 +307,35 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(len(calls.search), 1)
         self.handle(self.msg("/mp " + notice))                  # /mp 不受限制
         self.assertEqual(len(calls.search), 2)
+
+    def test_existing_torrent_reselects_episode(self):
+        class Qb:
+            def __init__(self):
+                self.set, self.started = [], []
+
+            def get_files(self, tid):
+                return [{"id": 0, "name": "S/S.S01E11.mkv", "priority": 0},
+                        {"id": 1, "name": "S/S.S01E12.mkv", "priority": 0}]
+
+            def set_files(self, **kw):
+                self.set.append(kw)
+                return True
+
+            def start_torrents(self, ids):
+                self.started.append(ids)
+
+        qb = Qb()
+        mod = types.ModuleType("app.sdk.services")
+        mod.DownloaderHelper = lambda: NS(get_services=lambda: {"qb": NS(instance=qb, type="qbittorrent")})
+        sys.modules["app.sdk.services"] = mod
+        try:
+            calls.results = [ctx("S01E11-E12", 1, 11, 12)]
+            self.p.init_plugin({"enabled": False, "auto_download": True, "config_version": 2})
+            self.handle(self.msg("tmdb 123 缺第11集"))
+        finally:
+            del sys.modules["app.sdk.services"]
+        self.assertEqual(qb.set, [{"torrent_hash": "hash1", "file_ids": [0], "priority": 1}])
+        self.assertEqual(qb.started, ["hash1"])
 
     def test_library_all_present_skips_search(self):
         calls.library = {1: [5, 6]}

@@ -72,9 +72,9 @@ def pick(results: List[Any], season: Optional[int], episode: Optional[int],
     2. 画质：MoviePilot 规则组匹配等级 pri_order，越高越好
     3. 同画质下每集越大越好（按档，大小翻倍算一档）
     4. 做种多的优先（按档）
-    5. 免费优先
-    6. 单集 > 多集包 > 整季包（包只勾选需要的集，差别不大，放最后）
-    7. 做种数、MoviePilot 原始顺序兜底
+    5. 单集 > 多集包 > 整季包（包只勾选需要的集，差别不大，放最后）
+    6. 做种数、MoviePilot 原始顺序兜底
+    是否免费不参与排序。
     """
     scored = []
     for idx, ctx in enumerate(results):
@@ -98,13 +98,41 @@ def pick(results: List[Any], season: Optional[int], episode: Optional[int],
                 kind = 1
             else:
                 continue
-        free = getattr(torrent, "downloadvolumefactor", None) == 0
         key = (seeders < low_seeders, -(getattr(torrent, "pri_order", 0) or 0),
                -_size_tier(episode_size(ctx, episode, season_eps)), -_seed_tier(seeders),
-               not free, kind, -seeders, idx)
+               kind, -seeders, idx)
         scored.append((key, ctx))
     scored.sort(key=lambda x: x[0])
     return [c for _, c in scored[:limit]]
+
+
+_FILE_EP = [re.compile(r"S\d{1,2}E(\d{1,4})(?:-?E(\d{1,4}))?", re.I),
+            re.compile(r"(?<![A-Za-z])EP?(\d{1,4})(?:-EP?(\d{1,4}))?(?![\dA-Za-z])", re.I),
+            re.compile(r"第(\d{1,4})集")]
+
+
+def file_episodes(name: str) -> List[int]:
+    """从种子里的文件名认集数，认不出返回空列表。"""
+    base = re.split(r"[\\/]", name or "")[-1]
+    for p in _FILE_EP:
+        m = p.search(base)
+        if m:
+            a = int(m.group(1))
+            b = int(m.group(2)) if m.lastindex and m.lastindex >= 2 and m.group(2) else a
+            return list(range(a, b + 1))
+    return []
+
+
+def files_to_enable(files: List[Any], episodes) -> List[Any]:
+    """已在下载器里的种子：返回本次需要、但当前被设为不下载（priority 0）的文件 id。"""
+    wanted = set(episodes)
+    ids = []
+    for f in files or []:
+        get = f.get if isinstance(f, dict) else (lambda k, _f=f: getattr(_f, k, None))
+        eps = file_episodes(get("name") or "")
+        if eps and set(eps) <= wanted and not get("priority"):
+            ids.append(get("id") if get("id") is not None else get("index"))
+    return ids
 
 
 # 标题末尾的发布组后缀（如 -XXWEB、@XXWEB），很多是站点自制组，会暴露来源站点
