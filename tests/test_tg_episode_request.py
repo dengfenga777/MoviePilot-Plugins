@@ -96,7 +96,8 @@ plugin_mod = importlib.util.module_from_spec(spec)
 sys.modules["tgepisoderequest"] = plugin_mod
 spec.loader.exec_module(plugin_mod)
 parse = importlib.import_module("tgepisoderequest.tgparse").parse
-pick = importlib.import_module("tgepisoderequest.picker").pick
+picker = importlib.import_module("tgepisoderequest.picker")
+pick = picker.pick
 
 
 class ParseTest(unittest.TestCase):
@@ -134,6 +135,21 @@ class PickTest(unittest.TestCase):
                          ["S02E05", "S02E01-E08"])
 
 
+class HideSiteTest(unittest.TestCase):
+    def test_brief_has_no_site_or_group(self):
+        c = ctx("Some Show 2026 S01E04 1080p WEB-DL H264 AAC 2Audios-FOOWEB", 1, 4)
+        c.torrent_info.site_name = "FooSite"
+        text = picker.brief(c)
+        self.assertNotIn("FooSite", text)
+        self.assertNotIn("FOOWEB", text)
+        self.assertIn("2Audios", text)
+
+    def test_clean_title_keeps_format_suffix(self):
+        self.assertEqual(picker.clean_title("Show.S01E01.1080p.WEB-DL"), "Show.S01E01.1080p.WEB-DL")
+        self.assertEqual(picker.clean_title("Show.Ep03.HDTV.1080p.H264-BARGRP"), "Show.Ep03.HDTV.1080p.H264")
+        self.assertEqual(picker.clean_title("Show S01E02 2160p@BAZWEB"), "Show S01E02 2160p")
+
+
 class FlowTest(unittest.TestCase):
     def setUp(self):
         calls.search.clear()
@@ -165,6 +181,7 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(calls.download[0]["episodes"], {5, 6})
         self.assertEqual(len(calls.download), 1)  # 同一个包覆盖两集只下一次
         self.assertIn("已推送下载", self.bot.edits[-1][0])
+        self.assertNotIn("[X]", "".join(t for t, _ in self.bot.edits))
         self.assertEqual(self.p.get_data("history")[0]["status"], "已下载")
 
     def test_multi_season_asks_then_searches(self):

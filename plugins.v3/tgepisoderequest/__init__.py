@@ -15,7 +15,7 @@ from app.schemas.types import MediaSource, MediaType
 from app.sdk.config import settings
 from app.sdk.logging import logger
 
-from .picker import brief, episodes_of, pick
+from .picker import brief, clean_title, episodes_of, pick
 from .telegram import TelegramBot, TelegramConflict, button
 from .tgparse import Request, parse
 
@@ -43,7 +43,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -368,7 +368,7 @@ class TgEpisodeRequest(_PluginBase):
         for ep, cands in job.choices.items():
             label = self.__ep_label(ep)
             if ep in job.done:
-                lines.append(f"✅ <b>{label}</b> 已推送下载：<code>{html.escape(job.done[ep])}</code>")
+                lines.append(f"✅ <b>{label}</b> 已推送下载：<code>{html.escape(clean_title(job.done[ep]))}</code>")
                 continue
             if not cands:
                 lines.append(f"❌ <b>{label}</b> 没有合适的资源")
