@@ -18,7 +18,7 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.media import Context, MediaInfo, MetaInfo, TorrentInfo, resolve_media_identity
 from app.sdk.network import RssHelper
-from app.sdk.services import RuleHelper
+from app.sdk.services import RuleHelper, MediaServerHelper
 from app.plugins import _PluginBase
 from app.schemas import ExistMediaInfo
 from app.schemas.types import MediaSource, SystemConfigKey, MediaType
@@ -42,8 +42,25 @@ def resolution(title) -> int:
     text = str(title or "")
     if re.search(r"2160[pi]|\b4k\b|\buhd\b", text, re.IGNORECASE):
         return 2160
-    match = re.search(r"(?<!\d)(1080|720|576|480)[pi]\b", text, re.IGNORECASE)
+    match = re.search(r"(?<!\d)(1440|1080|720|576|480)[pi]\b", text, re.IGNORECASE)
     return int(match.group(1)) if match else 0
+
+
+def source_resolution(source: dict) -> int:
+    """媒体库单个版本的分辨率：优先视频流宽高，strm 等没有流信息时看文件名，认不出返回 0。"""
+    for stream in source.get("MediaStreams") or []:
+        if stream.get("Type") == "Video" and (stream.get("Width") or stream.get("Height")):
+            width, height = int(stream.get("Width") or 0), int(stream.get("Height") or 0)
+            if width >= 3200 or height >= 2000:
+                return 2160
+            if width >= 2400 or height >= 1400:
+                return 1440
+            if width >= 1800 or height >= 1000:
+                return 1080
+            if width >= 1200 or height >= 700:
+                return 720
+            return 480
+    return resolution(f"{source.get('Name') or ''} {source.get('Path') or ''}")
 
 
 class DeleteHistoryRequest(BaseModel):
@@ -108,11 +125,11 @@ class RssSubscribeMovieNoNotify(_PluginBase):
     # 插件名称
     plugin_name = "电影订阅无通知"
     # 插件描述
-    plugin_desc = "定时刷新电影 RSS，仅处理电影：同一部电影只下载最好的一个版本（4K 优先、同分辨率码率高优先），之后最多升级一次，不发送系统通知。"
+    plugin_desc = "定时刷新电影 RSS，仅处理电影：同一部电影只下载最好的一个版本（4K 优先、同分辨率码率高优先），媒体库已有低分辨率版本时也升级一次，不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -952,8 +969,15 @@ class RssSubscribeMovieNoNotify(_PluginBase):
             # 媒体库已存在
             exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
             if exist_info:
-                logger.info(f'{mediainfo.title_year} 己存在')
-                return
+                best = max(c["res"] for c in candidates)
+                have = self.__library_resolution(mediainfo) if best else None
+                if not have or have >= best:
+                    logger.info(f'{mediainfo.title_year} 己存在'
+                                f'{f"（{have}p）" if have else "，画质未知不升级" if best else ""}')
+                    return
+                # 媒体库已有版本算作一次下载，只再升级一次
+                record = {"res": have, "count": 1}
+                candidates = [c for c in candidates if c["res"] > have]
         ranked = sorted(candidates, key=lambda c: (-c["res"], -c["size"], c["order"]))
         for candidate in ranked:
             result = downloadchain.download_single(
@@ -980,6 +1004,43 @@ class RssSubscribeMovieNoNotify(_PluginBase):
             self.save_data("movie_downloads_v1", downloads)
             self.__add_history(history, processed_keys, mediainfo, candidate)
             return
+
+    def __library_resolution(self, mediainfo: MediaInfo) -> Optional[int]:
+        """Emby/Jellyfin 里这部电影最好版本的分辨率；有版本认不出分辨率或查询失败返回 None，不升级。"""
+        import requests
+        source = {"themoviedb": "tmdb", "tmdb": "tmdb"}.get(str(mediainfo.media_source.value).lower())
+        if not source:
+            return None
+        found = []
+        try:
+            for service in (MediaServerHelper().get_services() or {}).values():
+                server_type = str(service.type).lower()
+                if server_type not in ("emby", "jellyfin"):
+                    continue
+                config = service.config.config or {}
+                host = str(config.get("host") or "").rstrip("/")
+                token = config.get("apikey")
+                if not host.startswith(("http://", "https://")) or not token:
+                    continue
+                base = host + ("/" if host.endswith("/emby") else "/emby/" if server_type == "emby" else "/")
+                response = requests.get(base + "Items", params={
+                    "Recursive": "true", "IncludeItemTypes": "Movie", "IsVirtual": "false",
+                    "AnyProviderIdEquals": f"{source}.{mediainfo.media_id}",
+                    "Fields": "ProviderIds,Path,MediaSources"}, headers={"X-Emby-Token": token}, timeout=15)
+                response.raise_for_status()
+                for item in response.json().get("Items") or []:
+                    ids = {str(k).lower(): str(v) for k, v in (item.get("ProviderIds") or {}).items()}
+                    if ids.get(source) != str(mediainfo.media_id):
+                        continue
+                    for media_source in item.get("MediaSources") or [item]:
+                        found.append(source_resolution(media_source))
+        except Exception:
+            # 不记录异常原文，避免把服务器地址或密钥写进日志
+            logger.warning(f"{mediainfo.title_year} 查询媒体库画质失败，不升级")
+            return None
+        if not found or 0 in found:
+            return None
+        return max(found)
 
     def __add_history(self, history: List[dict], processed_keys: set, mediainfo: MediaInfo, candidate: dict):
         history_item = {
