@@ -17,7 +17,7 @@ from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 
 from .billing import PmsClient, PmsError, PmsInsufficient, PmsUserNotFound, Usage, charge_key
-from .picker import brief, clean_title, episode_size, episodes_of, pick
+from .picker import brief, clean_title, episode_size, episodes_of, files_to_enable, pick
 from .telegram import TelegramBot, TelegramConflict, button
 from .tgparse import Request, is_chatter, parse
 
@@ -46,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -501,12 +501,42 @@ class TgEpisodeRequest(_PluginBase):
             return str(e)
         if not did:
             return error or "添加下载失败"
+        if select:
+            self.__ensure_selected(str(did), sorted(select), title)
         for e in covered:
             job.done[e] = title
         self.__track(job, str(did), sorted(e for e in covered if e))
         self.__record(job, "已下载", title, sorted(e for e in covered if e))
         logger.info(f"TG群组智能补集：{job.user_name} 请求 {job.req.describe()}，已推送 {title}")
         return None
+
+    def __ensure_selected(self, torrent_hash: str, episodes: List[int], title: str):
+        """种子之前就在下载器里时，MoviePilot 不会改它的文件勾选，这里把本次要的集重新勾上并开始下载。"""
+        try:
+            from app.sdk.services import DownloaderHelper
+            services = DownloaderHelper().get_services() or {}
+        except Exception as e:
+            logger.warning(f"TG群组智能补集：获取下载器失败，无法检查 {title} 的文件勾选：{e}")
+            return
+        if self._downloader and self._downloader in services:
+            services = {self._downloader: services[self._downloader]}
+        for name, service in services.items():
+            inst = getattr(service, "instance", None)
+            if not inst or getattr(service, "type", None) != "qbittorrent":
+                continue
+            try:
+                files = inst.get_files(torrent_hash)
+            except Exception:
+                files = None
+            if not files:
+                continue
+            ids = files_to_enable(files, episodes)
+            if ids:
+                ok = inst.set_files(torrent_hash=torrent_hash, file_ids=ids, priority=1)
+                inst.start_torrents(ids=torrent_hash)
+                logger.info(f"TG群组智能补集：{title} 已在下载器 {name} 中，"
+                            f"{'已重新勾选' if ok else '重新勾选失败'} {len(ids)} 个文件并开始下载")
+            return
 
     @staticmethod
     def __ep_label(ep: int) -> str:
