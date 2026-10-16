@@ -31,9 +31,22 @@ def _stub_moviepilot():
         def register(_etype):
             return lambda fn: fn
 
+    class _Chain:
+        @staticmethod
+        def recognize_media(**kw):
+            return NS(title="某剧", year="2026", seasons={1: list(range(1, 11))})
+
+        @staticmethod
+        def media_exists(mediainfo):
+            calls.lib_checks += 1
+            if isinstance(calls.library, Exception):
+                raise calls.library
+            return None if calls.library is None else NS(seasons=calls.library)
+
     class _PluginBase:
         def __init__(self):
             self._data = {}
+            self.chain = _Chain()
 
         def get_data(self, key):
             return self._data.get(key)
@@ -84,6 +97,7 @@ class SimpleCalls:
     def __init__(self):
         self.search, self.download, self.results, self.seasons = [], [], [], [1]
         self.fail, self.saved_config = set(), None
+        self.library, self.lib_checks = None, 0  # 媒体库里已有的 {季: [集]}，None = 库里没有
 
 
 def ctx(title, season, b=None, e=None, seeders=5, pri=0, free=True):
@@ -214,6 +228,7 @@ class FlowTest(unittest.TestCase):
         calls.search.clear()
         calls.download.clear()
         calls.seasons = [1]
+        calls.library, calls.lib_checks = None, 0
         self.p = plugin_mod.TgEpisodeRequest()
         self.p.init_plugin({"enabled": False, "admin_ids": "999", "auto_download": False, "config_version": 2})
         self.bot = FakeBot()
@@ -254,6 +269,50 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(len(calls.search), 1)
         self.handle(self.msg("/mp " + notice))                  # /mp 不受限制
         self.assertEqual(len(calls.search), 2)
+
+    def test_library_all_present_skips_search(self):
+        calls.library = {1: [5, 6]}
+        self.handle(self.msg("tmdb 123 缺第5、6集"))
+        self.assertEqual(calls.search, [])
+        self.assertIn("已经在库里", self.bot.edits[-1][0])
+        self.assertEqual(self.p.get_data("history")[0]["status"], "已在库里")
+
+    def test_library_partial_downloads_only_missing(self):
+        calls.library = {1: [5]}
+        calls.results = [ctx("S01E05", 1, 5), ctx("S01E06", 1, 6)]
+        self.handle(self.msg("tmdb 123 缺第5、6集"))
+        self.assertEqual(list(self.p._jobs.values())[-1].req.episodes, [6])
+        text = self.bot.edits[-1][0]
+        self.assertIn("E05 已在库里，只下缺的 1 集", text)
+        self.assertNotIn("S01E05", text)
+
+    def test_library_whole_season_and_movie(self):
+        calls.library = {1: list(range(1, 11))}
+        self.handle(self.msg("tmdb 123 第1季 缺"))
+        self.assertIn("整季 已经在库里", self.bot.edits[-1][0])
+        calls.library = {}
+        self.handle(self.msg("tmdb movie 550"))
+        self.assertIn("已经在库里", self.bot.edits[-1][0])
+        self.assertEqual(calls.search, [])
+
+    def test_library_whole_season_partial(self):
+        calls.library = {1: list(range(1, 9))}
+        calls.results = [ctx("S01 整季", 1)]
+        self.handle(self.msg("tmdb 123 第1季 缺"))
+        self.assertEqual(list(self.p._jobs.values())[-1].req.episodes, [9, 10])
+
+    def test_replace_skips_library(self):
+        calls.library = {1: [5]}
+        calls.results = [ctx("S01E05", 1, 5)]
+        for text in ["tmdb 123 第5集 花屏", "tmdb 123 第5集 没字幕"]:
+            self.handle(self.msg(text))
+        self.assertEqual((calls.lib_checks, len(calls.search)), (0, 2))
+
+    def test_library_error_does_not_block(self):
+        calls.library = RuntimeError("媒体服务器连不上")
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle(self.msg("tmdb 123 缺第5集"))
+        self.assertEqual(len(calls.search), 1)
 
     def test_multi_season_asks_then_searches(self):
         calls.seasons = [1, 2, 3]
@@ -365,6 +424,7 @@ class BillingTest(unittest.TestCase):
         calls.search.clear()
         calls.download.clear()
         calls.seasons = [1]
+        calls.library, calls.lib_checks = None, 0
         self.pms = FakePms({1: 50, 2: 5})
         self._orig = plugin_mod.PmsClient
         plugin_mod.PmsClient = self.pms
@@ -448,6 +508,7 @@ class AutoDeleteTest(unittest.TestCase):
         calls.search.clear()
         calls.download.clear()
         calls.seasons = [1]
+        calls.library, calls.lib_checks = None, 0
         self.p = plugin_mod.TgEpisodeRequest()
         self.p.init_plugin({"enabled": False, "config_version": 2, "auto_delete": 3, "delete_request": True})
         self.bot = FakeBot()
