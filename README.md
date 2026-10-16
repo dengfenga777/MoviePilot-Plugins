@@ -6,6 +6,7 @@
 - `电影订阅无通知`
 - `qB已整理自动清理`
 - `RSS剧集优选`（V3）
+- `TG群组智能补集`（V3）
 
 ## 自定义订阅无通知
 
@@ -43,6 +44,7 @@ plugins.v3/
   rsssubscribenonotify/
   rsssubscribemovienonotify/
   rssepisodequality/
+  tgepisoderequest/
 ```
 
 ## 电影订阅无通知
@@ -93,3 +95,11 @@ plugins.v3/
 启用本插件前，请停用负责同一批剧集的旧 RSS 下载任务，再将 RSS 地址复制到本插件；独立插件之间不共享下载质量记录。插件默认关闭，不会自动修改其他插件。
 
 详细配置与处理边界见 [插件说明](plugins.v3/rssepisodequality/README.md)。验证与测试命令见 [测试说明](tests/rss_episode_quality/VALIDATION.md)。
+
+## TG群组智能补集（V3）
+
+独立插件 `TgEpisodeRequest`，当前版本 `v1.0.0`，要求 MoviePilot `>= 3.0.0`。
+
+插件内运行一个独立的 Telegram 机器人。群成员发「tmdb 12345 缺第5集」「tmdb 12345 S02E05 资源有问题」，插件识别 TMDB ID、季、集和意图，调用 MoviePilot 精确搜索，给出候选让发起人或管理员点按钮下载（也可自动下载）。整季包只勾选请求的集。
+
+详见 [插件说明](plugins.v3/tgepisoderequest/README.md)。
