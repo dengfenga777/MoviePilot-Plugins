@@ -243,6 +243,18 @@ class FlowTest(unittest.TestCase):
         self.assertNotIn("[X]", "".join(t for t, _ in self.bot.edits))
         self.assertEqual(self.p.get_data("history")[0]["status"], "已下载")
 
+    def test_announcement_is_ignored(self):
+        notice = ("📢 求片机器人使用说明\n群里直接发消息就行：\n"
+                  "tmdb 94997 缺第5集\ntmdb 94997 S02E05\ntmdb movie 550\n有问题请 @ 管理员。")
+        for text in [notice, "tmdb 123 缺第5集 tmdb 456 缺第6集", "tmdb 123 缺第5集" + "啊" * 120]:
+            self.handle(self.msg(text))
+        self.assertEqual((calls.search, self.bot.sent), ([], []))
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle(self.msg("tmdb 123\n缺第5集"))            # 两行的正常求片照样识别
+        self.assertEqual(len(calls.search), 1)
+        self.handle(self.msg("/mp " + notice))                  # /mp 不受限制
+        self.assertEqual(len(calls.search), 2)
+
     def test_multi_season_asks_then_searches(self):
         calls.seasons = [1, 2, 3]
         calls.results = [ctx("S02E05", 2, 5)]

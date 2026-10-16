@@ -19,7 +19,7 @@ from app.sdk.logging import logger
 from .billing import PmsClient, PmsError, PmsInsufficient, PmsUserNotFound, Usage, charge_key
 from .picker import brief, clean_title, episodes_of, pick
 from .telegram import TelegramBot, TelegramConflict, button
-from .tgparse import Request, parse
+from .tgparse import Request, is_chatter, parse
 
 
 @dataclass
@@ -46,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -283,7 +283,7 @@ class TgEpisodeRequest(_PluginBase):
         elif command or self._trigger != "auto":
             return
         else:
-            req = parse(text, allow_bare_id=self._allow_bare_id)
+            req = None if is_chatter(text) else parse(text, allow_bare_id=self._allow_bare_id)
             if not req:
                 return
         self.__handle_request(bot, msg, req)
