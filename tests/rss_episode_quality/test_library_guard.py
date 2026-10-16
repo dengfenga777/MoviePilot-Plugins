@@ -70,7 +70,7 @@ ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tu
     'MediaServerHelper':MediaHelper,'DownloaderHelper':DownloadHelper,
     'query_library':Mock(),'Library':engine.Library,'UncertainLibrary':engine.UncertainLibrary,
     'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,'TARGETS':engine.TARGETS,'meets_target':engine.meets_target,'site_score':engine.site_score,
-    'file_scope':engine.file_scope,'is_special':engine.is_special,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
+    'file_scope':engine.file_scope,'TORRENT_EXISTS':'种子任务已存在，保留现有任务；请检查其选集和暂停状态','is_special':engine.is_special,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
     'Context':SimpleNamespace,'TorrentInfo':TorrentInfo,'MediaInfo':SimpleNamespace,
     'SystemConfigKey':SimpleNamespace(SubscribeFilterRuleGroups='rules'),
     'RuleHelper':object,'SilentDownloadChain':Download,'SilentSubscribeChain':Subscribe,
@@ -646,6 +646,20 @@ class PluginTests(unittest.TestCase):
         ns['query_library'].return_value=self.library(10); self.run_check()
         self.assertFalse(Download.calls)
         self.assertEqual(self.plugin.data['decisions_v1'][-1]['status'],'deferred')
+    def test_existing_torrent_is_not_resubmitted(self):
+        ns['query_library'].return_value=self.library(10)
+        DownloadHelper.services['QB'].instance.get_torrents.return_value=([{'progress':1.0}],False)
+        def exists(me,**kw):
+            me.calls.append(kw); me.last_error=ns['TORRENT_EXISTS']; return None
+        original=Download.download_single
+        Download.download_single=exists
+        self.addCleanup(setattr,Download,'download_single',original)
+        self.addCleanup(setattr,Download,'last_error',None)
+        self.run_check()
+        self.assertEqual(self.plugin.data['decisions_v1'][-1]['status'],'skipped')
+        self.plugin.data['pending_downloads_v2']={}
+        self.run_check()
+        self.assertEqual(len(Download.calls),1)
     def test_failed_direct_download_is_retried_next_run(self):
         self.pack(['节目 20261010.mkv'])
         ns['query_library'].return_value=self.library(10)

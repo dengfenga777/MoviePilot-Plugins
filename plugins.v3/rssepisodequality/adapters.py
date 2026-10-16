@@ -6,6 +6,9 @@ from pathlib import PurePosixPath
 from .engine import EmbyLibrary, Library, UncertainLibrary, UnsafeSelection, select_files, quality, file_scope, VIDEO
 
 
+TORRENT_EXISTS = '种子任务已存在，保留现有任务；请检查其选集和暂停状态'
+
+
 def query_library(services, media, timeout=10):
     import requests
     if not services:
@@ -74,7 +77,7 @@ def submit_selected(service, content, download_dir, cookie, category, label, sea
     if error or existing is None:
         raise UnsafeSelection('下载器任务查询失败')
     if existing:
-        raise UnsafeSelection('种子任务已存在，保留现有任务；请检查其选集和暂停状态')
+        raise UnsafeSelection(TORRENT_EXISTS)
     tag = 'rss-eq-' + uuid.uuid4().hex
     added = False
     started = False

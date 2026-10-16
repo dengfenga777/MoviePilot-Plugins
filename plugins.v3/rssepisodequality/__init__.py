@@ -26,7 +26,7 @@ from app.schemas.types import MediaSource, SystemConfigKey, MediaType, MessageTy
 
 from .engine import (Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO,
                      TARGETS, meets_target, site_score, is_special)
-from .adapters import query_library, submit_selected
+from .adapters import query_library, submit_selected, TORRENT_EXISTS
 
 lock = Lock()
 
@@ -162,7 +162,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -1663,6 +1663,12 @@ class RssEpisodeQuality(_PluginBase):
                             for ep in selected:
                                 ledger.pop(self.__episode_key(mediainfo, season, ep), None)
                             self.save_data("pending_downloads_v2", ledger)
+                        if downloadchain.last_error == TORRENT_EXISTS:
+                            # 下载器里已有同一个种子（别的订阅或上次提交），等它入库即可，不再反复提交
+                            self.__remember_skip(skip_cache, rss_key, "下载器已有该种子", DIRECT_SKIP_HOURS)
+                            self.__audit(mediainfo, title, "skipped", key=rss_key,
+                                         reason="下载器已有该种子", **details)
+                            continue
                         self.__audit(mediainfo, title, "failed", key=rss_key,
                                      reason=downloadchain.last_error or "下载链未接受资源", **details)
                         continue
