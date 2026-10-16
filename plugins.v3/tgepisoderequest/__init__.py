@@ -46,7 +46,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -98,6 +98,9 @@ class TgEpisodeRequest(_PluginBase):
     _free_movies: int = 3
     _free_seasons: int = 2
     _admin_free: bool = True
+    _auto_delete: int = 3
+    _delete_request: bool = False
+    _notice_delete: int = 0
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -133,6 +136,9 @@ class TgEpisodeRequest(_PluginBase):
             self._free_movies = self.__int(config.get("free_movies"), 3)
             self._free_seasons = self.__int(config.get("free_seasons"), 2)
             self._admin_free = config.get("admin_free", True)
+            self._auto_delete = max(0, self.__int(config.get("auto_delete"), 3))
+            self._delete_request = bool(config.get("delete_request"))
+            self._notice_delete = max(0, self.__int(config.get("notice_delete"), 0))
 
         self._jobs = {}
         self._search_lock = threading.Semaphore(2)
@@ -148,6 +154,8 @@ class TgEpisodeRequest(_PluginBase):
         self._thread = threading.Thread(target=self.__run, args=(self._bot, self._stop),
                                         name="tgepisoderequest-poll", daemon=True)
         self._thread.start()
+        threading.Thread(target=self.__cleaner, args=(self._bot, self._stop),
+                         name="tgepisoderequest-clean", daemon=True).start()
 
     def get_state(self) -> bool:
         return self._enabled and bool(self._token)
@@ -265,12 +273,12 @@ class TgEpisodeRequest(_PluginBase):
         command, _, rest = text.partition(" ")
         command = command.split("@", 1)[0].lower() if command.startswith("/") else ""
         if command in ("/help", "/start"):
-            bot.send(chat_id, self.__help_text(), reply_to=msg.get("message_id"))
+            self.__reply(bot, chat_id, self.__help_text(), msg.get("message_id"))
             return
         if command == "/mp":
             req = parse(rest, allow_bare_id=True)
             if not req:
-                bot.send(chat_id, "没识别出来 😵 例：/mp tmdb 12345 S01E05 缺集", reply_to=msg.get("message_id"))
+                self.__reply(bot, chat_id, "没识别出来 😵 例：/mp tmdb 12345 S01E05 缺集", msg.get("message_id"))
                 return
         elif command or self._trigger != "auto":
             return
@@ -303,7 +311,7 @@ class TgEpisodeRequest(_PluginBase):
         chat_id = msg["chat"]["id"]
         reply_to = msg.get("message_id")
         if len(req.episodes) > self._max_episodes:
-            bot.send(chat_id, f"一次最多处理 {self._max_episodes} 集，拆开发吧～", reply_to=reply_to)
+            self.__reply(bot, chat_id, f"一次最多处理 {self._max_episodes} 集，拆开发吧～", reply_to)
             return
         user = msg.get("from") or {}
         job = Job(req=req, user_id=user.get("id", 0),
@@ -319,7 +327,7 @@ class TgEpisodeRequest(_PluginBase):
                            if (s.season_number or 0) > 0]
             except Exception as e:
                 if req.episodes:
-                    bot.send(chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to=reply_to)
+                    self.__reply(bot, chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to)
                     return
                 logger.warning(f"TG群组智能补集：查询 TMDB {req.tmdbid} 季信息失败，按电影处理：{e}")
                 seasons = []
@@ -327,8 +335,8 @@ class TgEpisodeRequest(_PluginBase):
                 # 没写集数又查不到剧集，多半是电影
                 req.is_movie = True
             elif not seasons:
-                bot.send(chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，ID 是不是错了？"
-                                  f"电影的话不用写集数，或者发 tmdb movie {req.tmdbid}", reply_to=reply_to)
+                self.__reply(bot, chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，ID 是不是错了？"
+                                           f"电影的话不用写集数，或者发 tmdb movie {req.tmdbid}", reply_to)
                 return
             elif len(seasons) == 1:
                 req.season = seasons[0]
@@ -337,6 +345,7 @@ class TgEpisodeRequest(_PluginBase):
                         for i in range(0, len(seasons), 5)]
                 sent = bot.send(chat_id, f"这部剧有 {len(seasons)} 季，是哪一季？", reply_to=reply_to, buttons=rows)
                 job.message_id = sent["message_id"]
+                self.__expire_job(job, pending=True)
                 return
 
         sent = bot.send(chat_id, f"🔍 识别到：{req.describe()}，正在搜索…", reply_to=reply_to)
@@ -351,6 +360,7 @@ class TgEpisodeRequest(_PluginBase):
         refuse = self.__check_credits(job)
         if refuse:
             bot.edit(job.chat_id, job.message_id, refuse)
+            self.__expire_job(job)
             self.__record(job, "积分不足" if "积分不足" in refuse else "未通过积分检查")
             return
         try:
@@ -364,9 +374,11 @@ class TgEpisodeRequest(_PluginBase):
         except Exception as e:
             logger.error(f"TG群组智能补集：搜索 {req.describe()} 失败：{e}", exc_info=True)
             bot.edit(job.chat_id, job.message_id, f"❌ 搜索失败：{html.escape(str(e))}")
+            self.__expire_job(job)
             return
         if not results:
             bot.edit(job.chat_id, job.message_id, f"😢 {req.describe()} 没搜到任何资源")
+            self.__expire_job(job)
             self.__record(job, "没搜到资源")
             return
 
@@ -469,6 +481,8 @@ class TgEpisodeRequest(_PluginBase):
         if len(text) > 4000:
             text = text[:4000] + "…"
         bot.edit(job.chat_id, job.message_id, text, rows)
+        # 还有按钮没点完就等任务过期再删
+        self.__expire_job(job, pending=bool(rows))
 
     def __on_callback(self, bot: TelegramBot, q: Dict):
         parts = (q.get("data") or "").split("|")
@@ -505,7 +519,55 @@ class TgEpisodeRequest(_PluginBase):
                 self._jobs.pop(jid, None)
             bot.answer(q["id"], "已取消")
             bot.edit(job.chat_id, job.message_id, f"已取消：{job.req.describe()}")
+            self.__expire_job(job)
             self.__record(job, "已取消")
+
+    # ---------------- 自动删除群消息 ----------------
+
+    def __reply(self, bot: TelegramBot, chat_id: int, text: str, reply_to: Optional[int]):
+        """一次性回复（帮助、识别失败等），到时间连同触发它的消息一起删。"""
+        sent = bot.send(chat_id, text, reply_to=reply_to)
+        self.__expire(chat_id, (sent or {}).get("message_id"), self._auto_delete)
+        if self._delete_request:
+            self.__expire(chat_id, reply_to, self._auto_delete)
+
+    def __expire_job(self, job: Job, pending: bool = False):
+        """求片处理结束（或还在等按钮）时安排删除机器人的消息和原求片消息。"""
+        if not self._auto_delete:
+            return
+        minutes = max(self._auto_delete, self.JOB_TTL // 60) if pending else self._auto_delete
+        self.__expire(job.chat_id, job.message_id, minutes)
+        if self._delete_request:
+            self.__expire(job.chat_id, job.reply_to, minutes)
+
+    def __expire(self, chat_id: int, message_id: Optional[int], minutes: int):
+        if not minutes or not message_id:
+            return
+        with self._data_lock:
+            deletes = self.get_data("deletes") or {}
+            deletes[f"{chat_id}:{message_id}"] = time.time() + minutes * 60
+            self.save_data("deletes", deletes)
+
+    def __purge(self, bot: TelegramBot, now: Optional[float] = None):
+        now = now or time.time()
+        with self._data_lock:
+            deletes = self.get_data("deletes") or {}
+            due = [k for k, at in deletes.items() if at <= now]
+            if not due:
+                return
+            for k in due:
+                deletes.pop(k, None)
+            self.save_data("deletes", deletes)
+        for k in due:
+            chat_id, _, message_id = k.rpartition(":")
+            bot.delete(int(chat_id), int(message_id))
+
+    def __cleaner(self, bot: TelegramBot, stop: threading.Event):
+        while not stop.wait(20):
+            try:
+                self.__purge(bot)
+            except Exception as e:
+                logger.warning(f"TG群组智能补集：自动删除消息出错：{e}")
 
     # ---------------- PMS 积分 ----------------
 
@@ -675,7 +737,8 @@ class TgEpisodeRequest(_PluginBase):
                 what += " " + "、".join(f"E{e:02d}" for e in episodes)
         text = f"🎬 {who} 你求的 {what} 已入库，可以去看了！{note}"
         try:
-            bot.send(rec["chat_id"], text, reply_to=rec.get("reply_to") or None)
+            sent = bot.send(rec["chat_id"], text, reply_to=rec.get("reply_to") or None)
+            self.__expire(rec["chat_id"], (sent or {}).get("message_id"), self._notice_delete)
         except Exception as e:
             logger.warning(f"TG群组智能补集：发送入库提醒失败：{e}")
 
@@ -753,6 +816,14 @@ class TgEpisodeRequest(_PluginBase):
                         col(4, "VTextField", model="pending_days", label="等待入库天数", type="number",
                             hint="超过这么多天还没入库就不再提醒、不扣积分", persistent_hint=True),
                     ]},
+                    {"component": "VRow", "content": [
+                        col(4, "VTextField", model="auto_delete", label="处理完几分钟后删除机器人消息", type="number",
+                            hint="0 = 不删", persistent_hint=True),
+                        col(4, "VSwitch", model="delete_request", label="同时删除群友的求片消息",
+                            hint="需要机器人是群管理员并有删除消息权限", persistent_hint=True),
+                        col(4, "VTextField", model="notice_delete", label="入库提醒几分钟后删除", type="number",
+                            hint="0 = 保留", persistent_hint=True),
+                    ]},
                     {"component": "VDivider"},
                     {"component": "VRow", "content": [
                         col(4, "VSwitch", model="pms_enabled", label="对接 PMS 积分"),
@@ -806,6 +877,9 @@ class TgEpisodeRequest(_PluginBase):
             "downloader": "",
             "save_path": "",
             "notify_arrival": True,
+            "auto_delete": 3,
+            "delete_request": False,
+            "notice_delete": 0,
             "pending_days": 7,
             "pms_enabled": False,
             "pms_url": "",

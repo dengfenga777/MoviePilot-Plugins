@@ -2,6 +2,7 @@
 import importlib
 import sys
 import threading
+import time
 import types
 import unittest
 from enum import Enum
@@ -94,7 +95,7 @@ def ctx(title, season, b=None, e=None, seeders=5, pri=0, free=True):
 
 class FakeBot:
     def __init__(self):
-        self.sent, self.edits, self.answers = [], [], []
+        self.sent, self.edits, self.answers, self.deleted = [], [], [], []
 
     def send(self, chat_id, text, reply_to=None, buttons=None):
         self.sent.append((text, buttons))
@@ -102,6 +103,10 @@ class FakeBot:
 
     def edit(self, chat_id, message_id, text, buttons=None):
         self.edits.append((text, buttons))
+
+    def delete(self, chat_id, message_id):
+        self.deleted.append(message_id)
+        return True
 
     def answer(self, cid, text="", alert=False):
         self.answers.append(text)
@@ -413,6 +418,50 @@ class BillingTest(unittest.TestCase):
     def test_unknown_hash_ignored(self):
         self.p.on_transfer_complete(arrived("other"))
         self.assertEqual(self.bot.sent, [])
+
+
+class AutoDeleteTest(unittest.TestCase):
+    def setUp(self):
+        calls.search.clear()
+        calls.download.clear()
+        calls.seasons = [1]
+        self.p = plugin_mod.TgEpisodeRequest()
+        self.p.init_plugin({"enabled": False, "config_version": 2, "auto_delete": 3, "delete_request": True})
+        self.bot = FakeBot()
+
+    def handle(self, text):
+        self.p._TgEpisodeRequest__handle_update(self.bot, {"message": {
+            "message_id": 7, "text": text, "chat": {"id": -100}, "from": {"id": 1, "first_name": "U"}}})
+
+    def purge(self, after_minutes):
+        self.p._TgEpisodeRequest__purge(self.bot, time.time() + after_minutes * 60)
+
+    def test_deletes_result_and_request_after_minutes(self):
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle("tmdb 123 缺第5集")
+        self.assertIn("已推送下载", self.bot.edits[-1][0])
+        self.purge(2)
+        self.assertEqual(self.bot.deleted, [])
+        self.purge(4)
+        self.assertEqual(sorted(self.bot.deleted), [7, 101])
+        self.purge(10)
+        self.assertEqual(len(self.bot.deleted), 2)  # 只删一次
+
+    def test_pending_buttons_wait_for_job_expiry(self):
+        self.p._auto_download = False
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle("tmdb 123 缺第5集")
+        self.purge(10)
+        self.assertEqual(self.bot.deleted, [])
+        self.purge(61)
+        self.assertIn(101, self.bot.deleted)
+
+    def test_disabled(self):
+        self.p._auto_delete = 0
+        calls.results = []
+        self.handle("tmdb 123 缺第5集")
+        self.purge(999)
+        self.assertEqual(self.bot.deleted, [])
 
 
 class ReloadConflictTest(unittest.TestCase):

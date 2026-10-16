@@ -55,6 +55,14 @@ class TelegramBot:
             if "not modified" not in str(e):
                 raise
 
+    def delete(self, chat_id: int, message_id: int) -> bool:
+        """删除消息；消息已不存在、超过 48 小时或没权限时返回 False。"""
+        try:
+            self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+            return True
+        except TelegramError:
+            return False
+
     def answer(self, callback_id: str, text: str = "", alert: bool = False) -> None:
         try:
             self.call("answerCallbackQuery", callback_query_id=callback_id, text=text or None,
