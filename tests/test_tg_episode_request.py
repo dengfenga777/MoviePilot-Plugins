@@ -144,6 +144,17 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(parse("今天吃了 300 块的火锅"))
         self.assertIsNone(parse("我有 2 个问题 123 和 456"))
 
+    def test_bare_id_strict(self):
+        # 纯数字只认开头、后面不跟单位、不是分辨率、整句够短
+        for text in ["2016 年的那部没有", "2016年那部有问题", "500 G 没有了", "300块 没有", "1080 有问题",
+                     "1080p 花屏", "2160 p 有问题", "3.5 有问题", "15% 没有", "我 2000 年就看过 有问题",
+                     "今天 300 块的东西没有", "12345 缺第5集" + "，" * 40]:
+            self.assertIsNone(parse(text), text)
+        self.check("12345 缺第5集", 12345, None, [5])
+        self.check("12345 S01E05 有问题", 12345, 1, [5], "replace")
+        self.check("94997 第二季 3-5集 花屏", 94997, 2, [3, 4, 5], "replace")
+        self.check("tmdb 1080 第3集", 1080, None, [3])     # 写了 tmdb 就不受限制
+
     def test_movie(self):
         for text in ["https://www.themoviedb.org/movie/550 资源有问题", "tmdb 550 电影 资源有问题",
                      "tmdb movie 550 花屏", "movie/550 缺", "550 电影 有问题"]:
