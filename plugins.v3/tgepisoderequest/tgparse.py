@@ -31,8 +31,12 @@ TMDB_PATTERNS = [
     re.compile(r"(?<![A-Za-z])(?P<kind>tv|movie)\s*/\s*(?P<id>\d{2,9})", re.I),
     re.compile(r"tmdb\s*(?:id)?\s*[:：=#]?\s*(?P<id>\d{2,9})", re.I),
 ]
-# 消息里只有一个"裸"数字串并且足够长时也当作 TMDB ID（可在配置中关闭）
-BARE_ID = re.compile(r"(?<![\dA-Za-z])(?P<id>\d{3,9})(?![\dA-Za-z集季话])")
+# 不写 tmdb 的纯数字 ID：必须在消息开头，后面不能紧跟单位，消息也不能太长（可在配置中关闭）
+_UNITS = "%年月日号块元个次分秒岁楼层万千百集季话期部"
+BARE_ID = re.compile(rf"^\s*(?P<id>\d{{3,9}})(?![\d.A-Za-z{_UNITS}])(?!\s*(?:[{_UNITS}]|[GgKkMmTtPp](?![A-Za-z\d])))")
+BARE_MAX_LEN = 40
+# 常见分辨率，单独出现时多半不是 ID
+BARE_IGNORE = {480, 576, 720, 1080, 1440, 2160, 4320}
 
 CN_N = r"[0-9零一二两三四五六七八九十]+"
 
@@ -92,11 +96,10 @@ def parse(text: str, allow_bare_id: bool = True) -> Optional[Request]:
             id_span = m.span()
             break
     bare = False
-    if tmdbid is None and allow_bare_id:
-        ids = BARE_ID.findall(text)
-        if len(ids) == 1:
-            m = BARE_ID.search(text)
-            tmdbid, id_span, bare = int(m.group("id")), m.span(), True
+    if tmdbid is None and allow_bare_id and len(raw.strip()) <= BARE_MAX_LEN:
+        m = BARE_ID.search(text)
+        if m and int(m.group("id")) not in BARE_IGNORE:
+            tmdbid, id_span, bare = int(m.group("id")), m.span("id"), True
     if tmdbid is None:
         return None
 
