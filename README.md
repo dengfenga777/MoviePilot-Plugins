@@ -98,8 +98,8 @@ plugins.v3/
 
 ## TG群组智能补集（V3）
 
-独立插件 `TgEpisodeRequest`，当前版本 `v1.0.1`，要求 MoviePilot `>= 3.0.0`。
+独立插件 `TgEpisodeRequest`，当前版本 `v1.1.0`，要求 MoviePilot `>= 3.0.0`。
 
-插件内运行一个独立的 Telegram 机器人。群成员发「tmdb 12345 缺第5集」「tmdb 12345 S02E05 资源有问题」，插件识别 TMDB ID、季、集和意图，调用 MoviePilot 精确搜索，给出候选让发起人或管理员点按钮下载（也可自动下载）。整季包只勾选请求的集。
+插件内运行一个独立的 Telegram 机器人。群成员发「tmdb 12345 缺第5集」「tmdb 12345 S02E05 资源有问题」，插件识别 TMDB ID、季、集和意图，调用 MoviePilot 精确搜索，按「画质规则 + 做种数 + 免费」排序后默认自动下载最优资源，失败自动换下一个（也可改为点按钮选择）。整季包只勾选请求的集。
 
 详见 [插件说明](plugins.v3/tgepisoderequest/README.md)。
