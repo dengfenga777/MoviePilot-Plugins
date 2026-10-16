@@ -474,18 +474,28 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(len(Download.calls),1)
         return Download.calls[0]['context'].torrent_info
     def test_rss_order_is_site_priority_by_default(self):
-        feeds={'https://first.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
-               'https://second.example/rss':[('Show.S01E11.1080p.BluRay',9)]}
+        feeds={'https://first.example/rss':[('Show.S01E11.1080p.WEB-DL',5)],
+               'https://second.example/rss':[('Show.S01E11.1080p.WEB-DL',5)]}
         self.sites(feeds); self.run_check()
         self.assertIn('first.example',self.picked().enclosure)
-    def test_configured_site_priority_beats_rss_order_and_quality(self):
-        feeds={'https://low.example/rss':[('Show.S01E11.1080p.BluRay.HDR',9)],
-               'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',1)]}
+    def test_quality_and_size_beat_configured_site_priority(self):
+        feeds={'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
+               'https://low.example/rss':[('Show.S01E11.1080p.BluRay.HDR',9)]}
+        self.sites(feeds,'high\nlow'); self.run_check()
+        self.assertIn('low.example',self.picked().enclosure)
+    def test_larger_size_beats_site_priority_at_same_quality(self):
+        feeds={'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
+               'https://low.example/rss':[('Show.S01E11.1080p.WEB-DL.HQ',9)]}
+        self.sites(feeds,'high\nlow'); self.run_check()
+        self.assertIn('low.example',self.picked().enclosure)
+    def test_configured_site_priority_beats_rss_order_for_identical_release(self):
+        feeds={'https://low.example/rss':[('Show.S01E11.1080p.WEB-DL',5)],
+               'https://high.example/rss':[('Show.S01E11.1080p.WEB-DL',5)]}
         self.sites(feeds,'high\nlow'); self.run_check()
         self.assertIn('high.example',self.picked().enclosure)
     def test_unlisted_site_ranks_last(self):
         feeds={'https://other.example/rss':[('Show.S01E11.1080p.WEB-DL',1)],
-               'https://listed.example/rss':[('Show.S01E11.720p.WEB-DL',1)]}
+               'https://listed.example/rss':[('Show.S01E11.1080p.WEB-DL',1)]}
         self.sites(feeds,'listed'); self.run_check()
         self.assertIn('listed.example',self.picked().enclosure)
     def test_chase_target_quality_beats_site_priority(self):
@@ -495,10 +505,16 @@ class PluginTests(unittest.TestCase):
                'https://low.example/rss':[('Show.S01E11.2160p.WEB-DL',1)]}
         self.sites(feeds,'high\nlow'); self.run_check()
         self.assertIn('2160p',self.picked().title)
-    def test_chase_site_priority_among_target_quality(self):
+    def test_chase_quality_beats_site_among_target_quality(self):
         self.chase()
-        feeds={'https://low.example/rss':[('Show.S01E11.2160p.BluRay.REMUX.DV',9)],
-               'https://high.example/rss':[('Show.S01E11.2160p.WEB-DL',1)]}
+        feeds={'https://high.example/rss':[('Show.S01E11.2160p.WEB-DL',1)],
+               'https://low.example/rss':[('Show.S01E11.2160p.BluRay.REMUX.DV',9)]}
+        self.sites(feeds,'high\nlow'); self.run_check()
+        self.assertIn('low.example',self.picked().enclosure)
+    def test_chase_site_priority_breaks_identical_release(self):
+        self.chase()
+        feeds={'https://low.example/rss':[('Show.S01E11.2160p.WEB-DL',5)],
+               'https://high.example/rss':[('Show.S01E11.2160p.WEB-DL',5)]}
         self.sites(feeds,'high\nlow'); self.run_check()
         self.assertIn('high.example',self.picked().enclosure)
     def test_site_recorded_in_history_and_decisions(self):

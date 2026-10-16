@@ -158,11 +158,11 @@ class RssEpisodeQuality(_PluginBase):
     # 插件名称
     plugin_name = "RSS剧集优选"
     # 插件描述
-    plugin_desc = "追更优先：新集立即下载（多站同时出现按站点优先级），之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本）、整包只选缺集，不发送系统通知。"
+    plugin_desc = "追更优先：新集立即下载（多个版本同时出现时画质、码率优先，站点优先级最后），之后只升级一次到目标画质，每集下载次数可控；严格媒体库查重（支持多版本）、整包只选缺集，不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.4"
+    plugin_version = "1.5.5"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -669,7 +669,7 @@ class RssEpisodeQuality(_PluginBase):
                     {'title': '1080p', 'value': '1080p'}]}},
                 {'component': 'VTextField', 'props': {'model': 'max_downloads', 'label': '每集最多下载次数（追更优先模式，含首次，1–5）', 'type': 'number'}},
                 {'component': 'VTextarea', 'props': {
-                    'model': 'site_priority', 'label': '站点优先级（每行一个站点域名关键词，越靠上越优先）', 'rows': 3,
+                    'model': 'site_priority', 'label': '站点优先级（每行一个站点域名关键词，越靠上越优先；只在画质、体积都相同时才起作用）', 'rows': 3,
                     'placeholder': '例如：\nhdsky\nourbits\n留空则按上方RSS地址顺序，越靠上越优先',
                     'hint': '同一集同时出现在多个站时，先下优先级高的站；已有目标画质的资源仍优先，避免多下一次',
                     'persistent-hint': True}},
@@ -1436,27 +1436,26 @@ class RssEpisodeQuality(_PluginBase):
                 context = Context(meta_info=meta, media_info=mediainfo, torrent_info=torrentinfo)
                 smart = self._smart_quality and self._action == "download" and mediainfo.type == MediaType.TV
                 episode_keys = self.__episode_keys(meta, mediainfo) if smart else []
-                # 排序：已达目标画质（追更优先）> 站点优先级 > MP 规则优先级 > 画质细节
+                # 排序：已达目标画质（追更优先）> 画质细节 > 体积（码率）> MP 规则优先级 > 站点优先级
                 site, site_label = site_score([feed_url, link, enclosure], site_keys, feed_index)
                 site_labels[rss_key] = site_label
                 at_target = int(chase_target is not None and meets_target(quality(title), chase_target) is True)
-                order = (at_target, site) + rank(title, getattr(torrentinfo, "pri_order", 0))
+                rule_priority, *details = rank(title, getattr(torrentinfo, "pri_order", 0))
+                try:
+                    size = float(getattr(torrentinfo, "size", 0) or 0)
+                except (TypeError, ValueError):
+                    size = 0.0
+                order = (at_target, *details, size, rule_priority, site)
                 candidates.append((context, rss_key, episode_keys, order, smart))
             except Exception as err:
                 logger.error(f'解析RSS候选出错：{err} - {traceback.format_exc()}')
         self.save_data("rss_skip_cache_v1", skip_cache)
         if cache_hits:
             logger.info(f"剧集优选：{cache_hits} 条 RSS 近期已确认不适用或无需下载，本轮未重复识别")
-        # Higher MP rule scores first. Equal-grade variants are ordered by size only as a tie-breaker.
-        # Size cannot itself cause an upgrade or a second download.
+        # Size only orders equal-grade variants; it cannot itself cause an upgrade or a second download.
         if self._smart_quality and self._action == "download":
-            def size_of(item):
-                try:
-                    return float(item[0].torrent_info.size or 0)
-                except (TypeError, ValueError):
-                    return 0.0
             sorted_tv = iter(sorted((item for item in candidates if item[4]),
-                                    key=lambda item: (item[3], size_of(item)), reverse=True))
+                                    key=lambda item: item[3], reverse=True))
             candidates = [next(sorted_tv) if item[4] else item for item in candidates]
         ledger = self.get_data("pending_downloads_v2") or {}
         if not isinstance(ledger, dict):
