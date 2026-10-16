@@ -4,6 +4,14 @@ MoviePilot plugin: 电影订阅无通知。
 
 This MoviePilot V3 plugin is based on `RssSubscribeNoNotify` and is intended for movie RSS feeds. It keeps RSS matching, subscribe, download, history, and scheduling behavior, but only processes recognized movies and suppresses notifications.
 
+## 2.2.0：同一部电影只下一个版本
+
+- 先读完所有 RSS 源，再按电影分组，每部电影只下载最好的一个版本：分辨率高的优先（2160p > 1080p），同分辨率体积大（码率高）的优先，再按 RSS 源填写顺序。
+- 下载失败会自动换下一个版本。
+- 之后出现更高分辨率（比如先下了 1080p、后来出了 2160p）只升级一次，每部电影最多下载 2 次。
+- 媒体库已有且不是本插件下载过的电影，照旧跳过。
+- 日志里隐藏 passkey、rsskey 等密钥。
+
 ## Changes
 
 - Plugin class: `RssSubscribeMovieNoNotify`

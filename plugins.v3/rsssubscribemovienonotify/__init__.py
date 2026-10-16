@@ -25,6 +25,26 @@ from app.schemas.types import MediaSource, SystemConfigKey, MediaType
 
 lock = Lock()
 
+# 每部电影最多下载几次：第一次 + 出现更高分辨率时升级一次
+MAX_DOWNLOADS_PER_MOVIE = 2
+# 已下载电影记录的保留条数
+DOWNLOAD_RECORD_LIMIT = 3000
+_SECRET_PARAM = re.compile(r"((?:passkey|apikey|api_key|token|authkey|rsskey|sign|uid|key|downhash)=)[^&\s]+", re.IGNORECASE)
+
+
+def mask_url(url) -> str:
+    """日志里隐藏 RSS 链接中的密钥。"""
+    return _SECRET_PARAM.sub(r"\1***", str(url or ""))
+
+
+def resolution(title) -> int:
+    """从标题取分辨率，认不出返回 0。"""
+    text = str(title or "")
+    if re.search(r"2160[pi]|\b4k\b|\buhd\b", text, re.IGNORECASE):
+        return 2160
+    match = re.search(r"(?<!\d)(1080|720|576|480)[pi]\b", text, re.IGNORECASE)
+    return int(match.group(1)) if match else 0
+
 
 class DeleteHistoryRequest(BaseModel):
     """删除单条 RSS 历史的请求体。"""
@@ -88,11 +108,11 @@ class RssSubscribeMovieNoNotify(_PluginBase):
     # 插件名称
     plugin_name = "电影订阅无通知"
     # 插件描述
-    plugin_desc = "定时刷新电影 RSS 报文，仅处理电影，添加订阅或直接下载且不发送系统通知。"
+    plugin_desc = "定时刷新电影 RSS，仅处理电影：同一部电影只下载最好的一个版本（4K 优先、同分辨率码率高优先），之后最多升级一次，不发送系统通知。"
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -713,22 +733,22 @@ class RssSubscribeMovieNoNotify(_PluginBase):
             results = RssHelper().parse(url, proxy=self._proxy, timeout=20)
         except Exception as err:
             logger.error(
-                f"刷新 RSS 源发生未预期异常，已跳过：{url}，"
-                f"错误：{str(err)} - {traceback.format_exc()}"
+                f"刷新 RSS 源发生未预期异常，已跳过：{mask_url(url)}，"
+                f"错误：{mask_url(str(err))}"
             )
             return []
 
         if results is None:
-            logger.warning(f"RSS 链接可能已经过期：{url}")
+            logger.warning(f"RSS 链接可能已经过期：{mask_url(url)}")
             return []
         if results is False:
-            logger.error(f"RSS 请求或解析失败：{url}")
+            logger.error(f"RSS 请求或解析失败：{mask_url(url)}")
             return []
         if not isinstance(results, list):
-            logger.error(f"RSS 返回了不支持的数据类型：{url}，类型：{type(results).__name__}")
+            logger.error(f"RSS 返回了不支持的数据类型：{mask_url(url)}，类型：{type(results).__name__}")
             return []
         if not results:
-            logger.info(f"RSS 没有可处理的数据：{url}")
+            logger.info(f"RSS 没有可处理的数据：{mask_url(url)}")
         return results
 
     def __persist_history(self, history: List[dict]) -> None:
@@ -751,7 +771,7 @@ class RssSubscribeMovieNoNotify(_PluginBase):
 
     def __check(self):
         """
-        通过用户RSS同步豆瓣想看数据
+        读完所有 RSS 后按电影分组：每部电影只下载一个最好的版本，之后最多再升级一次分辨率。
         """
         if not self._address:
             return
@@ -768,170 +788,215 @@ class RssSubscribeMovieNoNotify(_PluginBase):
             for item in history
             if isinstance(item, dict) and item.get("key")
         }
+        downloads = self.get_data("movie_downloads_v1") or {}
+        if not isinstance(downloads, dict):
+            downloads = {}
         downloadchain = SilentDownloadChain()
         subscribechain = SilentSubscribeChain()
         rulehelper = RuleHelper()
         filter_groups = self.systemconfig.get(SystemConfigKey.SubscribeFilterRuleGroups)
+        # 1. 读完所有 RSS 源，按电影分组；RSS 源的先后顺序就是同等画质下的站点优先级
+        movies: Dict[str, dict] = {}
+        order = 0
         for url in self._address.splitlines():
-            # 处理每一个RSS链接
             url = url.strip()
             if not url:
                 continue
-            logger.info(f"开始刷新RSS：{url} ...")
-            results = self.__fetch_rss(url)
-            if not results:
-                continue
-            # 解析数据
-            for result in results:
+            logger.info(f"开始刷新RSS：{mask_url(url)} ...")
+            for result in self.__fetch_rss(url):
+                order += 1
                 try:
-                    title = result.get("title")
-                    description = result.get("description")
-                    enclosure = result.get("enclosure")
-                    link = result.get("link")
-                    size = result.get("size")
-                    pubdate: datetime.datetime = result.get("pubdate")
-                    # 检查是否处理过
-                    rss_key = self.__rss_key(result)
-                    if not title or not rss_key or rss_key in processed_keys or title in processed_keys:
-                        continue
-                    # 检查规则
-                    if self._include and not re.search(r"%s" % self._include,
-                                                       f"{title} {description}", re.IGNORECASE):
-                        logger.info(f"{title} - {description} 不符合包含规则")
-                        continue
-                    if self._exclude and re.search(r"%s" % self._exclude,
-                                                   f"{title} {description}", re.IGNORECASE):
-                        logger.info(f"{title} - {description} 不符合排除规则")
-                        continue
-                    if self._size_range:
-                        sizes = [float(_size) * 1024 ** 3 for _size in self._size_range.split("-")]
-                        if len(sizes) == 1 and float(size) < sizes[0]:
-                            logger.info(f"{title} - 种子大小不符合条件")
-                            continue
-                        elif len(sizes) > 1 and not sizes[0] <= float(size) <= sizes[1]:
-                            logger.info(f"{title} - 种子大小不在指定范围")
-                            continue
-                    # 识别媒体信息
-                    meta = MetaInfo(title=title, subtitle=description)
-                    if not meta.name:
-                        logger.warning(f"{title} 未识别到有效数据")
-                        continue
-                    mediainfo: MediaInfo = self.chain.recognize_media(meta=meta)
-                    if not mediainfo:
-                        logger.warning(f'未识别到媒体信息，标题：{title}')
-                        continue
-                    if mediainfo.type != MediaType.MOVIE:
-                        logger.info(f'{title} - 识别为{mediainfo.type.value}，电影订阅无通知跳过')
-                        continue
-                    # 种子
-                    torrentinfo = TorrentInfo(
-                        title=title,
-                        description=description,
-                        enclosure=enclosure,
-                        page_url=link,
-                        size=size,
-                        pubdate=pubdate.strftime("%Y-%m-%d %H:%M:%S") if pubdate else None,
-                        site_proxy=self._proxy,
-                    )
-                    # 过滤种子
-                    if self._filter:
-                        active_groups = rulehelper.get_rule_group_by_media(
-                            media=mediainfo,
-                            group_names=filter_groups
-                        )
-                        active_group_names = [group.name for group in active_groups]
-                        media_category = mediainfo.category or "未分类"
-                        if not active_group_names:
-                            logger.info(
-                                f"{title} - 未匹配到适用订阅规则组，"
-                                f"类型：{mediainfo.type.value}，分类：{media_category}"
-                            )
-                            continue
-                        logger.info(
-                            f"{title} - 使用订阅规则组：{', '.join(active_group_names)}，"
-                            f"类型：{mediainfo.type.value}，分类：{media_category}"
-                        )
-                        matched_torrents = self.chain.filter_torrents(
-                            rule_groups=filter_groups,
-                            torrent_list=[torrentinfo],
-                            mediainfo=mediainfo
-                        )
-                        if not matched_torrents:
-                            logger.info(f"{title} - 不匹配订阅规则组：{', '.join(active_group_names)}")
-                            continue
-                        torrentinfo = matched_torrents[0]
-                        logger.info(
-                            f"{title} - 已命中订阅规则组：{', '.join(active_group_names)}，"
-                            f"优先级：{getattr(torrentinfo, 'pri_order', '-')}"
-                        )
-                    # 媒体库已存在
-                    exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
-                    if exist_info:
-                        logger.info(f'{mediainfo.title_year} 己存在')
-                        continue
-                    # 下载或订阅
-                    if self._action == "download":
-                        # 添加下载
-                        result = downloadchain.download_single(
-                            context=Context(
-                                meta_info=meta,
-                                media_info=mediainfo,
-                                torrent_info=torrentinfo,
-                            ),
-                            save_path=self._save_path or None,
-                            username="电影RSS订阅无通知"
-                        )
-                        if not result:
-                            logger.error(f'{title} 下载失败')
-                            continue
-                    else:
-                        # 检查是否在订阅中
-                        subflag = subscribechain.exists(mediainfo=mediainfo, meta=meta)
-                        if subflag:
-                            logger.info(f'{mediainfo.title_year} 正在订阅中')
-                            continue
-                        # 添加订阅
-                        subscribe_id, subscribe_message = subscribechain.add(
-                            title=mediainfo.title,
-                            year=mediainfo.year,
-                            mtype=mediainfo.type,
-                            media_source=mediainfo.media_source,
-                            media_id=mediainfo.media_id,
-                            season=None,
-                            exist_ok=True,
-                            message=False,
-                            username="电影RSS订阅无通知"
-                        )
-                        if not subscribe_id:
-                            logger.error(
-                                f"{mediainfo.title_year} 添加订阅失败："
-                                f"{subscribe_message or '未知错误'}"
-                            )
-                            continue
-                    # 存储历史记录
-                    history_item = {
-                        "title": mediainfo.title_year,
-                        "key": rss_key,
-                        "rss_title": title,
-                        "type": mediainfo.type.value,
-                        "year": mediainfo.year,
-                        "poster": mediainfo.get_poster_image(),
-                        "overview": mediainfo.overview,
-                        "media_source": mediainfo.media_source.value,
-                        "media_id": str(mediainfo.media_id),
-                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    history_item["record_id"] = self.__history_record_id(history_item)
-                    history.append(history_item)
-                    processed_keys.add(rss_key)
+                    candidate = self.__candidate(result, processed_keys, rulehelper, filter_groups)
                 except Exception as err:
                     logger.error(f'刷新RSS数据出错：{str(err)} - {traceback.format_exc()}')
+                    continue
+                if not candidate:
+                    continue
+                candidate["order"] = order
+                movies.setdefault(candidate["media_key"], []).append(candidate)
+            logger.info(f"RSS {mask_url(url)} 刷新完成")
+        # 2. 每部电影只处理一次
+        for media_key, candidates in movies.items():
+            try:
+                self.__handle_movie(media_key, candidates, downloads, history, processed_keys,
+                                    downloadchain, subscribechain)
+            except Exception as err:
+                logger.error(f'处理电影出错：{str(err)} - {traceback.format_exc()}')
             self.__persist_history(history)
-            logger.info(f"RSS {url} 刷新完成")
         # 保存历史记录
         self.__persist_history(history)
         # 缓存只清理一次
         self._clearflag = False
+
+    def __candidate(self, result: dict, processed_keys: set, rulehelper, filter_groups) -> Optional[dict]:
+        """过滤并识别单条 RSS，返回可下载的电影候选。"""
+        title = result.get("title")
+        description = result.get("description")
+        enclosure = result.get("enclosure")
+        link = result.get("link")
+        size = result.get("size")
+        pubdate: datetime.datetime = result.get("pubdate")
+        # 检查是否处理过
+        rss_key = self.__rss_key(result)
+        if not title or not rss_key or rss_key in processed_keys or title in processed_keys:
+            return None
+        # 检查规则
+        if self._include and not re.search(r"%s" % self._include,
+                                           f"{title} {description}", re.IGNORECASE):
+            logger.info(f"{title} - {description} 不符合包含规则")
+            return None
+        if self._exclude and re.search(r"%s" % self._exclude,
+                                       f"{title} {description}", re.IGNORECASE):
+            logger.info(f"{title} - {description} 不符合排除规则")
+            return None
+        if self._size_range:
+            sizes = [float(_size) * 1024 ** 3 for _size in self._size_range.split("-")]
+            if len(sizes) == 1 and float(size) < sizes[0]:
+                logger.info(f"{title} - 种子大小不符合条件")
+                return None
+            elif len(sizes) > 1 and not sizes[0] <= float(size) <= sizes[1]:
+                logger.info(f"{title} - 种子大小不在指定范围")
+                return None
+        # 识别媒体信息
+        meta = MetaInfo(title=title, subtitle=description)
+        if not meta.name:
+            logger.warning(f"{title} 未识别到有效数据")
+            return None
+        mediainfo: MediaInfo = self.chain.recognize_media(meta=meta)
+        if not mediainfo:
+            logger.warning(f'未识别到媒体信息，标题：{title}')
+            return None
+        if mediainfo.type != MediaType.MOVIE:
+            logger.info(f'{title} - 识别为{mediainfo.type.value}，电影订阅无通知跳过')
+            return None
+        # 种子
+        torrentinfo = TorrentInfo(
+            title=title,
+            description=description,
+            enclosure=enclosure,
+            page_url=link,
+            size=size,
+            pubdate=pubdate.strftime("%Y-%m-%d %H:%M:%S") if pubdate else None,
+            site_proxy=self._proxy,
+        )
+        # 过滤种子
+        if self._filter:
+            active_groups = rulehelper.get_rule_group_by_media(
+                media=mediainfo,
+                group_names=filter_groups
+            )
+            active_group_names = [group.name for group in active_groups]
+            media_category = mediainfo.category or "未分类"
+            if not active_group_names:
+                logger.info(
+                    f"{title} - 未匹配到适用订阅规则组，"
+                    f"类型：{mediainfo.type.value}，分类：{media_category}"
+                )
+                return None
+            matched_torrents = self.chain.filter_torrents(
+                rule_groups=filter_groups,
+                torrent_list=[torrentinfo],
+                mediainfo=mediainfo
+            )
+            if not matched_torrents:
+                logger.info(f"{title} - 不匹配订阅规则组：{', '.join(active_group_names)}")
+                return None
+            torrentinfo = matched_torrents[0]
+        try:
+            size_value = float(size or 0)
+        except (TypeError, ValueError):
+            size_value = 0
+        return {
+            "title": title, "rss_key": rss_key, "meta": meta, "mediainfo": mediainfo,
+            "torrentinfo": torrentinfo, "res": resolution(title), "size": size_value,
+            "media_key": f"{mediainfo.media_source.value}:{mediainfo.media_id}",
+        }
+
+    def __handle_movie(self, media_key: str, candidates: List[dict], downloads: dict, history: List[dict],
+                       processed_keys: set, downloadchain, subscribechain) -> None:
+        """同一部电影的多个版本只挑一个：分辨率优先，同分辨率体积大（码率高）优先，再按 RSS 源顺序。"""
+        mediainfo: MediaInfo = candidates[0]["mediainfo"]
+        if self._action != "download":
+            first = candidates[0]
+            if subscribechain.exists(mediainfo=mediainfo, meta=first["meta"]):
+                logger.info(f'{mediainfo.title_year} 正在订阅中')
+                return
+            subscribe_id, subscribe_message = subscribechain.add(
+                title=mediainfo.title,
+                year=mediainfo.year,
+                mtype=mediainfo.type,
+                media_source=mediainfo.media_source,
+                media_id=mediainfo.media_id,
+                season=None,
+                exist_ok=True,
+                message=False,
+                username="电影RSS订阅无通知"
+            )
+            if not subscribe_id:
+                logger.error(f"{mediainfo.title_year} 添加订阅失败：{subscribe_message or '未知错误'}")
+                return
+            self.__add_history(history, processed_keys, mediainfo, first)
+            return
+        record = downloads.get(media_key)
+        if isinstance(record, dict):
+            have = int(record.get("res") or 0)
+            if int(record.get("count") or 1) >= MAX_DOWNLOADS_PER_MOVIE:
+                logger.info(f'{mediainfo.title_year} 已下载 {record.get("count")} 次，不再下载')
+                return
+            candidates = [c for c in candidates if c["res"] > have]
+            if not candidates:
+                logger.info(f'{mediainfo.title_year} 已下载 {have or "未知"}p，没有更高分辨率的版本')
+                return
+        else:
+            record = None
+            # 媒体库已存在
+            exist_info: Optional[ExistMediaInfo] = self.chain.media_exists(mediainfo=mediainfo)
+            if exist_info:
+                logger.info(f'{mediainfo.title_year} 己存在')
+                return
+        ranked = sorted(candidates, key=lambda c: (-c["res"], -c["size"], c["order"]))
+        for candidate in ranked:
+            result = downloadchain.download_single(
+                context=Context(
+                    meta_info=candidate["meta"],
+                    media_info=mediainfo,
+                    torrent_info=candidate["torrentinfo"],
+                ),
+                save_path=self._save_path or None,
+                username="电影RSS订阅无通知"
+            )
+            if not result:
+                logger.error(f'{candidate["title"]} 下载失败，尝试下一个版本')
+                continue
+            logger.info(f'{mediainfo.title_year} 共 {len(candidates)} 个版本，'
+                        f'{"升级" if record else "下载"}：{candidate["title"]}')
+            downloads[media_key] = {
+                "res": candidate["res"], "count": (record or {}).get("count", 0) + 1,
+                "title": candidate["title"], "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if len(downloads) > DOWNLOAD_RECORD_LIMIT:
+                for key in sorted(downloads, key=lambda k: str(downloads[k].get("t")))[:-DOWNLOAD_RECORD_LIMIT]:
+                    downloads.pop(key, None)
+            self.save_data("movie_downloads_v1", downloads)
+            self.__add_history(history, processed_keys, mediainfo, candidate)
+            return
+
+    def __add_history(self, history: List[dict], processed_keys: set, mediainfo: MediaInfo, candidate: dict):
+        history_item = {
+            "title": mediainfo.title_year,
+            "key": candidate["rss_key"],
+            "rss_title": candidate["title"],
+            "type": mediainfo.type.value,
+            "year": mediainfo.year,
+            "poster": mediainfo.get_poster_image(),
+            "overview": mediainfo.overview,
+            "media_source": mediainfo.media_source.value,
+            "media_id": str(mediainfo.media_id),
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        history_item["record_id"] = self.__history_record_id(history_item)
+        history.append(history_item)
+        processed_keys.add(candidate["rss_key"])
 
     def __log_and_notify_error(self, message):
         """
