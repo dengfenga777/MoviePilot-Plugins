@@ -6,6 +6,7 @@
     https://www.themoviedb.org/tv/12345 第二季 3-5集 花屏
     12345 第3、7、9集没有
     tmdb=12345 s1 e3 e4 字幕错了
+    tmdb 550 电影 资源有问题 / tmdb movie 550 / https://www.themoviedb.org/movie/550
 """
 from __future__ import annotations
 
@@ -16,6 +17,9 @@ from typing import List, Optional
 CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
+# 明确说是电影（没有季/集时才生效）
+MOVIE_WORDS = re.compile(r"电影|影片|剧场版|\bmovie\b|\bfilm\b", re.I)
+
 # 意图关键词
 REPLACE_WORDS = r"(有问题|问题|坏了|损坏|花屏|卡顿|没声音|无声|音画不同步|不同步|字幕(错|不对|有问题|缺失|没有)|" \
                 r"错集|错了|放错|播不了|不能播|无法播放|打不开|画质差|糊|洗版|替换|重新下|重下|换个|换一个)"
@@ -23,6 +27,8 @@ MISSING_WORDS = r"(缺|少了?|没有|没更|未更|漏了?|补一?下|补集|�
 
 TMDB_PATTERNS = [
     re.compile(r"themoviedb\.org/(?P<kind>tv|movie)/(?P<id>\d+)", re.I),
+    re.compile(r"tmdb\s*(?:id)?\s*[/:：=#]?\s*(?P<kind>tv|movie)\s*[/:：=#]?\s*(?P<id>\d{2,9})", re.I),
+    re.compile(r"(?<![A-Za-z])(?P<kind>tv|movie)\s*/\s*(?P<id>\d{2,9})", re.I),
     re.compile(r"tmdb\s*(?:id)?\s*[:：=#]?\s*(?P<id>\d{2,9})", re.I),
 ]
 # 消息里只有一个"裸"数字串并且足够长时也当作 TMDB ID（可在配置中关闭）
@@ -76,12 +82,13 @@ def parse(text: str, allow_bare_id: bool = True) -> Optional[Request]:
     text = text.replace("～", "~").replace("—", "-").replace("–", "-").replace("至", "-").replace("到", "-")
 
     # ---------- TMDB ID ----------
-    tmdbid, is_movie, id_span = None, False, None
+    tmdbid, is_movie, is_tv, id_span = None, False, False, None
     for p in TMDB_PATTERNS:
         m = p.search(text)
         if m:
             tmdbid = int(m.group("id"))
-            is_movie = (m.groupdict().get("kind") or "").lower() == "movie"
+            kind = (m.groupdict().get("kind") or "").lower()
+            is_movie, is_tv = kind == "movie", kind == "tv"
             id_span = m.span()
             break
     bare = False
@@ -137,6 +144,10 @@ def parse(text: str, allow_bare_id: bool = True) -> Optional[Request]:
     intent = "replace" if re.search(REPLACE_WORDS, raw) else "missing"
 
     episodes = sorted({e for e in episodes if e > 0})
+    if not is_tv and season is None and not episodes and MOVIE_WORDS.search(raw):
+        is_movie = True
+    if is_movie:
+        season, episodes = None, []
     # 裸数字 ID 误触发概率高：必须同时带集数或求片/报错关键词
     if bare and not episodes and not re.search(f"{REPLACE_WORDS}|{MISSING_WORDS}", raw):
         return None

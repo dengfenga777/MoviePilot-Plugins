@@ -31,29 +31,57 @@ def covers(ctx: Any, episode: int) -> bool:
     return eps is None or episode in eps
 
 
+# 做种数分档：同一画质下按档比较，档内再看是否免费，避免 50 和 60 做种这种差别压过免费
+_SEED_TIERS = (100, 30, 10, 3)
+
+
+def _seed_tier(seeders: int) -> int:
+    for i, n in enumerate(_SEED_TIERS):
+        if seeders >= n:
+            return len(_SEED_TIERS) - i
+    return 0
+
+
 def pick(results: List[Any], season: Optional[int], episode: Optional[int],
-         allow_pack: bool = True, min_seeders: int = 1, limit: int = 3) -> List[Any]:
-    """排序：恰好单集 > 含该集的多集包 > 整季包；组内保持 MoviePilot 的优先级顺序。"""
-    buckets: List[List[Any]] = [[], [], []]
-    for ctx in results:
+         allow_pack: bool = True, min_seeders: int = 1, low_seeders: int = 3,
+         limit: int = 3) -> List[Any]:
+    """兼顾速度和画质的排序：
+
+    1. 做种数少于 low_seeders 的排到最后（下不动）
+    2. 画质：MoviePilot 规则组匹配等级 pri_order，越高越好
+    3. 同画质下做种多的优先（按档）
+    4. 免费优先
+    5. 单集 > 多集包 > 整季包（包只勾选需要的集，差别不大，放最后）
+    6. 做种数、MoviePilot 原始顺序兜底
+    """
+    scored = []
+    for idx, ctx in enumerate(results):
         torrent = getattr(ctx, "torrent_info", None)
-        if (getattr(torrent, "seeders", 0) or 0) < min_seeders:
+        seeders = getattr(torrent, "seeders", 0) or 0
+        if seeders < min_seeders:
             continue
         s = season_of(ctx)
         if season is not None and s is not None and s != season:
             continue
-        if episode is None:
-            buckets[0].append(ctx)
-            continue
-        eps = episodes_of(ctx)
-        if eps is None:
-            if allow_pack:
-                buckets[2].append(ctx)
-        elif eps == [episode]:
-            buckets[0].append(ctx)
-        elif episode in eps:
-            buckets[1].append(ctx)
-    return (buckets[0] + buckets[1] + buckets[2])[:limit]
+        kind = 0
+        if episode is not None:
+            eps = episodes_of(ctx)
+            if eps is None:
+                if not allow_pack:
+                    continue
+                kind = 2
+            elif eps == [episode]:
+                kind = 0
+            elif episode in eps:
+                kind = 1
+            else:
+                continue
+        free = getattr(torrent, "downloadvolumefactor", None) == 0
+        key = (seeders < low_seeders, -(getattr(torrent, "pri_order", 0) or 0), -_seed_tier(seeders),
+               not free, kind, -seeders, idx)
+        scored.append((key, ctx))
+    scored.sort(key=lambda x: x[0])
+    return [c for _, c in scored[:limit]]
 
 
 # 标题末尾的发布组后缀（如 -XXWEB、@XXWEB），很多是站点自制组，会暴露来源站点

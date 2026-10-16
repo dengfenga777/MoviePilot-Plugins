@@ -31,6 +31,9 @@ def _stub_moviepilot():
         def save_data(self, key, value):
             self._data[key] = value
 
+        def update_config(self, config):
+            calls.saved_config = dict(config)
+
     class SearchChain:
         def search_by_id(self, **kw):
             calls.search.append(kw)
@@ -39,6 +42,9 @@ def _stub_moviepilot():
     class DownloadChain:
         def download_single(self, **kw):
             calls.download.append(kw)
+            title = kw["context"].torrent_info.title
+            if title in calls.fail:
+                return None, "种子下载失败"
             return "hash1", None
 
     class TmdbChain:
@@ -65,12 +71,13 @@ def _stub_moviepilot():
 class SimpleCalls:
     def __init__(self):
         self.search, self.download, self.results, self.seasons = [], [], [], [1]
+        self.fail, self.saved_config = set(), None
 
 
-def ctx(title, season, b=None, e=None, seeders=5):
+def ctx(title, season, b=None, e=None, seeders=5, pri=0, free=True):
     return NS(meta_info=NS(begin_season=season, begin_episode=b, end_episode=e, episode_list=[]),
               torrent_info=NS(title=title, seeders=seeders, site_name="X", size=2 * 1024 ** 3,
-                              downloadvolumefactor=0),
+                              downloadvolumefactor=0 if free else 1, pri_order=pri),
               media_info=NS(title="某剧", year="2026"))
 
 
@@ -122,17 +129,42 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(parse("我有 2 个问题 123 和 456"))
 
     def test_movie(self):
-        r = parse("https://www.themoviedb.org/movie/550 资源有问题")
-        self.assertTrue(r.is_movie)
+        for text in ["https://www.themoviedb.org/movie/550 资源有问题", "tmdb 550 电影 资源有问题",
+                     "tmdb movie 550 花屏", "movie/550 缺", "550 电影 有问题"]:
+            r = parse(text)
+            self.assertTrue(r and r.is_movie, text)
+            self.assertEqual((r.tmdbid, r.season, r.episodes), (550, None, []), text)
+        self.assertFalse(parse("tmdb 550 资源有问题").is_movie)       # 没说是电影，先按剧集查
+        self.assertFalse(parse("tmdb 123 第5集 电影院版").is_movie)   # 带集数就是剧
+        self.assertFalse(parse("tmdb tv 123 电影").is_movie)
+        self.assertIsNone(parse("我看了 300 部电影"))
 
 
 class PickTest(unittest.TestCase):
+    @staticmethod
+    def titles(cs):
+        return [c.torrent_info.title for c in cs]
+
     def test_order_and_filters(self):
         rs = [ctx("pack", 2), ctx("S02E01-E08", 2, 1, 8), ctx("S02E05", 2, 5), ctx("S01E05", 1, 5),
               ctx("S02E05 dead", 2, 5, seeders=0)]
         self.assertEqual([c.torrent_info.title for c in pick(rs, 2, 5)], ["S02E05", "S02E01-E08", "pack"])
         self.assertEqual([c.torrent_info.title for c in pick(rs, 2, 5, allow_pack=False)],
                          ["S02E05", "S02E01-E08"])
+
+    def test_quality_beats_kind(self):
+        rs = [ctx("ep 1080p", 1, 5, seeders=50), ctx("pack 2160p", 1, seeders=50, pri=90)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["pack 2160p", "ep 1080p"])
+
+    def test_low_seeders_last_even_if_better_quality(self):
+        rs = [ctx("2160p slow", 1, 5, seeders=2, pri=90), ctx("1080p fast", 1, 5, seeders=40, pri=10)]
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["1080p fast", "2160p slow"])
+
+    def test_seed_tier_then_free(self):
+        rs = [ctx("paid 60", 1, 5, seeders=60, free=False), ctx("free 40", 1, 5, seeders=40),
+              ctx("free 5", 1, 5, seeders=5)]
+        # 60 和 40 同一档 → 免费优先；5 做种低一档排后面
+        self.assertEqual(self.titles(pick(rs, 1, 5)), ["free 40", "paid 60", "free 5"])
 
 
 class HideSiteTest(unittest.TestCase):
@@ -156,7 +188,7 @@ class FlowTest(unittest.TestCase):
         calls.download.clear()
         calls.seasons = [1]
         self.p = plugin_mod.TgEpisodeRequest()
-        self.p.init_plugin({"enabled": False, "admin_ids": "999"})
+        self.p.init_plugin({"enabled": False, "admin_ids": "999", "auto_download": False, "config_version": 2})
         self.bot = FakeBot()
 
     def msg(self, text, uid=1):
@@ -194,6 +226,28 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(calls.search[0]["season"], 2)
         self.assertIn("资源有问题", self.bot.edits[-1][0])
 
+    def test_auto_download_is_default_and_migrated(self):
+        p = plugin_mod.TgEpisodeRequest()
+        p.init_plugin({"enabled": False})
+        self.assertTrue(p._auto_download)
+        calls.saved_config = None
+        p.init_plugin({"enabled": False, "auto_download": False})  # 旧版本保存的配置
+        self.assertTrue(p._auto_download)
+        self.assertEqual(calls.saved_config["config_version"], 2)
+
+    def test_auto_falls_back_to_next_candidate(self):
+        self.p._auto_download = True
+        calls.results = [ctx("S01E05 best", 1, 5, seeders=50), ctx("S01E05 second", 1, 5, seeders=20)]
+        calls.fail = {"S01E05 best"}
+        self.handle(self.msg("tmdb 123 缺第5集"))
+        self.assertEqual([d["context"].torrent_info.title for d in calls.download],
+                         ["S01E05 best", "S01E05 second"])
+        text, buttons = self.bot.edits[-1]
+        self.assertIn("已推送下载", text)
+        self.assertNotIn("下载失败", text)
+        self.assertFalse(buttons)
+        calls.fail = set()
+
     def test_single_episode_torrent_no_selection(self):
         calls.results = [ctx("S01E05", 1, 5)]
         self.p._auto_download = True
@@ -207,6 +261,27 @@ class FlowTest(unittest.TestCase):
         calls.results = [ctx("S01E05", 1, 5)]
         self.handle(self.msg("/mp@bot tmdb 123 缺第5集"))
         self.assertEqual(len(calls.search), 1)
+
+    def test_movie_flow(self):
+        calls.results = [ctx("Some Movie 2160p", None, seeders=30)]
+        self.p._auto_download = True
+        self.handle(self.msg("tmdb 550 电影 资源有问题"))
+        self.assertEqual(calls.search[0]["mtype"], plugin_mod.MediaType.MOVIE)
+        self.assertIsNone(calls.search[0]["season"])
+        self.assertIsNone(calls.download[0]["episodes"])
+        self.assertIn("已推送下载", self.bot.edits[-1][0])
+
+    def test_no_seasons_without_episodes_falls_back_to_movie(self):
+        calls.seasons = []
+        calls.results = [ctx("Some Movie 1080p", None)]
+        self.handle(self.msg("tmdb 550 资源有问题"))
+        self.assertEqual(calls.search[0]["mtype"], plugin_mod.MediaType.MOVIE)
+
+    def test_no_seasons_with_episodes_reports_error(self):
+        calls.seasons = []
+        self.handle(self.msg("tmdb 550 缺第5集"))
+        self.assertEqual(calls.search, [])
+        self.assertIn("没查到剧集信息", self.bot.sent[-1][0])
 
     def test_allowed_chats(self):
         self.p._allowed_chats = {-1}

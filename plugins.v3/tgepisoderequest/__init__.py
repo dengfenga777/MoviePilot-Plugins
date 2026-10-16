@@ -43,7 +43,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -75,10 +75,11 @@ class TgEpisodeRequest(_PluginBase):
     _allowed_chats: Set[int] = set()
     _admin_ids: Set[int] = set()
     _trigger: str = "auto"
-    _auto_download: bool = False
+    _auto_download: bool = True
     _allow_bare_id: bool = True
     _allow_pack: bool = True
     _min_seeders: int = 1
+    _low_seeders: int = 3
     _candidates: int = 3
     _max_episodes: int = 12
     _downloader: str = ""
@@ -86,6 +87,12 @@ class TgEpisodeRequest(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
+        if config and config.get("config_version", 0) < 2:
+            # 1.1.0 起默认自动下载：旧配置里的“手动选择”是当时的默认值，统一切换一次
+            config["auto_download"] = True
+            config["config_version"] = 2
+            self.update_config(config)
+            logger.info("TG群组智能补集：已切换为默认自动下载最优资源")
         if config:
             self._enabled = bool(config.get("enabled"))
             self._token = str(config.get("token") or "").strip()
@@ -93,10 +100,11 @@ class TgEpisodeRequest(_PluginBase):
             self._allowed_chats = self.__ids(config.get("allowed_chats"))
             self._admin_ids = self.__ids(config.get("admin_ids"))
             self._trigger = config.get("trigger") or "auto"
-            self._auto_download = bool(config.get("auto_download"))
+            self._auto_download = bool(config.get("auto_download", True))
             self._allow_bare_id = config.get("allow_bare_id", True)
             self._allow_pack = config.get("allow_pack", True)
             self._min_seeders = self.__int(config.get("min_seeders"), 1)
+            self._low_seeders = self.__int(config.get("low_seeders"), 3)
             self._candidates = max(1, min(self.__int(config.get("candidates"), 3), 8))
             self._max_episodes = self.__int(config.get("max_episodes"), 12)
             self._downloader = str(config.get("downloader") or "").strip()
@@ -229,8 +237,9 @@ class TgEpisodeRequest(_PluginBase):
                 "• tmdb 12345 缺第5集\n"
                 "• tmdb 12345 S02E05 资源有问题\n"
                 "• https://www.themoviedb.org/tv/12345 第二季 3-5集 花屏\n"
-                "• /mp 12345 第3、7集\n\n"
-                "没写季的话，单季剧自动识别，多季剧会让你选。")
+                "• /mp 12345 第3、7集\n"
+                "• tmdb 550 电影 资源有问题（或 tmdb movie 550）\n\n"
+                "没写季的话，单季剧自动识别，多季剧会让你选；没写集数又查不到剧集会按电影搜。")
 
     # ---------------- 求片流程 ----------------
 
@@ -260,12 +269,19 @@ class TgEpisodeRequest(_PluginBase):
                 seasons = [s.season_number for s in (TmdbChain().tmdb_seasons(tmdbid=req.tmdbid) or [])
                            if (s.season_number or 0) > 0]
             except Exception as e:
-                bot.send(chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to=reply_to)
+                if req.episodes:
+                    bot.send(chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to=reply_to)
+                    return
+                logger.warning(f"TG群组智能补集：查询 TMDB {req.tmdbid} 季信息失败，按电影处理：{e}")
+                seasons = []
+            if not seasons and not req.episodes:
+                # 没写集数又查不到剧集，多半是电影
+                req.is_movie = True
+            elif not seasons:
+                bot.send(chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，ID 是不是错了？"
+                                  f"电影的话不用写集数，或者发 tmdb movie {req.tmdbid}", reply_to=reply_to)
                 return
-            if not seasons:
-                bot.send(chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，是不是电影或者 ID 错了？", reply_to=reply_to)
-                return
-            if len(seasons) == 1:
+            elif len(seasons) == 1:
                 req.season = seasons[0]
             else:
                 rows = [[button(f"S{n:02d}", f"s|{jid}|{n}") for n in seasons[i:i + 5]]
@@ -305,7 +321,8 @@ class TgEpisodeRequest(_PluginBase):
             job.title = f"{media.title} ({media.year})" if media.year else (media.title or "")
         for ep in req.episodes or [0]:
             job.choices[ep] = pick(results, req.season, ep or None, allow_pack=self._allow_pack,
-                                   min_seeders=self._min_seeders, limit=self._candidates)
+                                   min_seeders=self._min_seeders, low_seeders=self._low_seeders,
+                                   limit=self._candidates)
 
         note = ""
         if self._auto_download:
@@ -313,12 +330,18 @@ class TgEpisodeRequest(_PluginBase):
         self.__render(bot, jid, note)
 
     def __download_all(self, job: Job) -> str:
+        """每集按排序依次尝试，第一个失败就换下一个候选。"""
         errors = []
         for ep, cands in job.choices.items():
-            if cands and ep not in job.done:
-                err = self.__download(job, ep, cands[0])
-                if err:
-                    errors.append(f"❌ {self.__ep_label(ep)} 下载失败：{html.escape(err)}")
+            last_err = None
+            for cand in cands:
+                if ep in job.done:  # 可能已被前面某个包一并覆盖
+                    break
+                last_err = self.__download(job, ep, cand)
+                if not last_err:
+                    break
+            if ep not in job.done and last_err:
+                errors.append(f"❌ {self.__ep_label(ep)} 下载失败：{html.escape(last_err)}")
         return "\n".join(errors)
 
     def __download(self, job: Job, ep: int, ctx) -> Optional[str]:
@@ -362,7 +385,10 @@ class TgEpisodeRequest(_PluginBase):
         if not job:
             return
         req = job.req
-        action = "🛠 资源有问题 → 重新下载" if req.intent == "replace" else "📥 缺集 → 补下载"
+        if req.intent == "replace":
+            action = "🛠 资源有问题 → 重新下载"
+        else:
+            action = "📥 求片 → 下载" if req.is_movie else "📥 缺集 → 补下载"
         lines = [f"<b>{html.escape(job.title)}</b>  {req.describe()}", action, ""]
         rows = []
         for ep, cands in job.choices.items():
@@ -457,7 +483,7 @@ class TgEpisodeRequest(_PluginBase):
                     {"component": "VRow", "content": [
                         col(4, "VSwitch", model="enabled", label="启用插件"),
                         col(4, "VSwitch", model="proxy", label="使用系统代理访问 Telegram"),
-                        col(4, "VSwitch", model="auto_download", label="自动下载第一个候选（不用点按钮）"),
+                        col(4, "VSwitch", model="auto_download", label="自动下载最优资源（关闭则需点按钮选择）"),
                     ]},
                     {"component": "VRow", "content": [
                         col(12, "VTextField", model="token", label="机器人 Token",
@@ -480,8 +506,16 @@ class TgEpisodeRequest(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         col(4, "VTextField", model="candidates", label="每集候选数", type="number"),
-                        col(4, "VTextField", model="min_seeders", label="最少做种数", type="number"),
+                        col(4, "VTextField", model="min_seeders", label="最少做种数（低于直接不要）", type="number"),
                         col(4, "VTextField", model="max_episodes", label="单次最多集数", type="number"),
+                    ]},
+                    {"component": "VRow", "content": [
+                        col(4, "VTextField", model="low_seeders", label="做种少于此数排到最后", type="number"),
+                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [{
+                            "component": "VAlert",
+                            "props": {"type": "info", "variant": "tonal", "density": "compact", "text":
+                                      "排序：做种太少的放最后 → MoviePilot 规则组画质 → 做种多的优先 → 免费优先 → 单集优先"},
+                        }]},
                     ]},
                     {"component": "VRow", "content": [
                         col(6, "VTextField", model="downloader", label="下载器名称", placeholder="留空用默认下载器"),
@@ -502,7 +536,7 @@ class TgEpisodeRequest(_PluginBase):
             "enabled": False,
             "token": "",
             "proxy": True,
-            "auto_download": False,
+            "auto_download": True,
             "allowed_chats": "",
             "admin_ids": "",
             "trigger": "auto",
@@ -510,6 +544,8 @@ class TgEpisodeRequest(_PluginBase):
             "allow_pack": True,
             "candidates": 3,
             "min_seeders": 1,
+            "low_seeders": 3,
+            "config_version": 2,
             "max_episodes": 12,
             "downloader": "",
             "save_path": "",
