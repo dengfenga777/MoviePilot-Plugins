@@ -129,8 +129,15 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(parse("我有 2 个问题 123 和 456"))
 
     def test_movie(self):
-        r = parse("https://www.themoviedb.org/movie/550 资源有问题")
-        self.assertTrue(r.is_movie)
+        for text in ["https://www.themoviedb.org/movie/550 资源有问题", "tmdb 550 电影 资源有问题",
+                     "tmdb movie 550 花屏", "movie/550 缺", "550 电影 有问题"]:
+            r = parse(text)
+            self.assertTrue(r and r.is_movie, text)
+            self.assertEqual((r.tmdbid, r.season, r.episodes), (550, None, []), text)
+        self.assertFalse(parse("tmdb 550 资源有问题").is_movie)       # 没说是电影，先按剧集查
+        self.assertFalse(parse("tmdb 123 第5集 电影院版").is_movie)   # 带集数就是剧
+        self.assertFalse(parse("tmdb tv 123 电影").is_movie)
+        self.assertIsNone(parse("我看了 300 部电影"))
 
 
 class PickTest(unittest.TestCase):
@@ -254,6 +261,27 @@ class FlowTest(unittest.TestCase):
         calls.results = [ctx("S01E05", 1, 5)]
         self.handle(self.msg("/mp@bot tmdb 123 缺第5集"))
         self.assertEqual(len(calls.search), 1)
+
+    def test_movie_flow(self):
+        calls.results = [ctx("Some Movie 2160p", None, seeders=30)]
+        self.p._auto_download = True
+        self.handle(self.msg("tmdb 550 电影 资源有问题"))
+        self.assertEqual(calls.search[0]["mtype"], plugin_mod.MediaType.MOVIE)
+        self.assertIsNone(calls.search[0]["season"])
+        self.assertIsNone(calls.download[0]["episodes"])
+        self.assertIn("已推送下载", self.bot.edits[-1][0])
+
+    def test_no_seasons_without_episodes_falls_back_to_movie(self):
+        calls.seasons = []
+        calls.results = [ctx("Some Movie 1080p", None)]
+        self.handle(self.msg("tmdb 550 资源有问题"))
+        self.assertEqual(calls.search[0]["mtype"], plugin_mod.MediaType.MOVIE)
+
+    def test_no_seasons_with_episodes_reports_error(self):
+        calls.seasons = []
+        self.handle(self.msg("tmdb 550 缺第5集"))
+        self.assertEqual(calls.search, [])
+        self.assertIn("没查到剧集信息", self.bot.sent[-1][0])
 
     def test_allowed_chats(self):
         self.p._allowed_chats = {-1}

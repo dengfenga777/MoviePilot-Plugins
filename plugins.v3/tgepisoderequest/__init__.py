@@ -237,8 +237,9 @@ class TgEpisodeRequest(_PluginBase):
                 "• tmdb 12345 缺第5集\n"
                 "• tmdb 12345 S02E05 资源有问题\n"
                 "• https://www.themoviedb.org/tv/12345 第二季 3-5集 花屏\n"
-                "• /mp 12345 第3、7集\n\n"
-                "没写季的话，单季剧自动识别，多季剧会让你选。")
+                "• /mp 12345 第3、7集\n"
+                "• tmdb 550 电影 资源有问题（或 tmdb movie 550）\n\n"
+                "没写季的话，单季剧自动识别，多季剧会让你选；没写集数又查不到剧集会按电影搜。")
 
     # ---------------- 求片流程 ----------------
 
@@ -268,12 +269,19 @@ class TgEpisodeRequest(_PluginBase):
                 seasons = [s.season_number for s in (TmdbChain().tmdb_seasons(tmdbid=req.tmdbid) or [])
                            if (s.season_number or 0) > 0]
             except Exception as e:
-                bot.send(chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to=reply_to)
+                if req.episodes:
+                    bot.send(chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to=reply_to)
+                    return
+                logger.warning(f"TG群组智能补集：查询 TMDB {req.tmdbid} 季信息失败，按电影处理：{e}")
+                seasons = []
+            if not seasons and not req.episodes:
+                # 没写集数又查不到剧集，多半是电影
+                req.is_movie = True
+            elif not seasons:
+                bot.send(chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，ID 是不是错了？"
+                                  f"电影的话不用写集数，或者发 tmdb movie {req.tmdbid}", reply_to=reply_to)
                 return
-            if not seasons:
-                bot.send(chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，是不是电影或者 ID 错了？", reply_to=reply_to)
-                return
-            if len(seasons) == 1:
+            elif len(seasons) == 1:
                 req.season = seasons[0]
             else:
                 rows = [[button(f"S{n:02d}", f"s|{jid}|{n}") for n in seasons[i:i + 5]]
@@ -377,7 +385,10 @@ class TgEpisodeRequest(_PluginBase):
         if not job:
             return
         req = job.req
-        action = "🛠 资源有问题 → 重新下载" if req.intent == "replace" else "📥 缺集 → 补下载"
+        if req.intent == "replace":
+            action = "🛠 资源有问题 → 重新下载"
+        else:
+            action = "📥 求片 → 下载" if req.is_movie else "📥 缺集 → 补下载"
         lines = [f"<b>{html.escape(job.title)}</b>  {req.describe()}", action, ""]
         rows = []
         for ep, cands in job.choices.items():
