@@ -5,6 +5,7 @@ import threading
 import time
 import types
 import unittest
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -530,6 +531,42 @@ class BillingTest(unittest.TestCase):
         # 同一部电影再求不再收费也不拦
         self.handle("tmdb movie 550 求", uid=2)
         self.assertEqual(len(calls.search), 2)
+
+    def poll(self, history):
+        mod = types.ModuleType("app.sdk.queries")
+        mod.list_transfer_history = lambda filters, page: NS(items=[
+            NS(date=d, episodes=e) for h, d, e in history if h == filters["download_hash"]])
+        sys.modules["app.sdk.queries"] = mod
+        try:
+            self.p._TgEpisodeRequest__poll_arrivals()
+        finally:
+            del sys.modules["app.sdk.queries"]
+
+    def test_poll_finds_arrival_when_event_is_late(self):
+        calls.results = [ctx("S01 整季", 1)]
+        self.handle("tmdb 123 缺第5、6集")
+        now = datetime.now()
+        old = (now - timedelta(days=200)).strftime("%Y-%m-%d %H:%M:%S")
+        new = now.strftime("%Y-%m-%d %H:%M:%S")
+        sent = len(self.bot.sent)
+        self.poll([("hash1", old, "E06")])                     # 以前整理过的不算
+        self.assertEqual(len(self.bot.sent), sent)
+        self.poll([("hash1", old, "E06"), ("hash1", new, "E05")])
+        self.assertIn("E05", self.bot.sent[-1][0])
+        self.assertNotIn("E06", self.bot.sent[-1][0])
+        self.assertEqual(len(self.pms.charges), 1)
+        self.poll([("hash1", new, "E05")])                     # 重复轮询不重复提醒
+        self.p.on_transfer_complete(arrived(eps=[5]))           # 积压的事件后到也不重复
+        self.assertEqual(len(self.bot.sent), sent + 1)
+        self.poll([("hash1", new, "E05-E06")])
+        self.assertIn("E06", self.bot.sent[-1][0])
+        self.assertEqual(self.p.get_data("arrivals"), {})
+
+    def test_poll_movie(self):
+        calls.results = [ctx("Movie A 2160p", None, seeders=30)]
+        self.handle("tmdb movie 550 求", uid=2)
+        self.poll([("hash1", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), None)])
+        self.assertIn("已入库", self.bot.sent[-1][0])
 
     def test_season_charged_once_on_first_arrival(self):
         calls.results = [ctx("S01 整季", 1)]
