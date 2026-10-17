@@ -1,4 +1,5 @@
 import html
+import re
 import secrets
 import threading
 import time
@@ -46,7 +47,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.4.2"
+    plugin_version = "1.4.3"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -657,12 +658,21 @@ class TgEpisodeRequest(_PluginBase):
             chat_id, _, message_id = k.rpartition(":")
             bot.delete(int(chat_id), int(message_id))
 
+    ARRIVAL_POLL_SECONDS = 300
+
     def __cleaner(self, bot: TelegramBot, stop: threading.Event):
+        last_poll = 0.0
         while not stop.wait(20):
             try:
                 self.__purge(bot)
             except Exception as e:
                 logger.warning(f"TG群组智能补集：自动删除消息出错：{e}")
+            if time.time() - last_poll >= self.ARRIVAL_POLL_SECONDS:
+                last_poll = time.time()
+                try:
+                    self.__poll_arrivals()
+                except Exception as e:
+                    logger.warning(f"TG群组智能补集：检查入库记录出错：{e}")
 
     # ---------------- PMS 积分 ----------------
 
@@ -792,7 +802,47 @@ class TgEpisodeRequest(_PluginBase):
         begin, end = self.__field(meta, "begin_episode"), self.__field(meta, "end_episode")
         if not meta_eps and begin:
             meta_eps = set(range(begin, (end or begin) + 1))
+        self.__arrived(download_hash, meta_eps)
 
+    @staticmethod
+    def __history_episodes(text: Optional[str]) -> Set[int]:
+        """整理历史里的集数字段，如 E05、E11-E12。"""
+        eps: Set[int] = set()
+        for a, b in re.findall(r"E(\d{1,4})(?:-E(\d{1,4}))?", text or "", re.I):
+            eps.update(range(int(a), int(b or a) + 1))
+        return eps
+
+    @staticmethod
+    def __history_time(text: Optional[str]) -> float:
+        try:
+            return datetime.strptime(str(text)[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    def __poll_arrivals(self):
+        """MoviePilot 的整理完成事件可能积压很久才投递，这里定时直接查整理历史兜底。"""
+        if not self.get_state():
+            return
+        with self._data_lock:
+            pending = {h: r.get("created", 0) for h, r in self.__live_arrivals().items()}
+        if not pending:
+            return
+        from app.sdk.queries import list_transfer_history
+        for download_hash, created in pending.items():
+            page = list_transfer_history({"download_hash": download_hash, "status": True}, {"count": 100})
+            # 同一个种子以前整理过的记录不算，只看求片之后的
+            items = [i for i in (getattr(page, "items", None) or [])
+                     if self.__history_time(getattr(i, "date", None)) >= created - 60]
+            if not items:
+                continue
+            eps: Set[int] = set()
+            for item in items:
+                eps |= self.__history_episodes(getattr(item, "episodes", None))
+            logger.info(f"TG群组智能补集：整理历史里查到 {download_hash[:8]} 已入库"
+                        f"{' ' + ','.join(f'E{e:02d}' for e in sorted(eps)) if eps else ''}")
+            self.__arrived(download_hash, eps)
+
+    def __arrived(self, download_hash: str, meta_eps: Set[int]):
         with self._data_lock:
             arrivals = self.__live_arrivals()
             rec = arrivals.get(download_hash)
