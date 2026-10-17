@@ -487,6 +487,76 @@ def arrived(hash_="hash1", eps=()):
                           "meta": NS(episode_list=eps, begin_episode=None, end_episode=None)})
 
 
+class WaitLibraryTest(unittest.TestCase):
+    """默认：本地整理完成还不算，媒体库里能看到（上传、生成 strm 之后）才提醒和扣费。"""
+
+    def setUp(self):
+        calls.search.clear()
+        calls.download.clear()
+        calls.seasons = [1]
+        calls.library, calls.lib_checks = None, 0
+        self.p = plugin_mod.TgEpisodeRequest()
+        self.p.init_plugin({"enabled": False, "config_version": 2, "check_library": False})
+        self.p.get_state = lambda: True
+        self.bot = FakeBot()
+        self.p._bot = self.bot
+
+    def handle(self, text, uid=1):
+        self.p._TgEpisodeRequest__handle_update(self.bot, {"message": {
+            "message_id": 7, "text": text, "chat": {"id": -100}, "from": {"id": uid, "first_name": f"U{uid}"}}})
+
+    def poll(self, history=()):
+        mod = types.ModuleType("app.sdk.queries")
+        mod.list_transfer_history = lambda filters, page: NS(items=[
+            NS(date=d, episodes=e) for h, d, e in history if h == filters["download_hash"]])
+        sys.modules["app.sdk.queries"] = mod
+        try:
+            self.p._TgEpisodeRequest__poll_arrivals()
+        finally:
+            del sys.modules["app.sdk.queries"]
+
+    def notices(self):
+        return [t for t, _ in self.bot.sent if "已入库" in t]
+
+    def test_episode_waits_for_library(self):
+        calls.results = [ctx("S01 整季", 1)]
+        self.handle("tmdb 123 缺第5、6集")
+        self.p.on_transfer_complete(arrived(eps=[5]))   # 本地整理完，还没上传
+        self.poll()
+        self.assertEqual(self.notices(), [])
+        calls.library = {1: [5]}                         # 上传完，媒体库里有 E05 了
+        self.poll()
+        self.assertEqual(len(self.notices()), 1)
+        self.assertIn("E05", self.notices()[-1])
+        self.assertNotIn("E06", self.notices()[-1])
+        self.poll()
+        self.assertEqual(len(self.notices()), 1)         # 不重复
+        calls.library = {1: [5, 6]}
+        self.poll()
+        self.assertIn("E06", self.notices()[-1])
+        self.assertEqual(self.p.get_data("arrivals"), {})
+
+    def test_movie_and_history_path(self):
+        calls.results = [ctx("Movie A 2160p", None, seeders=30)]
+        self.handle("tmdb movie 550 求")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.poll([("hash1", now, None)])                 # 整理历史查到了，媒体库还没有
+        self.assertEqual(self.notices(), [])
+        calls.library = {}
+        self.poll()
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_replace_needs_transfer_first(self):
+        calls.library = {1: [5]}                          # 旧文件本来就在库里
+        calls.results = [ctx("S01E05", 1, 5)]
+        self.handle("tmdb 123 第5集 花屏")
+        self.poll()
+        self.assertEqual(self.notices(), [])              # 新版本还没整理，不能提醒
+        self.p.on_transfer_complete(arrived(eps=[5]))
+        self.poll()
+        self.assertEqual(len(self.notices()), 1)
+
+
 class BillingTest(unittest.TestCase):
     def setUp(self):
         calls.search.clear()
@@ -499,7 +569,8 @@ class BillingTest(unittest.TestCase):
         self.p = plugin_mod.TgEpisodeRequest()
         self.p.init_plugin({"enabled": False, "admin_ids": "999", "config_version": 2,
                             "pms_enabled": True, "pms_url": "http://pms", "pms_token": "k",
-                            "movie_price": 10, "season_price": 20, "free_movies": 1, "free_seasons": 0})
+                            "movie_price": 10, "season_price": 20, "free_movies": 1, "free_seasons": 0,
+                            "wait_library": False})
         self.p.get_state = lambda: True
         self.bot = FakeBot()
         self.p._bot = self.bot
