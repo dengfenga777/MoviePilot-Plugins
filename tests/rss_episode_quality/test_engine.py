@@ -197,6 +197,14 @@ class SelectionTests(unittest.TestCase):
     def test_special_episode_file_is_skipped_not_fatal(self):
         enabled, disabled=e.select_files(self.files(['Show.S01E00.mkv','Show.S01E11.mkv','Show.S01E12.mkv']),1,{11,12})
         self.assertEqual(enabled,[1,2]); self.assertEqual(disabled,[0])
+    def test_variant_files_are_not_selected(self):
+        enabled, disabled=e.select_files(self.files(['节目.纯享.S01E11.Pure.mkv','节目.S01E11.mkv','节目.纯享.S01E11.Pure.ass']),1,{11})
+        self.assertEqual(enabled,[1]); self.assertEqual(disabled,[0,2])
+    def test_is_variant(self):
+        for name in ('Natural High S04E06 Pure 2026 2160p','现在就出发.先导片.S04E02.Prologue.mkv','现在就出发.加更.S04E01.Plus.mkv','Show S01E03 [纯享版] 1080p'):
+            self.assertTrue(e.is_variant(name),name)
+        for name in ('Natural High S04E03 2026 2160p TX WEB-DL','Show S01E19 2160p 60Fps MAXPLUS HDRVivid','幕后之王 S01E03 1080p','Purely S01E02 1080p'):
+            self.assertFalse(e.is_variant(name),name)
     def test_update_pack_and_subtitles(self):
         files=self.files([f'Show.S01E{i:02}.mkv' for i in range(1,13)]+['Show.S01E11.ass','readme.txt'])
         enabled, disabled=e.select_files(files,1,{11,12})

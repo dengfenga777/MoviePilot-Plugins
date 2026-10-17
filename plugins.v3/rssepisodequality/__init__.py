@@ -25,7 +25,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaSource, SystemConfigKey, MediaType, MessageType
 
 from .engine import (Library, UncertainLibrary, UnsafeSelection, decide, quality, rank, file_scope, VIDEO,
-                     TARGETS, meets_target, site_score, is_special)
+                     TARGETS, meets_target, site_score, is_special, is_variant)
 from .adapters import query_library, submit_selected, TORRENT_EXISTS
 
 lock = Lock()
@@ -162,7 +162,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.5"
+    plugin_version = "1.5.6"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -1175,7 +1175,7 @@ class RssEpisodeQuality(_PluginBase):
         torrent = Torrent.from_string(content)
         season_episodes = {}
         for file in torrent.files:
-            if Path(file.name).suffix.lower() not in VIDEO or is_special(file.name):
+            if Path(file.name).suffix.lower() not in VIDEO or is_special(file.name) or is_variant(file.name):
                 continue
             season, episodes = file_scope(file.name, None)
             if season is None or not episodes:
@@ -1358,6 +1358,10 @@ class RssEpisodeQuality(_PluginBase):
                     continue
                 if exclude_re and exclude_re.search(f"{title} {description}"):
                     logger.info(f"{title} - {description} 不符合排除规则")
+                    continue
+                if is_variant(title):
+                    logger.info(f"{title} - 纯享/加更/先导等衍生版与正片同集号，会顶替正片，跳过")
+                    self.__remember_skip(skip_cache, rss_key, "衍生版", 24)
                     continue
                 if self._size_range:
                     try:

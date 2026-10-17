@@ -70,7 +70,7 @@ ns={'_PluginBase':Base,'Optional':Optional,'Any':Any,'Dict':Dict,'List':List,'Tu
     'MediaServerHelper':MediaHelper,'DownloaderHelper':DownloadHelper,
     'query_library':Mock(),'Library':engine.Library,'UncertainLibrary':engine.UncertainLibrary,
     'UnsafeSelection':engine.UnsafeSelection,'decide':engine.decide,'quality':engine.quality,'rank':engine.rank,'TARGETS':engine.TARGETS,'meets_target':engine.meets_target,'site_score':engine.site_score,
-    'file_scope':engine.file_scope,'TORRENT_EXISTS':'种子任务已存在，保留现有任务；请检查其选集和暂停状态','is_special':engine.is_special,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
+    'file_scope':engine.file_scope,'TORRENT_EXISTS':'种子任务已存在，保留现有任务；请检查其选集和暂停状态','is_special':engine.is_special,'is_variant':engine.is_variant,'VIDEO':engine.VIDEO,'MetaInfo':Meta,
     'Context':SimpleNamespace,'TorrentInfo':TorrentInfo,'MediaInfo':SimpleNamespace,
     'SystemConfigKey':SimpleNamespace(SubscribeFilterRuleGroups='rules'),
     'RuleHelper':object,'SilentDownloadChain':Download,'SilentSubscribeChain':Subscribe,
@@ -676,6 +676,18 @@ class PluginTests(unittest.TestCase):
         self.plugin.data['pending_downloads_v2']={}
         self.run_check()
         self.assertEqual(len(Download.calls),1)
+    def test_variant_release_never_takes_main_episode_slot(self):
+        # 综艺纯享/加更与正片同集号：衍生版跳过，正片照常下载
+        ns['query_library'].return_value=self.library(10)
+        self.feed('Show.S01E12.Pure.2160p.WEB-DL','Show.S01E11.2160p.WEB-DL')
+        self.run_check()
+        self.assertEqual([c['episodes'] for c in Download.calls],[{11}])
+    def test_pack_variant_files_are_not_selected(self):
+        self.plugin._skip_unknown_episodes=False
+        self.pack(['节目.S01E11.2160p.mkv','节目.纯享.S01E11.Pure.2160p.mkv','节目.加更.S01E12.Plus.2160p.mkv'])
+        ns['query_library'].return_value=self.library(10)
+        self.run_check()
+        self.assertEqual(Download.calls[0]['episodes'],{11})
     def test_failed_direct_download_is_retried_next_run(self):
         self.pack(['节目 20261010.mkv'])
         ns['query_library'].return_value=self.library(10)

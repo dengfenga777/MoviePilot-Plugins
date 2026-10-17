@@ -195,6 +195,16 @@ def is_special(name):
     return re.search(r'(?i)\bS\d{1,3}E0+(?!\d)', str(name or '')) is not None
 
 
+# 综艺的纯享/加更/先导等衍生版和正片共用集号（如“S04E03 Pure”），整理后会顶替正片的位置
+_VARIANT = re.compile(r'(?:^|[ ._\[\]【】|/-])(?:纯享版?|加更版?|先导片?|彩蛋|花絮|幕后花絮)(?=[ ._\[\]【】|/-]|$)'
+                      r'|(?i:\bS\d{1,3}E\d{1,4}[ ._-]+(?:Pure|Plus|Prologue|Extras?|Bonus|Behind|BTS|Preview)\b)')
+
+
+def is_variant(name):
+    """衍生版（纯享/加更/先导/花絮等）：与正片同集号，但不是正片。"""
+    return _VARIANT.search(str(name or '')) is not None
+
+
 @dataclass
 class Plan:
     selected: set = field(default_factory=set)
@@ -438,7 +448,7 @@ def select_files(files, season, selected):
         if path.is_absolute() or '..' in path.parts:
             raise UnsafeSelection('文件路径异常')
         suffix = path.suffix.lower()
-        if suffix not in VIDEO | SUBTITLES or is_special(name) or re.search(r'(?i)(?:^|[/ ._-])(?:sample|trailer)(?:[/ ._-]|$)', name):
+        if suffix not in VIDEO | SUBTITLES or is_special(name) or is_variant(name) or re.search(r'(?i)(?:^|[/ ._-])(?:sample|trailer)(?:[/ ._-]|$)', name):
             disabled.append(file_id)
             continue
         file_season, episodes = (file_scope if suffix in VIDEO else subtitle_scope)(name, season)
