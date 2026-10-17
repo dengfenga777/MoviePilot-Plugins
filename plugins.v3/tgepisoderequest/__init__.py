@@ -47,7 +47,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.4.3"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -91,6 +91,7 @@ class TgEpisodeRequest(_PluginBase):
     _downloader: str = ""
     _save_path: str = ""
     _notify_arrival: bool = True
+    _wait_library: bool = True
     _pending_days: int = 7
     _pms_enabled: bool = False
     _pms_url: str = ""
@@ -130,6 +131,7 @@ class TgEpisodeRequest(_PluginBase):
             self._downloader = str(config.get("downloader") or "").strip()
             self._save_path = str(config.get("save_path") or "").strip()
             self._notify_arrival = config.get("notify_arrival", True)
+            self._wait_library = bool(config.get("wait_library", True))
             self._pending_days = max(1, self.__int(config.get("pending_days"), 7))
             self._pms_enabled = bool(config.get("pms_enabled"))
             self._pms_url = str(config.get("pms_url") or "").strip()
@@ -802,7 +804,7 @@ class TgEpisodeRequest(_PluginBase):
         begin, end = self.__field(meta, "begin_episode"), self.__field(meta, "end_episode")
         if not meta_eps and begin:
             meta_eps = set(range(begin, (end or begin) + 1))
-        self.__arrived(download_hash, meta_eps)
+        self.__transferred(download_hash, meta_eps)
 
     @staticmethod
     def __history_episodes(text: Optional[str]) -> Set[int]:
@@ -838,9 +840,62 @@ class TgEpisodeRequest(_PluginBase):
             eps: Set[int] = set()
             for item in items:
                 eps |= self.__history_episodes(getattr(item, "episodes", None))
-            logger.info(f"TG群组智能补集：整理历史里查到 {download_hash[:8]} 已入库"
-                        f"{' ' + ','.join(f'E{e:02d}' for e in sorted(eps)) if eps else ''}")
+            self.__transferred(download_hash, eps)
+        if self._wait_library:
+            self.__poll_library()
+
+    def __transferred(self, download_hash: str, eps: Set[int]):
+        """MoviePilot 整理完成（本地）。等媒体库模式下只记下来，等媒体库里能看到再提醒。"""
+        if not self._wait_library:
             self.__arrived(download_hash, eps)
+            return
+        with self._data_lock:
+            arrivals = self.__live_arrivals()
+            rec = arrivals.get(download_hash)
+            if not rec:
+                return
+            before = (rec.get("transferred_any"), sorted(rec.get("transferred") or []))
+            rec["transferred_any"] = True
+            rec["transferred"] = sorted(set(rec.get("transferred") or []) | set(eps))
+            if before != (True, rec["transferred"]):
+                logger.info(f"TG群组智能补集：{download_hash[:8]} 已整理"
+                            f"{' ' + ','.join(f'E{e:02d}' for e in rec['transferred']) if rec['transferred'] else ''}"
+                            f"，等媒体库里出现后再提醒")
+                self.save_data("arrivals", arrivals)
+
+    def __poll_library(self):
+        """已整理的请求去媒体库里查，上传完、媒体库里能看到了才算入库。"""
+        with self._data_lock:
+            pending = {h: dict(r) for h, r in self.__live_arrivals().items() if r.get("transferred_any")}
+        media_cache: Dict[Tuple[int, bool], Any] = {}
+        for download_hash, rec in pending.items():
+            key = (rec["tmdbid"], bool(rec["is_movie"]))
+            try:
+                if key not in media_cache:
+                    media_cache[key] = self.chain.recognize_media(
+                        mtype=MediaType.MOVIE if rec["is_movie"] else MediaType.TV,
+                        media_source=MediaSource.TMDB, media_id=str(rec["tmdbid"]))
+                media = media_cache[key]
+                exist = self.chain.media_exists(mediainfo=media) if media else None
+            except Exception as e:
+                logger.warning(f"TG群组智能补集：查询媒体库失败（{rec.get('title') or rec['tmdbid']}）：{e}")
+                continue
+            if not exist:
+                continue
+            if rec["is_movie"]:
+                self.__arrived(download_hash, set())
+                continue
+            have = set((getattr(exist, "seasons", None) or {}).get(rec.get("season")) or [])
+            arrived = set(rec.get("arrived") or [])
+            if rec["episodes"]:
+                ready = (set(rec["episodes"]) - arrived) & have
+                if ready:
+                    self.__arrived(download_hash, ready)
+            elif have:
+                # 整季请求：整理过的集都在媒体库里了才提醒（认不出集数时媒体库有这季就算）
+                done = set(rec.get("transferred") or [])
+                if done <= have:
+                    self.__arrived(download_hash, done)
 
     def __arrived(self, download_hash: str, meta_eps: Set[int]):
         with self._data_lock:
@@ -959,6 +1014,7 @@ class TgEpisodeRequest(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         col(4, "VSwitch", model="notify_arrival", label="入库后在群里 @ 求片的人"),
+                        col(4, "VSwitch", model="wait_library", label="等媒体库里能看到再提醒（上传 / 生成 strm 之后）"),
                         col(4, "VTextField", model="pending_days", label="等待入库天数", type="number",
                             hint="超过这么多天还没入库就不再提醒、不扣积分", persistent_hint=True),
                     ]},
@@ -1024,6 +1080,7 @@ class TgEpisodeRequest(_PluginBase):
             "downloader": "",
             "save_path": "",
             "notify_arrival": True,
+            "wait_library": True,
             "auto_delete": 3,
             "delete_request": False,
             "notice_delete": 0,
