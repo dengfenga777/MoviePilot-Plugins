@@ -38,7 +38,7 @@ class Job:
     done: Dict[int, str] = field(default_factory=dict)
     created: float = field(default_factory=time.time)
     # 一次求多季时几季共用：本批已占用的免费额度和积分，避免每季单独检查都放行
-    batch: Optional[Dict[str, float]] = None
+    batch: Optional[Dict[str, Any]] = None
 
 
 class TgEpisodeRequest(_PluginBase):
@@ -49,7 +49,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -71,6 +71,8 @@ class TgEpisodeRequest(_PluginBase):
     _executor: Optional[ThreadPoolExecutor] = None
     _search_lock: Optional[threading.Semaphore] = None
     _jobs: Dict[str, Job] = {}
+    # 正在逐季处理的多季请求，停止口令靠它通知还没轮到的季不要再处理
+    _batches: List[Dict[str, Any]] = []
     _jobs_lock = threading.Lock()
     _bot_username: str = ""
     _data_lock = threading.Lock()
@@ -150,6 +152,7 @@ class TgEpisodeRequest(_PluginBase):
             self._notice_delete = max(0, self.__int(config.get("notice_delete"), 0))
 
         self._jobs = {}
+        self._batches = []
         self._search_lock = threading.Semaphore(2)
         if not self._enabled:
             return
@@ -284,6 +287,9 @@ class TgEpisodeRequest(_PluginBase):
         if command in ("/help", "/start"):
             self.__reply(bot, chat_id, self.__help_text(), msg.get("message_id"))
             return
+        if command == "/stop" or (not command and text in self.STOP_WORDS):
+            self.__stop(bot, msg, quiet=command != "/stop")
+            return
         if command == "/mp":
             req = parse(rest, allow_bare_id=True)
             if not req:
@@ -305,7 +311,8 @@ class TgEpisodeRequest(_PluginBase):
                 "• https://www.themoviedb.org/tv/12345 第二季 3-5集 花屏\n"
                 "• /mp 12345 第3、7集\n"
                 "• tmdb 550 电影 资源有问题（或 tmdb movie 550）\n"
-                "• tmdb 12345 第1-3季 / tmdb 12345 全部季（一次求多季）\n\n"
+                "• tmdb 12345 第1-3季 / tmdb 12345 全部季（一次求多季）\n"
+                "• /stop 或「停止求片」：停掉还没处理的季\n\n"
                 "没写季的话，单季剧自动识别，多季剧会让你选；没写集数又查不到剧集会按电影搜。")
 
     # ---------------- 求片流程 ----------------
@@ -365,6 +372,43 @@ class TgEpisodeRequest(_PluginBase):
         job.message_id = sent["message_id"]
         self.__search(bot, jid)
 
+    STOP_WORDS = {"停止", "停止求片", "取消求片", "别下了", "停止下载"}
+
+    def __stop(self, bot: TelegramBot, msg: Dict, quiet: bool = False):
+        """停止口令：停掉自己还没处理的季和还在等点按钮的求片；管理员停掉本群所有人的。已推送的下载不动。"""
+        chat_id, reply_to = msg["chat"]["id"], msg.get("message_id")
+        uid = (msg.get("from") or {}).get("id", 0)
+        is_admin = uid in self._admin_ids
+
+        def mine(owner: int, chat: int) -> bool:
+            return chat == chat_id and (is_admin or owner == uid)
+
+        left = 0
+        for batch in list(self._batches):
+            if not batch.get("stopped") and mine(batch["user_id"], batch["chat_id"]):
+                batch["stopped"] = True
+                left += len(batch.get("pending") or [])
+        with self._jobs_lock:
+            waiting = [(jid, job) for jid, job in self._jobs.items()
+                       if mine(job.user_id, job.chat_id) and job.message_id
+                       and any(c and ep not in job.done for ep, c in job.choices.items())]
+            for jid, _ in waiting:
+                self._jobs.pop(jid, None)
+        for _, job in waiting:
+            bot.edit(job.chat_id, job.message_id, f"⏹ 已停止：{job.req.describe()}")
+            self.__expire_job(job)
+            self.__record(job, "已停止")
+        if not left and not waiting:
+            if not quiet:  # 群里随口说「停止」时没东西可停就不打扰
+                self.__reply(bot, chat_id, "现在没有可以停止的求片（已推送的下载不会撤回）", reply_to)
+            return
+        parts = []
+        if left:
+            parts.append(f"还没处理的 {left} 季不再搜索")
+        if waiting:
+            parts.append(f"{len(waiting)} 个等待选择的求片已取消")
+        self.__reply(bot, chat_id, f"⏹ 已停止：{'，'.join(parts)}。已推送的下载不会撤回。", reply_to)
+
     def __handle_multi_season(self, bot: TelegramBot, msg: Dict, req: Request):
         """一次求多季：逐季按整季请求处理，每季各自查库、检查积分、搜索下载、入库提醒和结算。"""
         chat_id, reply_to = msg["chat"]["id"], msg.get("message_id")
@@ -391,8 +435,22 @@ class TgEpisodeRequest(_PluginBase):
         self.__reply(bot, chat_id, f"📚 识别到：TMDB {req.tmdbid} 共 {len(seasons)} 季"
                                    f"（{', '.join(f'S{n:02d}' for n in seasons)}），逐季处理…{note}", reply_to)
         user = msg.get("from") or {}
-        batch: Dict[str, float] = {"free_used": 0, "committed": 0.0}
-        for n in seasons:
+        batch: Dict[str, Any] = {"free_used": 0, "committed": 0.0, "stopped": False,
+                                 "user_id": user.get("id", 0), "chat_id": chat_id, "pending": list(seasons)}
+        self._batches.append(batch)
+        try:
+            self.__run_seasons(bot, msg, req, batch)
+        finally:
+            if batch in self._batches:
+                self._batches.remove(batch)
+
+    def __run_seasons(self, bot: TelegramBot, msg: Dict, req: Request, batch: Dict[str, Any]):
+        chat_id, reply_to = msg["chat"]["id"], msg.get("message_id")
+        user = msg.get("from") or {}
+        while batch["pending"]:
+            if batch["stopped"]:
+                return
+            n = batch["pending"].pop(0)
             sub = Request(tmdbid=req.tmdbid, season=n, episodes=[], intent=req.intent)
             job = Job(req=sub, user_id=user.get("id", 0),
                       user_name=user.get("first_name") or user.get("username") or str(user.get("id", "")),

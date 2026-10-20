@@ -610,6 +610,48 @@ class MultiSeasonTest(unittest.TestCase):
         self.assertEqual([c["season"] for c in calls.search], [2, 3])  # S01 在库里；S02 免费，S03 用积分
         self.assertTrue(any("已经在库里" in t for t, _ in self.bot.edits))
 
+    def stop_after_first_search(self, text, uid=1):
+        orig = plugin_mod.SearchChain
+        test = self
+
+        class StoppingSearch(orig):
+            def search_by_id(self, **kw):
+                res = super().search_by_id(**kw)
+                if len(calls.search) == 1:
+                    test.p._TgEpisodeRequest__handle_update(test.bot, {"message": {
+                        "message_id": 8, "text": text, "chat": {"id": -100},
+                        "from": {"id": uid, "first_name": f"U{uid}"}}})
+                return res
+
+        plugin_mod.SearchChain = StoppingSearch
+        try:
+            self.handle("tmdb 1399 全部季")
+        finally:
+            plugin_mod.SearchChain = orig
+
+    def test_stop_command_skips_remaining_seasons(self):
+        calls.results = [ctx("S01 整季", 1), ctx("S02 整季", 2), ctx("S03 整季", 3)]
+        self.stop_after_first_search("停止求片")
+        self.assertEqual([c["season"] for c in calls.search], [1])
+        self.assertTrue(any("还没处理的 2 季不再搜索" in t for t, _ in self.bot.sent))
+        self.assertEqual(len(calls.download), 1)                      # 已推送的不撤回
+        self.assertEqual(self.p._batches, [])
+
+    def test_other_user_cannot_stop_but_admin_can(self):
+        calls.results = [ctx("S01 整季", 1), ctx("S02 整季", 2), ctx("S03 整季", 3)]
+        self.pms.balances[1] = 100
+        self.stop_after_first_search("/stop", uid=2)
+        self.assertEqual(len(calls.search), 3)
+        self.assertTrue(any("没有可以停止的求片" in t for t, _ in self.bot.sent))
+        calls.search.clear()
+        self.p.init_plugin({"enabled": False, "config_version": 2, "admin_ids": "9", "wait_library": False})
+        self.stop_after_first_search("/stop", uid=9)
+        self.assertEqual(len(calls.search), 1)
+
+    def test_bare_stop_word_is_quiet(self):
+        self.handle("停止")
+        self.assertEqual(self.bot.sent, [])
+
     def test_too_many_seasons(self):
         calls.seasons = list(range(1, 13))
         self.handle("tmdb 1399 全部季")
