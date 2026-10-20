@@ -716,4 +716,22 @@ class PluginTests(unittest.TestCase):
         with patch.object(time,'sleep'):plugin._RssEpisodeQuality__fetch_rss('https://x.invalid/')
         self.assertEqual(len(calls),1)
 
+class SilentDownloadTests(unittest.TestCase):
+    """MoviePilot 3.1.8 起 download() 会多传 custom_words 等参数。"""
+    def chain(self):
+        node=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='SilentDownloadChain')
+        class Native:
+            def __init__(self,*a,**kw):self.messagehelper=None
+            def download(self,*args,**kwargs):self.native=(args,kwargs);return 'native'
+        scope={**ns,'DownloadChain':Native,'_SilentMessageHelper':lambda wrapped:wrapped}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),str(source),'exec'),scope)
+        return scope['SilentDownloadChain']()
+    def test_new_host_arguments_are_accepted(self):
+        chain=self.chain()
+        result=chain.download(b'x','/d',episodes={1},custom_words='a => b')
+        self.assertIsNone(result[0]); self.assertEqual(chain.last_error,'没有明确选集计划，拒绝提交')
+        chain.direct=True
+        self.assertEqual(chain.download(b'x','/d',episodes={1},custom_words='a => b'),'native')
+        self.assertEqual(chain.native[1]['custom_words'],'a => b')
+
 if __name__=='__main__':unittest.main()

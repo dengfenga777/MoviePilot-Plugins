@@ -95,10 +95,11 @@ class SilentDownloadChain(DownloadChain):
     direct = False
 
     def download(self, content, download_dir, cookie=None, episodes=None, category=None,
-                 label=None, downloader=None):
+                 label=None, downloader=None, **kwargs):
+        # MoviePilot 新版本会追加参数（如 custom_words 识别词）；严格选集自己识别文件，只在整包下载时原样转交
         if self.direct:
             return super().download(content, download_dir, cookie, episodes=episodes, category=category,
-                                    label=label, downloader=downloader)
+                                    label=label, downloader=downloader, **kwargs)
         try:
             if self.selection_season is None or not episodes:
                 raise UnsafeSelection("没有明确选集计划，拒绝提交")
@@ -162,7 +163,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.6"
+    plugin_version = "1.5.7"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
