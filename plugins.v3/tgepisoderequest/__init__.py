@@ -37,6 +37,8 @@ class Job:
     # 集数 -> 已推送的种子标题
     done: Dict[int, str] = field(default_factory=dict)
     created: float = field(default_factory=time.time)
+    # 一次求多季时几季共用：本批已占用的免费额度和积分，避免每季单独检查都放行
+    batch: Optional[Dict[str, float]] = None
 
 
 class TgEpisodeRequest(_PluginBase):
@@ -47,7 +49,7 @@ class TgEpisodeRequest(_PluginBase):
     # 插件图标
     plugin_icon = "Telegram_A.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "misaya"
     # 作者主页
@@ -88,6 +90,7 @@ class TgEpisodeRequest(_PluginBase):
     _low_seeders: int = 3
     _candidates: int = 3
     _max_episodes: int = 12
+    _max_seasons: int = 10
     _downloader: str = ""
     _save_path: str = ""
     _notify_arrival: bool = True
@@ -128,6 +131,7 @@ class TgEpisodeRequest(_PluginBase):
             self._low_seeders = self.__int(config.get("low_seeders"), 3)
             self._candidates = max(1, min(self.__int(config.get("candidates"), 3), 8))
             self._max_episodes = self.__int(config.get("max_episodes"), 12)
+            self._max_seasons = max(1, self.__int(config.get("max_seasons"), 10))
             self._downloader = str(config.get("downloader") or "").strip()
             self._save_path = str(config.get("save_path") or "").strip()
             self._notify_arrival = config.get("notify_arrival", True)
@@ -300,7 +304,8 @@ class TgEpisodeRequest(_PluginBase):
                 "• tmdb 12345 S02E05 资源有问题\n"
                 "• https://www.themoviedb.org/tv/12345 第二季 3-5集 花屏\n"
                 "• /mp 12345 第3、7集\n"
-                "• tmdb 550 电影 资源有问题（或 tmdb movie 550）\n\n"
+                "• tmdb 550 电影 资源有问题（或 tmdb movie 550）\n"
+                "• tmdb 12345 第1-3季 / tmdb 12345 全部季（一次求多季）\n\n"
                 "没写季的话，单季剧自动识别，多季剧会让你选；没写集数又查不到剧集会按电影搜。")
 
     # ---------------- 求片流程 ----------------
@@ -317,6 +322,9 @@ class TgEpisodeRequest(_PluginBase):
         reply_to = msg.get("message_id")
         if len(req.episodes) > self._max_episodes:
             self.__reply(bot, chat_id, f"一次最多处理 {self._max_episodes} 集，拆开发吧～", reply_to)
+            return
+        if req.multi_season:
+            self.__handle_multi_season(bot, msg, req)
             return
         user = msg.get("from") or {}
         job = Job(req=req, user_id=user.get("id", 0),
@@ -356,6 +364,45 @@ class TgEpisodeRequest(_PluginBase):
         sent = bot.send(chat_id, f"🔍 识别到：{req.describe()}，正在搜索…", reply_to=reply_to)
         job.message_id = sent["message_id"]
         self.__search(bot, jid)
+
+    def __handle_multi_season(self, bot: TelegramBot, msg: Dict, req: Request):
+        """一次求多季：逐季按整季请求处理，每季各自查库、检查积分、搜索下载、入库提醒和结算。"""
+        chat_id, reply_to = msg["chat"]["id"], msg.get("message_id")
+        try:
+            tmdb_seasons = [s.season_number for s in (TmdbChain().tmdb_seasons(tmdbid=req.tmdbid) or [])
+                            if (s.season_number or 0) > 0]
+        except Exception as e:
+            self.__reply(bot, chat_id, f"❌ 查询 TMDB 季信息失败：{html.escape(str(e))}", reply_to)
+            return
+        if not tmdb_seasons:
+            self.__reply(bot, chat_id, f"❌ TMDB {req.tmdbid} 没查到剧集信息，ID 是不是错了？", reply_to)
+            return
+        seasons = sorted(tmdb_seasons) if req.all_seasons else [n for n in req.seasons if n in tmdb_seasons]
+        missing = [] if req.all_seasons else [n for n in req.seasons if n not in tmdb_seasons]
+        if not seasons:
+            self.__reply(bot, chat_id, f"❌ 这部剧只有 {', '.join(f'S{n:02d}' for n in sorted(tmdb_seasons))}，"
+                                       f"没有你说的那几季", reply_to)
+            return
+        if len(seasons) > self._max_seasons:
+            self.__reply(bot, chat_id, f"这部剧有 {len(seasons)} 季，一次最多求 {self._max_seasons} 季，"
+                                       f"拆开发吧，例如：tmdb {req.tmdbid} 第1-{self._max_seasons}季", reply_to)
+            return
+        note = f"（TMDB 上没有 {', '.join(f'S{n:02d}' for n in missing)}，已跳过）" if missing else ""
+        self.__reply(bot, chat_id, f"📚 识别到：TMDB {req.tmdbid} 共 {len(seasons)} 季"
+                                   f"（{', '.join(f'S{n:02d}' for n in seasons)}），逐季处理…{note}", reply_to)
+        user = msg.get("from") or {}
+        batch: Dict[str, float] = {"free_used": 0, "committed": 0.0}
+        for n in seasons:
+            sub = Request(tmdbid=req.tmdbid, season=n, episodes=[], intent=req.intent)
+            job = Job(req=sub, user_id=user.get("id", 0),
+                      user_name=user.get("first_name") or user.get("username") or str(user.get("id", "")),
+                      chat_id=chat_id, reply_to=reply_to or 0, batch=batch)
+            jid = secrets.token_hex(4)
+            with self._jobs_lock:
+                self._jobs[jid] = job
+            sent = bot.send(chat_id, f"🔍 {sub.describe()}，正在搜索…", reply_to=reply_to)
+            job.message_id = sent["message_id"]
+            self.__search(bot, jid)
 
     def __search(self, bot: TelegramBot, jid: str):
         job = self._jobs.get(jid)
@@ -707,7 +754,9 @@ class TgEpisodeRequest(_PluginBase):
         usage = self.__usage()
         if price <= 0 or usage.is_paid(job.user_id, charge_key(req.tmdbid, req.is_movie, req.season)):
             return None
-        if usage.left(job.user_id, kind, quota) > 0:
+        batch = job.batch if job.batch is not None else {"free_used": 0, "committed": 0.0}
+        if usage.left(job.user_id, kind, quota) > batch["free_used"]:
+            batch["free_used"] += 1
             return None
         try:
             balance = PmsClient(self._pms_url, self._pms_token).balance(job.user_id)
@@ -716,9 +765,13 @@ class TgEpisodeRequest(_PluginBase):
         except PmsError as e:
             logger.error(f"TG群组智能补集：查询积分失败：{e}")
             return "❌ 积分系统暂时连不上，稍后再试"
-        if balance < price:
+        if balance < batch["committed"] + price:
+            if batch["committed"]:
+                return (f"❌ 积分不足：前面几季入库后共需 {batch['committed']:g} 积分，"
+                        f"再求这一季还要 {price:g}，你当前 {balance:g}")
             return (f"❌ 积分不足：本月免费的{self.__kind_name(kind)}额度已用完，"
                     f"求{self.__kind_name(kind)}需要 {price:g} 积分，你当前 {balance:g}")
+        batch["committed"] += price
         return None
 
     def __settle(self, rec: Dict) -> str:
@@ -999,6 +1052,7 @@ class TgEpisodeRequest(_PluginBase):
                         col(4, "VTextField", model="candidates", label="每集候选数", type="number"),
                         col(4, "VTextField", model="min_seeders", label="最少做种数（低于直接不要）", type="number"),
                         col(4, "VTextField", model="max_episodes", label="单次最多集数", type="number"),
+                        col(4, "VTextField", model="max_seasons", label="一次最多求几季", type="number"),
                     ]},
                     {"component": "VRow", "content": [
                         col(4, "VTextField", model="low_seeders", label="做种少于此数排到最后", type="number"),
@@ -1066,6 +1120,7 @@ class TgEpisodeRequest(_PluginBase):
             "token": "",
             "proxy": True,
             "auto_download": True,
+            "max_seasons": 10,
             "check_library": True,
             "allowed_chats": "",
             "admin_ids": "",
