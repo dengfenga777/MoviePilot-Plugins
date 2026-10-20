@@ -20,6 +20,9 @@ CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
 # 明确说是电影（没有季/集时才生效）
 MOVIE_WORDS = re.compile(r"电影|影片|剧场版|\bmovie\b|\bfilm\b", re.I)
 
+# 整部剧所有季（「全季」是一整季，不算）
+ALL_SEASONS = re.compile(r"全部季|所有季|全部的季|每一季|全\s*\d+\s*季|全集|全剧|整部剧?|一整部|全套|全系列")
+
 # 意图关键词
 REPLACE_WORDS = r"(有问题|问题|坏了|损坏|花屏|卡顿|没声音|无声|音画不同步|不同步|字幕(错|不对|有问题|缺失|没有)|(没|无|缺|没有)(中文)?字幕|没有?中字|" \
                 r"错集|错了|放错|播不了|不能播|无法播放|打不开|画质差|糊|洗版|替换|重新下|重下|换个|换一个)"
@@ -74,10 +77,21 @@ class Request:
     episodes: List[int] = field(default_factory=list)
     intent: str = "missing"  # missing | replace
     is_movie: bool = False
+    # 一次求多季：seasons 为指定的几季，all_seasons 为整部剧所有季
+    seasons: List[int] = field(default_factory=list)
+    all_seasons: bool = False
+
+    @property
+    def multi_season(self) -> bool:
+        return not self.is_movie and (self.all_seasons or len(self.seasons) > 1)
 
     def describe(self) -> str:
         if self.is_movie:
             return f"TMDB {self.tmdbid}（电影）"
+        if self.all_seasons:
+            return f"TMDB {self.tmdbid} 全部季"
+        if len(self.seasons) > 1:
+            return f"TMDB {self.tmdbid} " + ",".join(f"S{n:02d}" for n in self.seasons)
         s = f"S{self.season:02d}" if self.season is not None else "S??"
         eps = ",".join(f"E{e:02d}" for e in self.episodes) or "全季"
         return f"TMDB {self.tmdbid} {s} {eps}"
@@ -129,8 +143,24 @@ def parse(text: str, allow_bare_id: bool = True) -> Optional[Request]:
             episodes += _expand(a, int(em.group(2))) if em.group(2) else [a]
     rest = re.sub(r"S\d{1,2}\s*(?:E\d{1,4}\s*(?:-\s*E?\d{1,4})?\s*)+", " ", rest, flags=re.I)
 
+    # 多季：第1-3季 / S01-S03 / 1到3季 / 第1、2、3季 / 全部季 / 全集
+    seasons: List[int] = []
+    if season is None and not episodes:
+        m = re.search(rf"(?:第\s*)?({CN_N})\s*季?\s*-\s*(?:第\s*)?({CN_N})\s*季"
+                      rf"|(?<![A-Za-z])S(\d{{1,2}})\s*-\s*S?(\d{{1,2}})(?![\dEe])", rest, re.I)
+        if m:
+            a, b = (cn2int(m.group(1)), cn2int(m.group(2))) if m.group(1) else (int(m.group(3)), int(m.group(4)))
+            seasons = _expand(a, b) if 0 < min(a, b) and abs(b - a) <= 50 else []
+        else:
+            m = re.search(rf"(?:第\s*)?((?:{CN_N}\s*[、,，和与及/]\s*)+{CN_N})\s*季", rest)
+            if m:
+                seasons = sorted({cn2int(x) for x in re.split(r"[、,，和与及/\s]+", m.group(1)) if x})
+        if m and seasons:
+            rest = rest[:m.start()] + " " + rest[m.end():]
+    all_seasons = season is None and not episodes and not seasons and bool(ALL_SEASONS.search(raw))
+
     # 季：第二季 / 第2季 / S2 / Season 2
-    if season is None:
+    if season is None and not seasons:
         m = re.search(rf"第\s*({CN_N})\s*季|(?<![A-Za-z])S(\d{{1,2}})(?![\d])|season\s*(\d{{1,2}})", rest, re.I)
         if m:
             season = cn2int(m.group(1)) if m.group(1) else int(m.group(2) or m.group(3))
@@ -161,9 +191,15 @@ def parse(text: str, allow_bare_id: bool = True) -> Optional[Request]:
     episodes = sorted({e for e in episodes if e > 0})
     if not is_tv and season is None and not episodes and MOVIE_WORDS.search(raw):
         is_movie = True
+    if seasons and episodes:
+        # 带了集数就只能是一季
+        season, seasons = seasons[0], []
+    if len(seasons) == 1:
+        season, seasons = seasons[0], []
     if is_movie:
-        season, episodes = None, []
+        season, episodes, seasons, all_seasons = None, [], [], False
     # 裸数字 ID 误触发概率高：必须同时带集数或求片/报错关键词
     if bare and not episodes and not re.search(f"{REPLACE_WORDS}|{MISSING_WORDS}", raw):
         return None
-    return Request(tmdbid=tmdbid, season=season, episodes=episodes, intent=intent, is_movie=is_movie)
+    return Request(tmdbid=tmdbid, season=season, episodes=episodes, intent=intent, is_movie=is_movie,
+                   seasons=seasons, all_seasons=all_seasons)

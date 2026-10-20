@@ -159,6 +159,20 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(parse("今天吃了 300 块的火锅"))
         self.assertIsNone(parse("我有 2 个问题 123 和 456"))
 
+    def test_multi_season(self):
+        cases = {"tmdb 1399 全部季": (True, []), "tmdb 1399 全集 求": (True, []),
+                 "tmdb 1399 第1-3季": (False, [1, 2, 3]), "tmdb 1399 1到3季": (False, [1, 2, 3]),
+                 "tmdb 1399 S01-S03": (False, [1, 2, 3]), "tmdb 1399 第一季到第三季": (False, [1, 2, 3]),
+                 "tmdb 1399 第1、3、5季": (False, [1, 3, 5])}
+        for text, (all_, seasons) in cases.items():
+            r = parse(text)
+            self.assertTrue(r.multi_season, text)
+            self.assertEqual((r.all_seasons, r.seasons, r.season, r.episodes), (all_, seasons, None, []), text)
+        for text in ["tmdb 1399 第2季", "tmdb 1399 第2季 全季", "tmdb 1399 S01-S03 第5集", "tmdb 550 电影 全集",
+                     "tmdb 1399 第3-5集"]:
+            self.assertFalse(parse(text).multi_season, text)
+        self.check("tmdb 1399 S01-S03 第5集", 1399, 1, [5])
+
     def test_bare_id_strict(self):
         # 纯数字只认开头、后面不跟单位、不是分辨率、整句够短
         for text in ["2016 年的那部没有", "2016年那部有问题", "500 G 没有了", "300块 没有", "1080 有问题",
@@ -555,6 +569,52 @@ class WaitLibraryTest(unittest.TestCase):
         self.p.on_transfer_complete(arrived(eps=[5]))
         self.poll()
         self.assertEqual(len(self.notices()), 1)
+
+
+class MultiSeasonTest(unittest.TestCase):
+    def setUp(self):
+        calls.search.clear()
+        calls.download.clear()
+        calls.seasons = [1, 2, 3]
+        calls.library, calls.lib_checks = None, 0
+        self.pms = FakePms({1: 25})
+        self._orig = plugin_mod.PmsClient
+        plugin_mod.PmsClient = self.pms
+        self.p = plugin_mod.TgEpisodeRequest()
+        self.p.init_plugin({"enabled": False, "config_version": 2, "pms_enabled": True, "pms_url": "http://pms",
+                            "pms_token": "k", "season_price": 20, "free_seasons": 1, "wait_library": False})
+        self.bot = FakeBot()
+
+    def tearDown(self):
+        plugin_mod.PmsClient = self._orig
+
+    def handle(self, text):
+        self.p._TgEpisodeRequest__handle_update(self.bot, {"message": {
+            "message_id": 7, "text": text, "chat": {"id": -100}, "from": {"id": 1, "first_name": "U1"}}})
+
+    def test_all_seasons_one_job_each_with_batch_credits(self):
+        calls.results = [ctx("S01 整季", 1), ctx("S02 整季", 2), ctx("S03 整季", 3)]
+        self.handle("tmdb 1399 全部季")
+        self.assertEqual([c["season"] for c in calls.search], [1, 2])   # S03 积分不够，不搜
+        self.assertIn("共 3 季", self.bot.sent[0][0])
+        # 1 季免费 + 1 季 20 积分；余额 25 不够第三季
+        self.assertIn("积分不足", self.bot.edits[-1][0])
+        self.assertIn("共需 20 积分", self.bot.edits[-1][0])
+        self.assertEqual(len(calls.download), 2)
+
+    def test_skips_seasons_in_library_and_unknown(self):
+        calls.library = {1: list(range(1, 11))}
+        calls.results = [ctx("S02 整季", 2), ctx("S03 整季", 3)]
+        self.handle("tmdb 1399 第1-4季")
+        self.assertIn("没有 S04", self.bot.sent[0][0])
+        self.assertEqual([c["season"] for c in calls.search], [2, 3])  # S01 在库里；S02 免费，S03 用积分
+        self.assertTrue(any("已经在库里" in t for t, _ in self.bot.edits))
+
+    def test_too_many_seasons(self):
+        calls.seasons = list(range(1, 13))
+        self.handle("tmdb 1399 全部季")
+        self.assertIn("一次最多求 10 季", self.bot.sent[-1][0])
+        self.assertEqual(calls.search, [])
 
 
 class BillingTest(unittest.TestCase):
