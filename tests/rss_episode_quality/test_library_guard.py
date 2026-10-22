@@ -682,6 +682,18 @@ class PluginTests(unittest.TestCase):
         self.feed('Show.S01E12.Pure.2160p.WEB-DL','Show.S01E11.2160p.WEB-DL')
         self.run_check()
         self.assertEqual([c['episodes'] for c in Download.calls],[{11}])
+    def test_special_episode_title_is_skipped(self):
+        ns['query_library'].return_value=self.library(10)
+        class SpecialMeta(Meta):
+            # MoviePilot 把 SxxE00 识别为集号 [0]
+            def __init__(self,title=None,**kw):
+                if engine.is_special(title):
+                    Meta.__init__(self,'Show.S01E11'); self.name=title; self.episode_list=[0]
+                else:Meta.__init__(self,title,**kw)
+        self.feed('Show.S01E00.2160p.WEB-DL','Show.S01E11.2160p.WEB-DL')
+        with patch.dict(ns,{'MetaInfo':SpecialMeta}):self.run_check()
+        self.assertEqual([c['episodes'] for c in Download.calls],[{11}])
+        self.assertNotIn('failed',[d['status'] for d in self.plugin.data['decisions_v1']])
     def test_pack_variant_files_are_not_selected(self):
         self.plugin._skip_unknown_episodes=False
         self.pack(['节目.S01E11.2160p.mkv','节目.纯享.S01E11.Pure.2160p.mkv','节目.加更.S01E12.Plus.2160p.mkv'])

@@ -163,7 +163,7 @@ class RssEpisodeQuality(_PluginBase):
     # 插件图标
     plugin_icon = "rss.png"
     # 插件版本
-    plugin_version = "1.5.7"
+    plugin_version = "1.5.8"
     # 插件作者
     plugin_author = "jxxghp / misaya"
     # 作者主页
@@ -1363,6 +1363,11 @@ class RssEpisodeQuality(_PluginBase):
                 if is_variant(title):
                     logger.info(f"{title} - 纯享/加更/先导等衍生版与正片同集号，会顶替正片，跳过")
                     self.__remember_skip(skip_cache, rss_key, "衍生版", 24)
+                    continue
+                if is_special(title):
+                    # 第 0 集在媒体库里不计入集数、种子里也不会被选中，下载只会反复失败
+                    logger.info(f"{title} - 特别篇/先导片（E00）不处理，跳过")
+                    self.__remember_skip(skip_cache, rss_key, "特别篇", 24)
                     continue
                 if self._size_range:
                     try:
