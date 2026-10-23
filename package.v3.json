@@ -107,5 +107,18 @@
       "v1.0.1": "群消息里不再显示资源所在站点，资源标题末尾的发布组后缀（如 -XXWEB）也一并去掉，避免暴露来源站点。",
       "v1.0.0": "新增：独立 Telegram 机器人识别群消息里的 TMDB ID、季、集和「缺集 / 资源有问题」，调用 MoviePilot 精确搜索，按单集 > 多集包 > 整季包给出候选，点按钮或自动下载；整季包只勾选请求的集。"
     }
+  },
+  "MediaCoverGeneratorAsync": {
+    "name": "Emby媒体库封面生成（异步版）",
+    "description": "生成 Emby/Jellyfin 媒体库动态/静态封面。入库监控改为后台排队合并处理，不再阻塞 MoviePilot 的整理完成事件。",
+    "labels": "Emby,Jellyfin,封面,媒体库",
+    "version": "1.1.0",
+    "icon": "https://raw.githubusercontent.com/wio-ki/MoviePilot-Plugins/main/icons/emby.png",
+    "author": "misaya,Kioo",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.1.0": "基于 Kioo 的「Emby媒体库封面生成」1.0.1 修改：整理完成和 Webhook 入库只登记到后台队列后立即返回，不再在事件里等待延迟、不再触发媒体库全量同步；同一媒体去重，同一媒体库 2 分钟内合并成一次封面生成；媒体库还没扫到时每 5 分钟重试，最多 6 次。首次安装沿用原版配置（默认未启用）。"
+    }
   }
 }
